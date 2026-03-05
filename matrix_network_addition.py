@@ -62,31 +62,28 @@ class RotationalGD:
 
     @torch.no_grad()
     def step(self, model: MatrixNetwork) -> None:
-        # Token matrices: normalize by last dimension, move toward normalized gradient update, renormalize.
+        # Token matrices: move toward negative normalized gradient target, then renormalize.
         w_m = model.token_mats
         g_m = model.token_mats.grad
         if g_m is not None:
-            w_m_norm = normalize_last_dim(w_m)
-            target_m = normalize_last_dim(w_m_norm - g_m)
-            new_m = w_m_norm + self.step_size * (target_m - w_m_norm)
+            target_m = -normalize_last_dim(g_m)
+            new_m = w_m + self.step_size * (target_m - w_m)
             w_m.copy_(normalize_last_dim(new_m))
 
         # Decoder vectors.
         w_d = model.decode_vecs
         g_d = model.decode_vecs.grad
         if g_d is not None:
-            w_d_norm = normalize_last_dim(w_d)
-            target_d = normalize_last_dim(w_d_norm - g_d)
-            new_d = w_d_norm + self.step_size * (target_d - w_d_norm)
+            target_d = -normalize_last_dim(g_d)
+            new_d = w_d + self.step_size * (target_d - w_d)
             w_d.copy_(normalize_last_dim(new_d))
 
         # Query vector.
         w_q = model.query
         g_q = model.query.grad
         if g_q is not None:
-            w_q_norm = normalize_last_dim(w_q)
-            target_q = normalize_last_dim(w_q_norm - g_q)
-            new_q = w_q_norm + self.step_size * (target_q - w_q_norm)
+            target_q = -normalize_last_dim(g_q)
+            new_q = w_q + self.step_size * (target_q - w_q)
             w_q.copy_(normalize_last_dim(new_q))
 
         model.zero_grad(set_to_none=True)
