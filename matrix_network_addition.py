@@ -154,9 +154,11 @@ def train(
     eval_samples: int,
     max_gen_len: int,
     device: torch.device,
+    model: MatrixNetwork | None = None,
 ) -> MatrixNetwork:
     rng = random.Random(seed)
-    model = MatrixNetwork(n=n, device=device)
+    if model is None:
+        model = MatrixNetwork(n=n, device=device)
     optim = RotationalGD(step_size=step_size)
 
     for step in range(1, steps + 1):
@@ -211,9 +213,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
     p.add_argument("--max-gen-len", type=int, default=8, help="Autoregressive decode cutoff when EOS is not produced")
+    p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default="checkpoints/matrix_network_addition.pt", help="Checkpoint path")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
     return p.parse_args()
+
+
+def load_checkpoint(load_path: str, device: torch.device) -> MatrixNetwork:
+    path = Path(load_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    try:
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(path, map_location=device)
+    model = MatrixNetwork(n=int(ckpt["n"]), device=device)
+    model.load_state_dict(ckpt["state_dict"])
+    return model
 
 
 def save_checkpoint(model: MatrixNetwork, save_path: str) -> None:
@@ -234,8 +250,13 @@ def main() -> None:
     args = parse_args()
     device = pick_device(args.device)
     print(f"device={device}")
+    model = None
+    if args.load_path is not None:
+        model = load_checkpoint(args.load_path, device)
+        if model.n != args.n:
+            print(f"loaded_n={model.n}; overriding --n={args.n} with checkpoint dimension")
     model = train(
-        n=args.n,
+        n=model.n if model is not None else args.n,
         steps=args.steps,
         batch_size=args.batch_size,
         step_size=args.step_size,
@@ -245,6 +266,7 @@ def main() -> None:
         eval_samples=args.eval_samples,
         max_gen_len=args.max_gen_len,
         device=device,
+        model=model,
     )
     save_checkpoint(model, args.save_path)
     print(f"saved_checkpoint={args.save_path}")
