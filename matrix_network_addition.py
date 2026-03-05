@@ -12,16 +12,8 @@ VOCAB = "0123456789+="
 EPS = 1e-12
 
 
-def normalize_vectors(x: torch.Tensor, dim: int = -1, eps: float = EPS) -> torch.Tensor:
-    return x / (x.norm(dim=dim, keepdim=True) + eps)
-
-
-def normalize_matrices_rowcol(x: torch.Tensor, iters: int = 2, eps: float = EPS) -> torch.Tensor:
-    out = x
-    for _ in range(iters):
-        out = out / (out.norm(dim=-1, keepdim=True) + eps)  # row vectors
-        out = out / (out.norm(dim=-2, keepdim=True) + eps)  # column vectors
-    return out
+def normalize_last_dim(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
+    return x / (x.norm(dim=-1, keepdim=True) + eps)
 
 
 class MatrixNetwork(torch.nn.Module):
@@ -42,9 +34,9 @@ class MatrixNetwork(torch.nn.Module):
 
     @torch.no_grad()
     def renormalize_in_place(self) -> None:
-        self.token_mats.copy_(normalize_matrices_rowcol(self.token_mats))
-        self.decode_vecs.copy_(normalize_vectors(self.decode_vecs, dim=-1))
-        self.query.copy_(normalize_vectors(self.query, dim=0))
+        self.token_mats.copy_(normalize_last_dim(self.token_mats))
+        self.decode_vecs.copy_(normalize_last_dim(self.decode_vecs))
+        self.query.copy_(normalize_last_dim(self.query))
 
     def encode(self, s: str) -> List[int]:
         return [self.stoi[ch] for ch in s]
@@ -70,32 +62,32 @@ class RotationalGD:
 
     @torch.no_grad()
     def step(self, model: MatrixNetwork) -> None:
-        # Token matrices: normalize rows+cols, move toward normalized gradient update, renormalize.
+        # Token matrices: normalize by last dimension, move toward normalized gradient update, renormalize.
         w_m = model.token_mats
         g_m = model.token_mats.grad
         if g_m is not None:
-            w_m_norm = normalize_matrices_rowcol(w_m)
-            target_m = normalize_matrices_rowcol(w_m_norm - g_m)
+            w_m_norm = normalize_last_dim(w_m)
+            target_m = normalize_last_dim(w_m_norm - g_m)
             new_m = w_m_norm + self.step_size * (target_m - w_m_norm)
-            w_m.copy_(normalize_matrices_rowcol(new_m))
+            w_m.copy_(normalize_last_dim(new_m))
 
         # Decoder vectors.
         w_d = model.decode_vecs
         g_d = model.decode_vecs.grad
         if g_d is not None:
-            w_d_norm = normalize_vectors(w_d, dim=-1)
-            target_d = normalize_vectors(w_d_norm - g_d, dim=-1)
+            w_d_norm = normalize_last_dim(w_d)
+            target_d = normalize_last_dim(w_d_norm - g_d)
             new_d = w_d_norm + self.step_size * (target_d - w_d_norm)
-            w_d.copy_(normalize_vectors(new_d, dim=-1))
+            w_d.copy_(normalize_last_dim(new_d))
 
         # Query vector.
         w_q = model.query
         g_q = model.query.grad
         if g_q is not None:
-            w_q_norm = normalize_vectors(w_q, dim=0)
-            target_q = normalize_vectors(w_q_norm - g_q, dim=0)
+            w_q_norm = normalize_last_dim(w_q)
+            target_q = normalize_last_dim(w_q_norm - g_q)
             new_q = w_q_norm + self.step_size * (target_q - w_q_norm)
-            w_q.copy_(normalize_vectors(new_q, dim=0))
+            w_q.copy_(normalize_last_dim(new_q))
 
         model.zero_grad(set_to_none=True)
 
