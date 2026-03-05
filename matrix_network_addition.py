@@ -2,13 +2,15 @@
 import argparse
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 
 
-VOCAB = "0123456789+="
+EOS_TOKEN = "~"
+VOCAB = f"0123456789+={EOS_TOKEN}"
 EPS = 1e-12
 
 
@@ -97,38 +99,48 @@ def random_problem(rng: random.Random) -> Tuple[int, int, str, str]:
     return a, b, lhs, rhs
 
 
-def evaluate(model: MatrixNetwork, eval_samples: int, seed: int) -> Tuple[float, float]:
+def generate_until_eos(model: MatrixNetwork, lhs: str, max_len: int) -> Tuple[str, bool]:
+    pred = ""
+    for _ in range(max_len):
+        next_ch = model.predict_next(lhs + pred)
+        if next_ch == EOS_TOKEN:
+            return pred, True
+        pred += next_ch
+    return pred, False
+
+
+def evaluate(model: MatrixNetwork, eval_samples: int, seed: int, max_gen_len: int) -> Tuple[float, float, float]:
     rng = random.Random(seed)
     exact = 0
     tf_correct = 0
     tf_total = 0
+    stopped = 0
 
     for _ in range(eval_samples):
         _, _, lhs, rhs = random_problem(rng)
 
-        pred = ""
-        for _ in range(len(rhs)):
-            pred += model.predict_next(lhs + pred)
-        if pred == rhs:
+        pred, did_stop = generate_until_eos(model, lhs, max_gen_len)
+        stopped += int(did_stop)
+        if did_stop and pred == rhs:
             exact += 1
 
-        for i in range(len(rhs)):
-            next_ch = model.predict_next(lhs + rhs[:i])
-            tf_correct += int(next_ch == rhs[i])
+        target_seq = rhs + EOS_TOKEN
+        for i in range(len(target_seq)):
+            next_ch = model.predict_next(lhs + target_seq[:i])
+            tf_correct += int(next_ch == target_seq[i])
             tf_total += 1
 
-    return exact / eval_samples, tf_correct / max(tf_total, 1)
+    return exact / eval_samples, tf_correct / max(tf_total, 1), stopped / eval_samples
 
 
-def show_samples(model: MatrixNetwork, seed: int, count: int = 10) -> None:
+def show_samples(model: MatrixNetwork, seed: int, max_gen_len: int, count: int = 10) -> None:
     rng = random.Random(seed)
     for _ in range(count):
         a, b, lhs, rhs = random_problem(rng)
-        pred = ""
-        for _ in range(len(rhs)):
-            pred += model.predict_next(lhs + pred)
-        ok = "OK" if pred == rhs else "XX"
-        print(f"{lhs}{rhs:>4s} | pred={pred:>4s}  [{ok}]   ({a}+{b})")
+        pred, did_stop = generate_until_eos(model, lhs, max_gen_len)
+        ok = "OK" if (did_stop and pred == rhs) else "XX"
+        stop_txt = "eos" if did_stop else "max"
+        print(f"{lhs}{rhs:>4s} | pred={pred:>4s} ({stop_txt}) [{ok}]   ({a}+{b})")
 
 
 def train(
@@ -140,6 +152,7 @@ def train(
     log_every: int,
     eval_every: int,
     eval_samples: int,
+    max_gen_len: int,
     device: torch.device,
 ) -> MatrixNetwork:
     rng = random.Random(seed)
@@ -153,9 +166,10 @@ def train(
 
         for _ in range(batch_size):
             _, _, lhs, rhs = random_problem(rng)
-            for i in range(len(rhs)):
-                prefix = lhs + rhs[:i]
-                target_id = model.stoi[rhs[i]]
+            target_seq = rhs + EOS_TOKEN
+            for i in range(len(target_seq)):
+                prefix = lhs + target_seq[:i]
+                target_id = model.stoi[target_seq[i]]
                 logits = model.forward_prefix_ids(model.encode(prefix))
                 losses.append(F.cross_entropy(logits.unsqueeze(0), torch.tensor([target_id], device=device)))
                 total_correct += int(int(logits.argmax().item()) == target_id)
@@ -167,11 +181,11 @@ def train(
 
         if step % log_every == 0 or step == 1:
             acc = total_correct / max(total_targets, 1)
-            print(f"step={step:5d} loss={loss.item():.4f} digit_acc={acc:.3f}")
+            print(f"step={step:5d} loss={loss.item():.4f} token_acc={acc:.3f}")
 
         if step % eval_every == 0 or step == steps:
-            exact, tf_acc = evaluate(model, eval_samples=eval_samples, seed=seed + step)
-            print(f"  eval exact_match={exact:.3f} teacher_forced_digit_acc={tf_acc:.3f}")
+            exact, tf_acc, stop_rate = evaluate(model, eval_samples=eval_samples, seed=seed + step, max_gen_len=max_gen_len)
+            print(f"  eval exact_match={exact:.3f} teacher_forced_token_acc={tf_acc:.3f} stop_rate={stop_rate:.3f}")
 
     return model
 
@@ -196,8 +210,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
+    p.add_argument("--max-gen-len", type=int, default=8, help="Autoregressive decode cutoff when EOS is not produced")
+    p.add_argument("--save-path", type=str, default="checkpoints/matrix_network_addition.pt", help="Checkpoint path")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
     return p.parse_args()
+
+
+def save_checkpoint(model: MatrixNetwork, save_path: str) -> None:
+    path = Path(save_path)
+    if path.parent:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "n": model.n,
+            "vocab": model.vocab,
+            "state_dict": model.state_dict(),
+        },
+        path,
+    )
 
 
 def main() -> None:
@@ -213,10 +243,13 @@ def main() -> None:
         log_every=args.log_every,
         eval_every=args.eval_every,
         eval_samples=args.eval_samples,
+        max_gen_len=args.max_gen_len,
         device=device,
     )
+    save_checkpoint(model, args.save_path)
+    print(f"saved_checkpoint={args.save_path}")
     print("\nSample predictions:")
-    show_samples(model, seed=args.seed + 999)
+    show_samples(model, seed=args.seed + 999, max_gen_len=args.max_gen_len)
 
 
 if __name__ == "__main__":
