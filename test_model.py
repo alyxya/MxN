@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--checkpoint",
         type=str,
-        default="models/matrix_network_n100_step001_10k.pt",
+        default="models/matrix_network_n30_step0005_resume10k.pt",
         help="Path to saved checkpoint",
     )
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
