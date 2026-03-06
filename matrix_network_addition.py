@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import torch
-import torch.nn.functional as F
 
 
 EOS_TOKEN = "~"
@@ -16,6 +15,21 @@ EPS = 1e-12
 
 def normalize_last_dim(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
     return x / (x.norm(dim=-1, keepdim=True) + eps)
+
+
+def orthogonal_unit_in_plane(v_hat: torch.Tensor, d: torch.Tensor, eps: float = EPS) -> torch.Tensor:
+    # Orthogonal component of decoder vector within span{v_hat, d}.
+    d_orth = d - torch.dot(d, v_hat) * v_hat
+    n = d_orth.norm()
+    if float(n.item()) > eps:
+        return d_orth / (n + eps)
+
+    # Degenerate case: d nearly parallel to v_hat, pick a stable orthogonal direction.
+    idx = int(torch.argmin(torch.abs(v_hat)).item())
+    basis = torch.zeros_like(v_hat)
+    basis[idx] = 1.0
+    fallback = basis - torch.dot(basis, v_hat) * v_hat
+    return fallback / (fallback.norm() + eps)
 
 
 class MatrixNetwork(torch.nn.Module):
@@ -28,7 +42,8 @@ class MatrixNetwork(torch.nn.Module):
         self.itos: Dict[int, str] = {i: ch for ch, i in self.stoi.items()}
 
         std = (1.0 / n) ** 0.5
-        self.token_mats = torch.nn.Parameter(torch.randn(self.vocab_size, n, n, device=device) * std)
+        eye = torch.eye(n, device=device).unsqueeze(0).repeat(self.vocab_size, 1, 1)
+        self.token_mats = torch.nn.Parameter(eye + torch.randn(self.vocab_size, n, n, device=device) * 1e-4)
         self.decode_vecs = torch.nn.Parameter(torch.randn(self.vocab_size, n, device=device) * std)
         self.query = torch.nn.Parameter(torch.randn(n, device=device) * std)
 
@@ -43,11 +58,15 @@ class MatrixNetwork(torch.nn.Module):
     def encode(self, s: str) -> List[int]:
         return [self.stoi[ch] for ch in s]
 
-    def forward_prefix_ids(self, token_ids: Sequence[int]) -> torch.Tensor:
+    def queried_vector_ids(self, token_ids: Sequence[int]) -> torch.Tensor:
         p = torch.eye(self.n, device=self.token_mats.device)
         for tid in token_ids:
             p = p @ self.token_mats[tid]
         v = p @ self.query
+        return v
+
+    def forward_prefix_ids(self, token_ids: Sequence[int]) -> torch.Tensor:
+        v = self.queried_vector_ids(token_ids)
         logits = self.decode_vecs @ v
         return logits
 
@@ -64,11 +83,11 @@ class RotationalGD:
 
     @torch.no_grad()
     def step(self, model: MatrixNetwork) -> None:
-        # Token matrices: move toward negative normalized gradient target, then renormalize.
+        # Token matrices: move toward normalized pseudo-gradient target, then renormalize.
         w_m = model.token_mats
         g_m = model.token_mats.grad
         if g_m is not None:
-            target_m = -normalize_last_dim(g_m)
+            target_m = normalize_last_dim(g_m)
             new_m = w_m + self.step_size * (target_m - w_m)
             w_m.copy_(normalize_last_dim(new_m))
 
@@ -76,7 +95,7 @@ class RotationalGD:
         w_d = model.decode_vecs
         g_d = model.decode_vecs.grad
         if g_d is not None:
-            target_d = -normalize_last_dim(g_d)
+            target_d = normalize_last_dim(g_d)
             new_d = w_d + self.step_size * (target_d - w_d)
             w_d.copy_(normalize_last_dim(new_d))
 
@@ -84,7 +103,7 @@ class RotationalGD:
         w_q = model.query
         g_q = model.query.grad
         if g_q is not None:
-            target_q = -normalize_last_dim(g_q)
+            target_q = normalize_last_dim(g_q)
             new_q = w_q + self.step_size * (target_q - w_q)
             w_q.copy_(normalize_last_dim(new_q))
 
@@ -176,7 +195,8 @@ def train(
     optim = RotationalGD(step_size=step_size)
 
     for step in range(1, steps + 1):
-        losses: List[torch.Tensor] = []
+        model.zero_grad(set_to_none=True)
+        decode_grad = torch.zeros_like(model.decode_vecs)
         total_correct = 0
         total_targets = 0
 
@@ -186,18 +206,43 @@ def train(
             for i in range(len(target_seq)):
                 prefix = lhs + target_seq[:i]
                 target_id = model.stoi[target_seq[i]]
-                logits = model.forward_prefix_ids(model.encode(prefix))
-                losses.append(F.cross_entropy(logits.unsqueeze(0), torch.tensor([target_id], device=device)))
-                total_correct += int(int(logits.argmax().item()) == target_id)
+                token_ids = model.encode(prefix)
+                v = model.queried_vector_ids(token_ids)
+
+                with torch.no_grad():
+                    v_det = v.detach()
+                    v_hat = normalize_last_dim(v_det)
+                    logits_det = model.decode_vecs @ v_det
+                    pred_id = int(logits_det.argmax().item())
+                    total_correct += int(pred_id == target_id)
+
+                    target_dir = normalize_last_dim(model.decode_vecs[target_id].detach())
+                    if pred_id == target_id:
+                        # Match: queried vector and target decoder are encouraged to align.
+                        grad_v = target_dir
+                        decode_grad[target_id].add_(v_hat)
+                    else:
+                        # Mismatch: queried vector and target decoder are encouraged to become orthogonal.
+                        grad_v = orthogonal_unit_in_plane(target_dir, v_hat)
+                        decode_grad[target_id].add_(orthogonal_unit_in_plane(v_hat, target_dir))
+
+                    # Requested decoder pseudo-gradient:
+                    # non-target classes use in-plane orthogonal unit vectors to queried vector.
+                    for c in range(model.vocab_size):
+                        if c == target_id:
+                            continue
+                        decode_grad[c].add_(orthogonal_unit_in_plane(v_hat, model.decode_vecs[c].detach()))
+
+                # Backprop pseudo-gradient into matrix embeddings/query only.
+                v.backward(grad_v)
                 total_targets += 1
 
-        loss = torch.stack(losses).mean()
-        loss.backward()
+        model.decode_vecs.grad = decode_grad
         optim.step(model)
 
         if step % log_every == 0 or step == 1:
             acc = total_correct / max(total_targets, 1)
-            print(f"step={step:5d} loss={loss.item():.4f} token_acc={acc:.3f}")
+            print(f"step={step:5d} token_acc={acc:.3f}")
 
         if step % eval_every == 0 or step == steps:
             exact, tf_acc, stop_rate = evaluate(
