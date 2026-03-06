@@ -29,6 +29,7 @@ class MatrixNetwork(torch.nn.Module):
         self.itos: Dict[int, str] = {i: ch for ch, i in self.stoi.items()}
 
         std = (1.0 / n) ** 0.5
+        self.base_mat = torch.nn.Parameter(torch.eye(n, device=device) + torch.randn(n, n, device=device) * 1e-4)
         eye = torch.eye(n, device=device).unsqueeze(0).repeat(self.vocab_size, 1, 1)
         self.token_mats = torch.nn.Parameter(eye + torch.randn(self.vocab_size, n, n, device=device) * 1e-4)
         self.decode_vecs = torch.nn.Parameter(torch.randn(self.vocab_size, n, device=device) * std)
@@ -38,6 +39,7 @@ class MatrixNetwork(torch.nn.Module):
 
     @torch.no_grad()
     def renormalize_in_place(self) -> None:
+        self.base_mat.copy_(normalize_last_dim(self.base_mat))
         self.token_mats.copy_(normalize_last_dim(self.token_mats))
         self.decode_vecs.copy_(normalize_last_dim(self.decode_vecs))
         self.query.copy_(normalize_last_dim(self.query))
@@ -46,7 +48,7 @@ class MatrixNetwork(torch.nn.Module):
         return [self.stoi[ch] for ch in s]
 
     def queried_vector_ids(self, token_ids: Sequence[int]) -> torch.Tensor:
-        p = torch.eye(self.n, device=self.token_mats.device)
+        p = self.base_mat
         for tid in token_ids:
             p = p @ self.token_mats[tid]
         v = p @ self.query
@@ -72,6 +74,7 @@ class RotationalGD:
     momentum_end: float = 0.98
     momentum_ramp_iters: int = 3000
     _iter_count: int = 0
+    _hist_b: torch.Tensor | None = None
     _hist_m: torch.Tensor | None = None
     _hist_d: torch.Tensor | None = None
     _hist_q: torch.Tensor | None = None
@@ -107,6 +110,14 @@ class RotationalGD:
     def step(self, model: MatrixNetwork) -> None:
         self._iter_count += 1
         momentum = self._current_momentum()
+
+        # Base matrix.
+        w_b = model.base_mat
+        g_b = model.base_mat.grad
+        if g_b is not None:
+            target_b, self._hist_b = self._target_direction(g_b, self._hist_b, momentum)
+            new_b = w_b + self.learning_rate * (target_b - w_b)
+            w_b.copy_(normalize_last_dim(new_b))
 
         # Token matrices: move toward negative normalized gradient target, then renormalize.
         w_m = model.token_mats
@@ -418,7 +429,17 @@ def load_checkpoint(load_path: str, device: torch.device) -> tuple[MatrixNetwork
     except TypeError:
         ckpt = torch.load(path, map_location=device)
     model = MatrixNetwork(n=int(ckpt["n"]), device=device)
-    model.load_state_dict(ckpt["state_dict"])
+    incompatible = model.load_state_dict(ckpt["state_dict"], strict=False)
+    allowed_missing = {"base_mat"}
+    missing = set(incompatible.missing_keys)
+    unexpected = set(incompatible.unexpected_keys)
+    disallowed_missing = missing - allowed_missing
+    if disallowed_missing:
+        raise ValueError(f"Checkpoint missing unsupported keys: {sorted(disallowed_missing)}")
+    if unexpected:
+        raise ValueError(f"Checkpoint has unexpected keys: {sorted(unexpected)}")
+    if "base_mat" in missing:
+        print("checkpoint_missing_base_mat=true; using newly initialized base matrix")
     addend_digits = ckpt.get("addend_digits")
     if addend_digits is not None:
         addend_digits = int(addend_digits)

@@ -46,7 +46,15 @@ def load_model(checkpoint_path: Path, device: torch.device) -> Tuple[MatrixNetwo
         raise ValueError("Checkpoint missing required keys: 'n' and 'state_dict'")
 
     model = MatrixNetwork(n=int(ckpt["n"]), device=device)
-    model.load_state_dict(ckpt["state_dict"])
+    incompatible = model.load_state_dict(ckpt["state_dict"], strict=False)
+    allowed_missing = {"base_mat"}
+    missing = set(incompatible.missing_keys)
+    unexpected = set(incompatible.unexpected_keys)
+    disallowed_missing = missing - allowed_missing
+    if disallowed_missing:
+        raise ValueError(f"Checkpoint missing unsupported keys: {sorted(disallowed_missing)}")
+    if unexpected:
+        raise ValueError(f"Checkpoint has unexpected keys: {sorted(unexpected)}")
     model.eval()
     addend_digits = int(ckpt.get("addend_digits", 3))
     return model, addend_digits
