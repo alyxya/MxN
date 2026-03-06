@@ -29,11 +29,11 @@ def parse_prompt_line(line: str) -> Tuple[int, int]:
     raise ValueError("Enter either '123+456' or '123 456'")
 
 
-def format_lhs(a: int, b: int) -> str:
-    return f"{a:03d}+{b:03d}="
+def format_lhs(a: int, b: int, addend_digits: int) -> str:
+    return f"{a:0{addend_digits}d}+{b:0{addend_digits}d}="
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> MatrixNetwork:
+def load_model(checkpoint_path: Path, device: torch.device) -> Tuple[MatrixNetwork, int]:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
@@ -48,12 +48,13 @@ def load_model(checkpoint_path: Path, device: torch.device) -> MatrixNetwork:
     model = MatrixNetwork(n=int(ckpt["n"]), device=device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
-    return model
+    addend_digits = int(ckpt.get("addend_digits", 3))
+    return model, addend_digits
 
 
 @torch.no_grad()
-def run_prediction(model: MatrixNetwork, a: int, b: int, max_gen_len: int) -> None:
-    lhs = format_lhs(a, b)
+def run_prediction(model: MatrixNetwork, a: int, b: int, max_gen_len: int, addend_digits: int) -> None:
+    lhs = format_lhs(a, b, addend_digits)
     pred, did_stop = generate_until_eos(model, lhs, max_gen_len)
     expected = str(a + b)
     status = "eos" if did_stop else "max_len"
@@ -73,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--max-gen-len", type=int, default=8)
+    p.add_argument("--addend-digits", type=int, default=None, help="Override addend width used for prompt formatting")
     p.add_argument("--expr", type=str, default=None, help="Single expression, e.g. '123+456'")
     p.add_argument("--a", type=int, default=None, help="First addend for one-shot run")
     p.add_argument("--b", type=int, default=None, help="Second addend for one-shot run")
@@ -83,18 +85,19 @@ def main() -> None:
     args = parse_args()
     device = pick_device(args.device)
     ckpt_path = Path(args.checkpoint)
-    model = load_model(ckpt_path, device)
-    print(f"loaded={ckpt_path} device={device} n={model.n}")
+    model, ckpt_addend_digits = load_model(ckpt_path, device)
+    addend_digits = args.addend_digits if args.addend_digits is not None else ckpt_addend_digits
+    print(f"loaded={ckpt_path} device={device} n={model.n} addend_digits={addend_digits}")
 
     if args.expr is not None:
         a, b = parse_expression(args.expr)
-        run_prediction(model, a, b, args.max_gen_len)
+        run_prediction(model, a, b, args.max_gen_len, addend_digits)
         return
 
     if args.a is not None or args.b is not None:
         if args.a is None or args.b is None:
             raise ValueError("If using --a/--b, both must be set")
-        run_prediction(model, args.a, args.b, args.max_gen_len)
+        run_prediction(model, args.a, args.b, args.max_gen_len, addend_digits)
         return
 
     print("Enter additions as '123+456' or '123 456'. Type 'quit' to exit.")
@@ -112,7 +115,7 @@ def main() -> None:
 
         try:
             a, b = parse_prompt_line(line)
-            run_prediction(model, a, b, args.max_gen_len)
+            run_prediction(model, a, b, args.max_gen_len, addend_digits)
         except Exception as exc:
             print(f"error: {exc}")
 

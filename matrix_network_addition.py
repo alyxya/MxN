@@ -91,10 +91,11 @@ class RotationalGD:
         model.zero_grad(set_to_none=True)
 
 
-def random_problem(rng: random.Random) -> Tuple[int, int, str, str]:
-    a = rng.randint(0, 999)
-    b = rng.randint(0, 999)
-    lhs = f"{a:03d}+{b:03d}="
+def random_problem(rng: random.Random, addend_digits: int) -> Tuple[int, int, str, str]:
+    max_val = (10**addend_digits) - 1
+    a = rng.randint(0, max_val)
+    b = rng.randint(0, max_val)
+    lhs = f"{a:0{addend_digits}d}+{b:0{addend_digits}d}="
     rhs = str(a + b)
     return a, b, lhs, rhs
 
@@ -109,7 +110,13 @@ def generate_until_eos(model: MatrixNetwork, lhs: str, max_len: int) -> Tuple[st
     return pred, False
 
 
-def evaluate(model: MatrixNetwork, eval_samples: int, seed: int, max_gen_len: int) -> Tuple[float, float, float]:
+def evaluate(
+    model: MatrixNetwork,
+    eval_samples: int,
+    seed: int,
+    max_gen_len: int,
+    addend_digits: int,
+) -> Tuple[float, float, float]:
     rng = random.Random(seed)
     exact = 0
     tf_correct = 0
@@ -117,7 +124,7 @@ def evaluate(model: MatrixNetwork, eval_samples: int, seed: int, max_gen_len: in
     stopped = 0
 
     for _ in range(eval_samples):
-        _, _, lhs, rhs = random_problem(rng)
+        _, _, lhs, rhs = random_problem(rng, addend_digits)
 
         pred, did_stop = generate_until_eos(model, lhs, max_gen_len)
         stopped += int(did_stop)
@@ -133,10 +140,16 @@ def evaluate(model: MatrixNetwork, eval_samples: int, seed: int, max_gen_len: in
     return exact / eval_samples, tf_correct / max(tf_total, 1), stopped / eval_samples
 
 
-def show_samples(model: MatrixNetwork, seed: int, max_gen_len: int, count: int = 10) -> None:
+def show_samples(
+    model: MatrixNetwork,
+    seed: int,
+    max_gen_len: int,
+    addend_digits: int,
+    count: int = 10,
+) -> None:
     rng = random.Random(seed)
     for _ in range(count):
-        a, b, lhs, rhs = random_problem(rng)
+        a, b, lhs, rhs = random_problem(rng, addend_digits)
         pred, did_stop = generate_until_eos(model, lhs, max_gen_len)
         ok = "OK" if (did_stop and pred == rhs) else "XX"
         stop_txt = "eos" if did_stop else "max"
@@ -148,6 +161,7 @@ def train(
     steps: int,
     batch_size: int,
     step_size: float,
+    addend_digits: int,
     seed: int,
     log_every: int,
     eval_every: int,
@@ -167,7 +181,7 @@ def train(
         total_targets = 0
 
         for _ in range(batch_size):
-            _, _, lhs, rhs = random_problem(rng)
+            _, _, lhs, rhs = random_problem(rng, addend_digits)
             target_seq = rhs + EOS_TOKEN
             for i in range(len(target_seq)):
                 prefix = lhs + target_seq[:i]
@@ -186,7 +200,13 @@ def train(
             print(f"step={step:5d} loss={loss.item():.4f} token_acc={acc:.3f}")
 
         if step % eval_every == 0 or step == steps:
-            exact, tf_acc, stop_rate = evaluate(model, eval_samples=eval_samples, seed=seed + step, max_gen_len=max_gen_len)
+            exact, tf_acc, stop_rate = evaluate(
+                model,
+                eval_samples=eval_samples,
+                seed=seed + step,
+                max_gen_len=max_gen_len,
+                addend_digits=addend_digits,
+            )
             print(f"  eval exact_match={exact:.3f} teacher_forced_token_acc={tf_acc:.3f} stop_rate={stop_rate:.3f}")
 
     return model
@@ -208,6 +228,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=1500, help="Training steps")
     p.add_argument("--batch-size", type=int, default=64, help="Problems per step")
     p.add_argument("--step-size", type=float, default=0.2, help="Rotational interpolation step toward normalized update target")
+    p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)
@@ -219,7 +240,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def load_checkpoint(load_path: str, device: torch.device) -> MatrixNetwork:
+def load_checkpoint(load_path: str, device: torch.device) -> tuple[MatrixNetwork, int | None]:
     path = Path(load_path)
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
@@ -229,10 +250,13 @@ def load_checkpoint(load_path: str, device: torch.device) -> MatrixNetwork:
         ckpt = torch.load(path, map_location=device)
     model = MatrixNetwork(n=int(ckpt["n"]), device=device)
     model.load_state_dict(ckpt["state_dict"])
-    return model
+    addend_digits = ckpt.get("addend_digits")
+    if addend_digits is not None:
+        addend_digits = int(addend_digits)
+    return model, addend_digits
 
 
-def save_checkpoint(model: MatrixNetwork, save_path: str) -> None:
+def save_checkpoint(model: MatrixNetwork, save_path: str, addend_digits: int) -> None:
     path = Path(save_path)
     if path.parent:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -240,6 +264,7 @@ def save_checkpoint(model: MatrixNetwork, save_path: str) -> None:
         {
             "n": model.n,
             "vocab": model.vocab,
+            "addend_digits": addend_digits,
             "state_dict": model.state_dict(),
         },
         path,
@@ -251,15 +276,23 @@ def main() -> None:
     device = pick_device(args.device)
     print(f"device={device}")
     model = None
+    addend_digits = args.addend_digits
     if args.load_path is not None:
-        model = load_checkpoint(args.load_path, device)
+        model, loaded_addend_digits = load_checkpoint(args.load_path, device)
         if model.n != args.n:
             print(f"loaded_n={model.n}; overriding --n={args.n} with checkpoint dimension")
+        if loaded_addend_digits is not None and loaded_addend_digits != args.addend_digits:
+            print(
+                f"loaded_addend_digits={loaded_addend_digits}; overriding --addend-digits={args.addend_digits}"
+            )
+            addend_digits = loaded_addend_digits
+    print(f"addend_digits={addend_digits}")
     model = train(
         n=model.n if model is not None else args.n,
         steps=args.steps,
         batch_size=args.batch_size,
         step_size=args.step_size,
+        addend_digits=addend_digits,
         seed=args.seed,
         log_every=args.log_every,
         eval_every=args.eval_every,
@@ -268,10 +301,15 @@ def main() -> None:
         device=device,
         model=model,
     )
-    save_checkpoint(model, args.save_path)
+    save_checkpoint(model, args.save_path, addend_digits=addend_digits)
     print(f"saved_checkpoint={args.save_path}")
     print("\nSample predictions:")
-    show_samples(model, seed=args.seed + 999, max_gen_len=args.max_gen_len)
+    show_samples(
+        model,
+        seed=args.seed + 999,
+        max_gen_len=args.max_gen_len,
+        addend_digits=addend_digits,
+    )
 
 
 if __name__ == "__main__":
