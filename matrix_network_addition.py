@@ -67,14 +67,52 @@ class MatrixNetwork(torch.nn.Module):
 @dataclass
 class RotationalGD:
     learning_rate: float
+    use_momentum: bool = False
+    momentum_start: float = 0.2
+    momentum_end: float = 0.98
+    momentum_ramp_iters: int = 3000
+    _iter_count: int = 0
+    _hist_m: torch.Tensor | None = None
+    _hist_d: torch.Tensor | None = None
+    _hist_q: torch.Tensor | None = None
+
+    def _current_momentum(self) -> float:
+        if self.momentum_ramp_iters <= 0:
+            ramp = 1.0
+        else:
+            ramp = min(1.0, max(0.0, (self._iter_count - 1) / float(self.momentum_ramp_iters)))
+        return self.momentum_start + (self.momentum_end - self.momentum_start) * ramp
+
+    def _target_direction(
+        self,
+        grad: torch.Tensor,
+        hist: torch.Tensor | None,
+        momentum: float,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        cur = -normalize_last_dim(grad)
+        if not self.use_momentum:
+            return cur, hist
+        if (
+            hist is None
+            or hist.shape != cur.shape
+            or hist.device != cur.device
+            or hist.dtype != cur.dtype
+        ):
+            hist = cur.clone()
+        else:
+            hist = normalize_last_dim(momentum * hist + (1.0 - momentum) * cur)
+        return hist, hist
 
     @torch.no_grad()
     def step(self, model: MatrixNetwork) -> None:
+        self._iter_count += 1
+        momentum = self._current_momentum()
+
         # Token matrices: move toward negative normalized gradient target, then renormalize.
         w_m = model.token_mats
         g_m = model.token_mats.grad
         if g_m is not None:
-            target_m = -normalize_last_dim(g_m)
+            target_m, self._hist_m = self._target_direction(g_m, self._hist_m, momentum)
             new_m = w_m + self.learning_rate * (target_m - w_m)
             w_m.copy_(normalize_last_dim(new_m))
 
@@ -82,7 +120,7 @@ class RotationalGD:
         w_d = model.decode_vecs
         g_d = model.decode_vecs.grad
         if g_d is not None:
-            target_d = -normalize_last_dim(g_d)
+            target_d, self._hist_d = self._target_direction(g_d, self._hist_d, momentum)
             new_d = w_d + self.learning_rate * (target_d - w_d)
             w_d.copy_(normalize_last_dim(new_d))
 
@@ -90,7 +128,7 @@ class RotationalGD:
         w_q = model.query
         g_q = model.query.grad
         if g_q is not None:
-            target_q = -normalize_last_dim(g_q)
+            target_q, self._hist_q = self._target_direction(g_q, self._hist_q, momentum)
             new_q = w_q + self.learning_rate * (target_q - w_q)
             w_q.copy_(normalize_last_dim(new_q))
 
@@ -198,6 +236,10 @@ def train(
     iters: int,
     batch_size: int,
     learning_rate: float,
+    use_momentum: bool,
+    momentum_start: float,
+    momentum_end: float,
+    momentum_ramp_iters: int,
     addend_digits: int,
     seed: int,
     log_every: int,
@@ -212,7 +254,13 @@ def train(
     rng = random.Random(seed)
     if model is None:
         model = MatrixNetwork(n=n, device=device)
-    optim = RotationalGD(learning_rate=learning_rate)
+    optim = RotationalGD(
+        learning_rate=learning_rate,
+        use_momentum=use_momentum,
+        momentum_start=momentum_start,
+        momentum_end=momentum_end,
+        momentum_ramp_iters=momentum_ramp_iters,
+    )
     fixed_train: List[Problem] | None = None
     if fixed_train_size > 0:
         fixed_seed = seed if fixed_train_seed is None else fixed_train_seed
@@ -302,6 +350,29 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
         help="Rotational interpolation rate toward normalized negative gradient target",
     )
+    p.add_argument(
+        "--use-momentum",
+        action="store_true",
+        help="Enable scheduled momentum on normalized gradient directions",
+    )
+    p.add_argument(
+        "--momentum-start",
+        type=float,
+        default=0.2,
+        help="Initial momentum weight for gradient history (used with --use-momentum)",
+    )
+    p.add_argument(
+        "--momentum-end",
+        type=float,
+        default=0.98,
+        help="Final momentum weight for gradient history after ramp (used with --use-momentum)",
+    )
+    p.add_argument(
+        "--momentum-ramp-iters",
+        type=int,
+        default=3000,
+        help="Iterations over which momentum increases from start to end (used with --use-momentum)",
+    )
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
@@ -312,7 +383,7 @@ def parse_args() -> argparse.Namespace:
         "--fixed-train-size",
         type=int,
         default=0,
-        help="If >0, sample this many training problems once and reuse them every step",
+        help="If >0, sample this many training problems once and reuse them every iteration",
     )
     p.add_argument(
         "--fixed-train-seed",
@@ -359,9 +430,25 @@ def save_checkpoint(model: MatrixNetwork, save_path: str, addend_digits: int) ->
 
 def main() -> None:
     args = parse_args()
+    if not (0.0 <= args.momentum_start < 1.0):
+        raise ValueError("--momentum-start must be in [0, 1)")
+    if not (0.0 <= args.momentum_end < 1.0):
+        raise ValueError("--momentum-end must be in [0, 1)")
+    if args.momentum_end < args.momentum_start:
+        raise ValueError("--momentum-end must be >= --momentum-start")
+    if args.momentum_ramp_iters < 0:
+        raise ValueError("--momentum-ramp-iters must be >= 0")
+
     device = pick_device(args.device)
     print(f"device={device}")
     print(f"iters={args.iters} learning_rate={args.learning_rate}")
+    if args.use_momentum:
+        print(
+            f"momentum=on start={args.momentum_start} end={args.momentum_end} "
+            f"ramp_iters={args.momentum_ramp_iters}"
+        )
+    else:
+        print("momentum=off")
     model = None
     addend_digits = args.addend_digits
     if args.load_path is not None:
@@ -379,6 +466,10 @@ def main() -> None:
         iters=args.iters,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        use_momentum=args.use_momentum,
+        momentum_start=args.momentum_start,
+        momentum_end=args.momentum_end,
+        momentum_ramp_iters=args.momentum_ramp_iters,
         addend_digits=addend_digits,
         seed=args.seed,
         log_every=args.log_every,

@@ -52,3 +52,18 @@ python matrix_network_addition.py \
   --eval-every 1000 \
   --save-path checkpoints/matrix_network_n30_step0005_resume10k.pt
 ```
+
+## Optional Momentum
+
+Enable scheduled momentum on normalized gradient directions:
+
+```bash
+python matrix_network_addition.py \
+  --n 30 \
+  --learning-rate 0.01 \
+  --iters 10000 \
+  --use-momentum \
+  --momentum-start 0.2 \
+  --momentum-end 0.98 \
+  --momentum-ramp-iters 3000
+```
