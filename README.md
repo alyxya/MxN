@@ -31,8 +31,8 @@ Example fresh training run:
 ```bash
 python matrix_network_addition.py \
   --n 30 \
-  --step-size 0.01 \
-  --steps 10000 \
+  --learning-rate 0.01 \
+  --iters 10000 \
   --batch-size 64 \
   --eval-every 1000 \
   --save-path checkpoints/matrix_network_n30_step001_10k.pt
@@ -46,8 +46,8 @@ Resume from a checkpoint (same architecture, smaller step size):
 python matrix_network_addition.py \
   --load-path checkpoints/matrix_network_n30_step001_10k.pt \
   --n 30 \
-  --step-size 0.005 \
-  --steps 10000 \
+  --learning-rate 0.005 \
+  --iters 10000 \
   --batch-size 64 \
   --eval-every 1000 \
   --save-path checkpoints/matrix_network_n30_step0005_resume10k.pt

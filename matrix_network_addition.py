@@ -66,7 +66,7 @@ class MatrixNetwork(torch.nn.Module):
 
 @dataclass
 class RotationalGD:
-    step_size: float
+    learning_rate: float
 
     @torch.no_grad()
     def step(self, model: MatrixNetwork) -> None:
@@ -75,7 +75,7 @@ class RotationalGD:
         g_m = model.token_mats.grad
         if g_m is not None:
             target_m = -normalize_last_dim(g_m)
-            new_m = w_m + self.step_size * (target_m - w_m)
+            new_m = w_m + self.learning_rate * (target_m - w_m)
             w_m.copy_(normalize_last_dim(new_m))
 
         # Decoder vectors.
@@ -83,7 +83,7 @@ class RotationalGD:
         g_d = model.decode_vecs.grad
         if g_d is not None:
             target_d = -normalize_last_dim(g_d)
-            new_d = w_d + self.step_size * (target_d - w_d)
+            new_d = w_d + self.learning_rate * (target_d - w_d)
             w_d.copy_(normalize_last_dim(new_d))
 
         # Query vector.
@@ -91,7 +91,7 @@ class RotationalGD:
         g_q = model.query.grad
         if g_q is not None:
             target_q = -normalize_last_dim(g_q)
-            new_q = w_q + self.step_size * (target_q - w_q)
+            new_q = w_q + self.learning_rate * (target_q - w_q)
             w_q.copy_(normalize_last_dim(new_q))
 
         model.zero_grad(set_to_none=True)
@@ -195,9 +195,9 @@ def show_samples(
 
 def train(
     n: int,
-    steps: int,
+    iters: int,
     batch_size: int,
-    step_size: float,
+    learning_rate: float,
     addend_digits: int,
     seed: int,
     log_every: int,
@@ -212,7 +212,7 @@ def train(
     rng = random.Random(seed)
     if model is None:
         model = MatrixNetwork(n=n, device=device)
-    optim = RotationalGD(step_size=step_size)
+    optim = RotationalGD(learning_rate=learning_rate)
     fixed_train: List[Problem] | None = None
     if fixed_train_size > 0:
         fixed_seed = seed if fixed_train_seed is None else fixed_train_seed
@@ -223,7 +223,7 @@ def train(
         )
         print(f"fixed_train_size={len(fixed_train)} fixed_train_seed={fixed_seed}")
 
-    for step in range(1, steps + 1):
+    for iter_idx in range(1, iters + 1):
         model.zero_grad(set_to_none=True)
         losses: List[torch.Tensor] = []
         total_correct = 0
@@ -248,11 +248,11 @@ def train(
         loss.backward()
         optim.step(model)
 
-        if step % log_every == 0 or step == 1:
+        if iter_idx % log_every == 0 or iter_idx == 1:
             acc = total_correct / max(total_targets, 1)
-            print(f"step={step:5d} loss={loss.item():.4f} token_acc={acc:.3f}")
+            print(f"iter={iter_idx:5d} loss={loss.item():.4f} token_acc={acc:.3f}")
 
-        if step % eval_every == 0 or step == steps:
+        if iter_idx % eval_every == 0 or iter_idx == iters:
             if fixed_train is not None:
                 tr_exact, tr_tf_acc, tr_stop_rate = evaluate_on_dataset(
                     model,
@@ -267,7 +267,7 @@ def train(
             exact, tf_acc, stop_rate = evaluate(
                 model,
                 eval_samples=eval_samples,
-                seed=seed + step,
+                seed=seed + iter_idx,
                 max_gen_len=max_gen_len,
                 addend_digits=addend_digits,
             )
@@ -289,9 +289,19 @@ def pick_device(requested: str) -> torch.device:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Matrix-network toy model for 3-digit addition")
     p.add_argument("--n", type=int, default=16, help="Embedding matrix/vector dimension")
-    p.add_argument("--steps", type=int, default=1500, help="Training steps")
-    p.add_argument("--batch-size", type=int, default=64, help="Problems per step")
-    p.add_argument("--step-size", type=float, default=0.2, help="Rotational interpolation step toward normalized update target")
+    p.add_argument(
+        "--iters",
+        type=int,
+        default=1500,
+        help="Training iterations",
+    )
+    p.add_argument("--batch-size", type=int, default=64, help="Problems per iteration")
+    p.add_argument(
+        "--learning-rate",
+        type=float,
+        default=0.2,
+        help="Rotational interpolation rate toward normalized negative gradient target",
+    )
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
@@ -351,6 +361,7 @@ def main() -> None:
     args = parse_args()
     device = pick_device(args.device)
     print(f"device={device}")
+    print(f"iters={args.iters} learning_rate={args.learning_rate}")
     model = None
     addend_digits = args.addend_digits
     if args.load_path is not None:
@@ -365,9 +376,9 @@ def main() -> None:
     print(f"addend_digits={addend_digits}")
     model = train(
         n=model.n if model is not None else args.n,
-        steps=args.steps,
+        iters=args.iters,
         batch_size=args.batch_size,
-        step_size=args.step_size,
+        learning_rate=args.learning_rate,
         addend_digits=addend_digits,
         seed=args.seed,
         log_every=args.log_every,
