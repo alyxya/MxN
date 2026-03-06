@@ -236,6 +236,7 @@ def train(
     iters: int,
     batch_size: int,
     learning_rate: float,
+    loss_temp: float,
     use_momentum: bool,
     momentum_start: float,
     momentum_end: float,
@@ -288,7 +289,12 @@ def train(
                 target_id = model.stoi[target_seq[i]]
                 token_ids = model.encode(prefix)
                 logits = model.forward_prefix_ids(token_ids)
-                losses.append(F.cross_entropy(logits.unsqueeze(0), torch.tensor([target_id], device=device)))
+                losses.append(
+                    F.cross_entropy(
+                        (logits / loss_temp).unsqueeze(0),
+                        torch.tensor([target_id], device=device),
+                    )
+                )
                 total_correct += int(int(logits.argmax().item()) == target_id)
                 total_targets += 1
 
@@ -349,6 +355,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.2,
         help="Rotational interpolation rate toward normalized negative gradient target",
+    )
+    p.add_argument(
+        "--loss-temp",
+        type=float,
+        default=1.0,
+        help="Cross-entropy temperature (loss is computed on logits / loss_temp)",
     )
     p.add_argument(
         "--use-momentum",
@@ -430,6 +442,8 @@ def save_checkpoint(model: MatrixNetwork, save_path: str, addend_digits: int) ->
 
 def main() -> None:
     args = parse_args()
+    if args.loss_temp <= 0.0:
+        raise ValueError("--loss-temp must be > 0")
     if not (0.0 <= args.momentum_start < 1.0):
         raise ValueError("--momentum-start must be in [0, 1)")
     if not (0.0 <= args.momentum_end < 1.0):
@@ -441,7 +455,7 @@ def main() -> None:
 
     device = pick_device(args.device)
     print(f"device={device}")
-    print(f"iters={args.iters} learning_rate={args.learning_rate}")
+    print(f"iters={args.iters} learning_rate={args.learning_rate} loss_temp={args.loss_temp}")
     if args.use_momentum:
         print(
             f"momentum=on start={args.momentum_start} end={args.momentum_end} "
@@ -466,6 +480,7 @@ def main() -> None:
         iters=args.iters,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        loss_temp=args.loss_temp,
         use_momentum=args.use_momentum,
         momentum_start=args.momentum_start,
         momentum_end=args.momentum_end,
