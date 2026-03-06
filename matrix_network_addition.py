@@ -6,30 +6,17 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 
 
 EOS_TOKEN = "~"
 VOCAB = f"0123456789+={EOS_TOKEN}"
 EPS = 1e-12
+Problem = Tuple[int, int, str, str]
 
 
 def normalize_last_dim(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
     return x / (x.norm(dim=-1, keepdim=True) + eps)
-
-
-def orthogonal_unit_in_plane(v_hat: torch.Tensor, d: torch.Tensor, eps: float = EPS) -> torch.Tensor:
-    # Orthogonal component of decoder vector within span{v_hat, d}.
-    d_orth = d - torch.dot(d, v_hat) * v_hat
-    n = d_orth.norm()
-    if float(n.item()) > eps:
-        return d_orth / (n + eps)
-
-    # Degenerate case: d nearly parallel to v_hat, pick a stable orthogonal direction.
-    idx = int(torch.argmin(torch.abs(v_hat)).item())
-    basis = torch.zeros_like(v_hat)
-    basis[idx] = 1.0
-    fallback = basis - torch.dot(basis, v_hat) * v_hat
-    return fallback / (fallback.norm() + eps)
 
 
 class MatrixNetwork(torch.nn.Module):
@@ -83,11 +70,11 @@ class RotationalGD:
 
     @torch.no_grad()
     def step(self, model: MatrixNetwork) -> None:
-        # Token matrices: move toward normalized pseudo-gradient target, then renormalize.
+        # Token matrices: move toward negative normalized gradient target, then renormalize.
         w_m = model.token_mats
         g_m = model.token_mats.grad
         if g_m is not None:
-            target_m = normalize_last_dim(g_m)
+            target_m = -normalize_last_dim(g_m)
             new_m = w_m + self.step_size * (target_m - w_m)
             w_m.copy_(normalize_last_dim(new_m))
 
@@ -95,7 +82,7 @@ class RotationalGD:
         w_d = model.decode_vecs
         g_d = model.decode_vecs.grad
         if g_d is not None:
-            target_d = normalize_last_dim(g_d)
+            target_d = -normalize_last_dim(g_d)
             new_d = w_d + self.step_size * (target_d - w_d)
             w_d.copy_(normalize_last_dim(new_d))
 
@@ -103,20 +90,25 @@ class RotationalGD:
         w_q = model.query
         g_q = model.query.grad
         if g_q is not None:
-            target_q = normalize_last_dim(g_q)
+            target_q = -normalize_last_dim(g_q)
             new_q = w_q + self.step_size * (target_q - w_q)
             w_q.copy_(normalize_last_dim(new_q))
 
         model.zero_grad(set_to_none=True)
 
 
-def random_problem(rng: random.Random, addend_digits: int) -> Tuple[int, int, str, str]:
+def random_problem(rng: random.Random, addend_digits: int) -> Problem:
     max_val = (10**addend_digits) - 1
     a = rng.randint(0, max_val)
     b = rng.randint(0, max_val)
     lhs = f"{a:0{addend_digits}d}+{b:0{addend_digits}d}="
     rhs = str(a + b)
     return a, b, lhs, rhs
+
+
+def make_fixed_dataset(seed: int, size: int, addend_digits: int) -> List[Problem]:
+    rng = random.Random(seed)
+    return [random_problem(rng, addend_digits) for _ in range(size)]
 
 
 def generate_until_eos(model: MatrixNetwork, lhs: str, max_len: int) -> Tuple[str, bool]:
@@ -159,6 +151,32 @@ def evaluate(
     return exact / eval_samples, tf_correct / max(tf_total, 1), stopped / eval_samples
 
 
+def evaluate_on_dataset(
+    model: MatrixNetwork,
+    dataset: Sequence[Problem],
+    max_gen_len: int,
+) -> Tuple[float, float, float]:
+    exact = 0
+    tf_correct = 0
+    tf_total = 0
+    stopped = 0
+
+    for _, _, lhs, rhs in dataset:
+        pred, did_stop = generate_until_eos(model, lhs, max_gen_len)
+        stopped += int(did_stop)
+        if did_stop and pred == rhs:
+            exact += 1
+
+        target_seq = rhs + EOS_TOKEN
+        for i in range(len(target_seq)):
+            next_ch = model.predict_next(lhs + target_seq[:i])
+            tf_correct += int(next_ch == target_seq[i])
+            tf_total += 1
+
+    total = max(len(dataset), 1)
+    return exact / total, tf_correct / max(tf_total, 1), stopped / total
+
+
 def show_samples(
     model: MatrixNetwork,
     seed: int,
@@ -188,63 +206,64 @@ def train(
     max_gen_len: int,
     device: torch.device,
     model: MatrixNetwork | None = None,
+    fixed_train_size: int = 0,
+    fixed_train_seed: int | None = None,
 ) -> MatrixNetwork:
     rng = random.Random(seed)
     if model is None:
         model = MatrixNetwork(n=n, device=device)
     optim = RotationalGD(step_size=step_size)
+    fixed_train: List[Problem] | None = None
+    if fixed_train_size > 0:
+        fixed_seed = seed if fixed_train_seed is None else fixed_train_seed
+        fixed_train = make_fixed_dataset(
+            seed=fixed_seed,
+            size=fixed_train_size,
+            addend_digits=addend_digits,
+        )
+        print(f"fixed_train_size={len(fixed_train)} fixed_train_seed={fixed_seed}")
 
     for step in range(1, steps + 1):
         model.zero_grad(set_to_none=True)
-        decode_grad = torch.zeros_like(model.decode_vecs)
+        losses: List[torch.Tensor] = []
         total_correct = 0
         total_targets = 0
 
         for _ in range(batch_size):
-            _, _, lhs, rhs = random_problem(rng, addend_digits)
+            if fixed_train is None:
+                _, _, lhs, rhs = random_problem(rng, addend_digits)
+            else:
+                _, _, lhs, rhs = fixed_train[rng.randrange(len(fixed_train))]
             target_seq = rhs + EOS_TOKEN
             for i in range(len(target_seq)):
                 prefix = lhs + target_seq[:i]
                 target_id = model.stoi[target_seq[i]]
                 token_ids = model.encode(prefix)
-                v = model.queried_vector_ids(token_ids)
-
-                with torch.no_grad():
-                    v_det = v.detach()
-                    v_hat = normalize_last_dim(v_det)
-                    logits_det = model.decode_vecs @ v_det
-                    pred_id = int(logits_det.argmax().item())
-                    total_correct += int(pred_id == target_id)
-
-                    target_dir = normalize_last_dim(model.decode_vecs[target_id].detach())
-                    if pred_id == target_id:
-                        # Match: queried vector and target decoder are encouraged to align.
-                        grad_v = target_dir
-                        decode_grad[target_id].add_(v_hat)
-                    else:
-                        # Mismatch: queried vector and target decoder are encouraged to become orthogonal.
-                        grad_v = orthogonal_unit_in_plane(target_dir, v_hat)
-                        decode_grad[target_id].add_(orthogonal_unit_in_plane(v_hat, target_dir))
-
-                    # Requested decoder pseudo-gradient:
-                    # non-target classes use in-plane orthogonal unit vectors to queried vector.
-                    for c in range(model.vocab_size):
-                        if c == target_id:
-                            continue
-                        decode_grad[c].add_(orthogonal_unit_in_plane(v_hat, model.decode_vecs[c].detach()))
-
-                # Backprop pseudo-gradient into matrix embeddings/query only.
-                v.backward(grad_v)
+                logits = model.forward_prefix_ids(token_ids)
+                losses.append(F.cross_entropy(logits.unsqueeze(0), torch.tensor([target_id], device=device)))
+                total_correct += int(int(logits.argmax().item()) == target_id)
                 total_targets += 1
 
-        model.decode_vecs.grad = decode_grad
+        loss = torch.stack(losses).mean()
+        loss.backward()
         optim.step(model)
 
         if step % log_every == 0 or step == 1:
             acc = total_correct / max(total_targets, 1)
-            print(f"step={step:5d} token_acc={acc:.3f}")
+            print(f"step={step:5d} loss={loss.item():.4f} token_acc={acc:.3f}")
 
         if step % eval_every == 0 or step == steps:
+            if fixed_train is not None:
+                tr_exact, tr_tf_acc, tr_stop_rate = evaluate_on_dataset(
+                    model,
+                    dataset=fixed_train,
+                    max_gen_len=max_gen_len,
+                )
+                print(
+                    f"  eval[fixed_train] exact_match={tr_exact:.3f} "
+                    f"teacher_forced_token_acc={tr_tf_acc:.3f} stop_rate={tr_stop_rate:.3f}"
+                )
+
             exact, tf_acc, stop_rate = evaluate(
                 model,
                 eval_samples=eval_samples,
@@ -252,7 +271,7 @@ def train(
                 max_gen_len=max_gen_len,
                 addend_digits=addend_digits,
             )
-            print(f"  eval exact_match={exact:.3f} teacher_forced_token_acc={tf_acc:.3f} stop_rate={stop_rate:.3f}")
+            print(f"  eval[random] exact_match={exact:.3f} teacher_forced_token_acc={tf_acc:.3f} stop_rate={stop_rate:.3f}")
 
     return model
 
@@ -279,6 +298,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
     p.add_argument("--max-gen-len", type=int, default=8, help="Autoregressive decode cutoff when EOS is not produced")
+    p.add_argument(
+        "--fixed-train-size",
+        type=int,
+        default=0,
+        help="If >0, sample this many training problems once and reuse them every step",
+    )
+    p.add_argument(
+        "--fixed-train-seed",
+        type=int,
+        default=None,
+        help="Seed used for fixed training set generation (defaults to --seed)",
+    )
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default="checkpoints/matrix_network_addition.pt", help="Checkpoint path")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -345,6 +376,8 @@ def main() -> None:
         max_gen_len=args.max_gen_len,
         device=device,
         model=model,
+        fixed_train_size=args.fixed_train_size,
+        fixed_train_seed=args.fixed_train_seed,
     )
     save_checkpoint(model, args.save_path, addend_digits=addend_digits)
     print(f"saved_checkpoint={args.save_path}")
