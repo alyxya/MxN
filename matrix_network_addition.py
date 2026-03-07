@@ -411,7 +411,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
-    p.add_argument("--max-gen-len", type=int, default=8, help="Autoregressive decode cutoff when EOS is not produced")
     p.add_argument(
         "--fixed-train-size",
         type=int,
@@ -509,6 +508,8 @@ def main() -> None:
             )
             addend_digits = loaded_addend_digits
     print(f"addend_digits={addend_digits}")
+    max_gen_len = addend_digits + 2
+    print(f"max_gen_len={max_gen_len}")
     model = train(
         n=model.n if model is not None else args.n,
         iters=args.iters,
@@ -525,7 +526,7 @@ def main() -> None:
         log_every=args.log_every,
         eval_every=args.eval_every,
         eval_samples=args.eval_samples,
-        max_gen_len=args.max_gen_len,
+        max_gen_len=max_gen_len,
         device=device,
         model=model,
         fixed_train_size=args.fixed_train_size,
@@ -537,7 +538,7 @@ def main() -> None:
     show_samples(
         model,
         seed=args.seed + 999,
-        max_gen_len=args.max_gen_len,
+        max_gen_len=max_gen_len,
         addend_digits=addend_digits,
     )
 
