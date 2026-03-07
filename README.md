@@ -55,7 +55,7 @@ python matrix_network_addition.py \
 
 ## Optional Momentum
 
-Enable scheduled momentum on normalized gradient directions:
+Enable EMA momentum on normalized gradient directions:
 
 ```bash
 python matrix_network_addition.py \
@@ -63,7 +63,29 @@ python matrix_network_addition.py \
   --learning-rate 0.01 \
   --iters 10000 \
   --use-momentum \
-  --momentum-start 0.2 \
-  --momentum-end 0.98 \
-  --momentum-ramp-iters 3000
+  --momentum-decay 0.98 \
+  --momentum-blend-start 0.0 \
+  --momentum-blend 0.5 \
+  --momentum-blend-ramp-iters 1000
+```
+
+## W&B Logging
+
+Install W&B first:
+
+```bash
+pip install wandb
+```
+
+Then enable logging in training:
+
+```bash
+python matrix_network_addition.py \
+  --n 30 \
+  --learning-rate 0.01 \
+  --iters 10000 \
+  --wandb \
+  --wandb-project matrix-networks \
+  --wandb-run-name n30-lr1e-2 \
+  --wandb-tags addition,baseline
 ```

@@ -3,7 +3,7 @@ import argparse
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -265,6 +265,8 @@ def train(
     model: MatrixNetwork | None = None,
     fixed_train_size: int = 0,
     fixed_train_seed: int | None = None,
+    wandb_run: Any | None = None,
+    wandb_log_every: int = 10,
 ) -> MatrixNetwork:
     rng = random.Random(seed)
     if model is None:
@@ -316,12 +318,23 @@ def train(
         loss = torch.stack(losses).mean()
         loss.backward()
         optim.step(model)
+        acc = total_correct / max(total_targets, 1)
+
+        if wandb_run is not None and (iter_idx == 1 or iter_idx % wandb_log_every == 0 or iter_idx == iters):
+            wandb_run.log(
+                {
+                    "train/loss": float(loss.item()),
+                    "train/token_acc": float(acc),
+                    "iter": iter_idx,
+                },
+                step=iter_idx,
+            )
 
         if iter_idx % log_every == 0 or iter_idx == 1:
-            acc = total_correct / max(total_targets, 1)
             print(f"iter={iter_idx:5d} loss={loss.item():.4f} token_acc={acc:.3f}")
 
         if iter_idx % eval_every == 0 or iter_idx == iters:
+            eval_log: Dict[str, float | int] = {"iter": iter_idx}
             if fixed_train is not None:
                 tr_exact, tr_tf_acc, tr_stop_rate = evaluate_on_dataset(
                     model,
@@ -332,6 +345,13 @@ def train(
                     f"  eval[fixed_train] exact_match={tr_exact:.3f} "
                     f"teacher_forced_token_acc={tr_tf_acc:.3f} stop_rate={tr_stop_rate:.3f}"
                 )
+                eval_log.update(
+                    {
+                        "eval_fixed/exact_match": float(tr_exact),
+                        "eval_fixed/teacher_forced_token_acc": float(tr_tf_acc),
+                        "eval_fixed/stop_rate": float(tr_stop_rate),
+                    }
+                )
 
             exact, tf_acc, stop_rate = evaluate(
                 model,
@@ -341,6 +361,15 @@ def train(
                 addend_digits=addend_digits,
             )
             print(f"  eval[random] exact_match={exact:.3f} teacher_forced_token_acc={tf_acc:.3f} stop_rate={stop_rate:.3f}")
+            eval_log.update(
+                {
+                    "eval_random/exact_match": float(exact),
+                    "eval_random/teacher_forced_token_acc": float(tf_acc),
+                    "eval_random/stop_rate": float(stop_rate),
+                }
+            )
+            if wandb_run is not None:
+                wandb_run.log(eval_log, step=iter_idx)
 
     return model
 
@@ -426,7 +455,78 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default="checkpoints/matrix_network_addition.pt", help="Checkpoint path")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
+    p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases experiment logging")
+    p.add_argument("--wandb-project", type=str, default="matrix-networks", help="W&B project name")
+    p.add_argument("--wandb-entity", type=str, default=None, help="W&B entity (team/user)")
+    p.add_argument("--wandb-run-name", type=str, default=None, help="W&B run name")
+    p.add_argument("--wandb-group", type=str, default=None, help="W&B group")
+    p.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated W&B tags")
+    p.add_argument("--wandb-dir", type=str, default=None, help="Optional local directory for W&B files")
+    p.add_argument(
+        "--wandb-mode",
+        type=str,
+        default="online",
+        choices=["online", "offline", "disabled"],
+        help="W&B mode",
+    )
+    p.add_argument("--wandb-log-every", type=int, default=10, help="Log train metrics to W&B every N iterations")
     return p.parse_args()
+
+
+def init_wandb_run(
+    args: argparse.Namespace,
+    *,
+    resolved_n: int,
+    addend_digits: int,
+    max_gen_len: int,
+) -> Any | None:
+    if not args.wandb:
+        return None
+    try:
+        import wandb  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("W&B logging requested but `wandb` is not installed. Install via `pip install wandb`.") from exc
+
+    tags: list[str] | None = None
+    if args.wandb_tags:
+        parsed_tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
+        tags = parsed_tags if parsed_tags else None
+
+    config = {
+        "n": resolved_n,
+        "iters": args.iters,
+        "batch_size": args.batch_size,
+        "learning_rate": args.learning_rate,
+        "loss_temp": args.loss_temp,
+        "use_momentum": args.use_momentum,
+        "momentum_decay": args.momentum_decay,
+        "momentum_blend_start": args.momentum_blend_start,
+        "momentum_blend": args.momentum_blend,
+        "momentum_blend_ramp_iters": args.momentum_blend_ramp_iters,
+        "addend_digits": addend_digits,
+        "seed": args.seed,
+        "eval_every": args.eval_every,
+        "eval_samples": args.eval_samples,
+        "max_gen_len": max_gen_len,
+        "fixed_train_size": args.fixed_train_size,
+        "fixed_train_seed": args.fixed_train_seed,
+        "load_path": args.load_path,
+        "save_path": args.save_path,
+        "device": str(args.device),
+    }
+
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        group=args.wandb_group,
+        tags=tags,
+        mode=args.wandb_mode,
+        dir=args.wandb_dir,
+        config=config,
+    )
+    print(f"wandb=on project={args.wandb_project} mode={args.wandb_mode}")
+    return run
 
 
 def load_checkpoint(load_path: str, device: torch.device) -> tuple[MatrixNetwork, int | None]:
@@ -484,6 +584,8 @@ def main() -> None:
         raise ValueError("--momentum-blend must be >= --momentum-blend-start")
     if args.momentum_blend_ramp_iters < 0:
         raise ValueError("--momentum-blend-ramp-iters must be >= 0")
+    if args.wandb_log_every <= 0:
+        raise ValueError("--wandb-log-every must be > 0")
 
     device = pick_device(args.device)
     print(f"device={device}")
@@ -510,28 +612,41 @@ def main() -> None:
     print(f"addend_digits={addend_digits}")
     max_gen_len = addend_digits + 2
     print(f"max_gen_len={max_gen_len}")
-    model = train(
-        n=model.n if model is not None else args.n,
-        iters=args.iters,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        loss_temp=args.loss_temp,
-        use_momentum=args.use_momentum,
-        momentum_decay=args.momentum_decay,
-        momentum_blend_start=args.momentum_blend_start,
-        momentum_blend=args.momentum_blend,
-        momentum_blend_ramp_iters=args.momentum_blend_ramp_iters,
+    resolved_n = model.n if model is not None else args.n
+    wandb_run = init_wandb_run(
+        args,
+        resolved_n=resolved_n,
         addend_digits=addend_digits,
-        seed=args.seed,
-        log_every=args.log_every,
-        eval_every=args.eval_every,
-        eval_samples=args.eval_samples,
         max_gen_len=max_gen_len,
-        device=device,
-        model=model,
-        fixed_train_size=args.fixed_train_size,
-        fixed_train_seed=args.fixed_train_seed,
     )
+    try:
+        model = train(
+            n=resolved_n,
+            iters=args.iters,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            loss_temp=args.loss_temp,
+            use_momentum=args.use_momentum,
+            momentum_decay=args.momentum_decay,
+            momentum_blend_start=args.momentum_blend_start,
+            momentum_blend=args.momentum_blend,
+            momentum_blend_ramp_iters=args.momentum_blend_ramp_iters,
+            addend_digits=addend_digits,
+            seed=args.seed,
+            log_every=args.log_every,
+            eval_every=args.eval_every,
+            eval_samples=args.eval_samples,
+            max_gen_len=max_gen_len,
+            device=device,
+            model=model,
+            fixed_train_size=args.fixed_train_size,
+            fixed_train_seed=args.fixed_train_seed,
+            wandb_run=wandb_run,
+            wandb_log_every=args.wandb_log_every,
+        )
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
     save_checkpoint(model, args.save_path, addend_digits=addend_digits)
     print(f"saved_checkpoint={args.save_path}")
     print("\nSample predictions:")
