@@ -70,27 +70,17 @@ class MatrixNetwork(torch.nn.Module):
 class RotationalGD:
     learning_rate: float
     use_momentum: bool = False
-    momentum_start: float = 0.2
-    momentum_end: float = 0.98
-    momentum_ramp_iters: int = 3000
-    _iter_count: int = 0
+    momentum_decay: float = 0.98
+    momentum_blend: float = 0.5
     _hist_b: torch.Tensor | None = None
     _hist_m: torch.Tensor | None = None
     _hist_d: torch.Tensor | None = None
     _hist_q: torch.Tensor | None = None
 
-    def _current_momentum(self) -> float:
-        if self.momentum_ramp_iters <= 0:
-            ramp = 1.0
-        else:
-            ramp = min(1.0, max(0.0, (self._iter_count - 1) / float(self.momentum_ramp_iters)))
-        return self.momentum_start + (self.momentum_end - self.momentum_start) * ramp
-
     def _target_direction(
         self,
         grad: torch.Tensor,
         hist: torch.Tensor | None,
-        momentum: float,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         cur = -normalize_last_dim(grad)
         if not self.use_momentum:
@@ -103,19 +93,17 @@ class RotationalGD:
         ):
             hist = cur.clone()
         else:
-            hist = normalize_last_dim(momentum * hist + (1.0 - momentum) * cur)
-        return hist, hist
+            hist = normalize_last_dim(self.momentum_decay * hist + (1.0 - self.momentum_decay) * cur)
+        target = normalize_last_dim((1.0 - self.momentum_blend) * cur + self.momentum_blend * hist)
+        return target, hist
 
     @torch.no_grad()
     def step(self, model: MatrixNetwork) -> None:
-        self._iter_count += 1
-        momentum = self._current_momentum()
-
         # Base matrix.
         w_b = model.base_mat
         g_b = model.base_mat.grad
         if g_b is not None:
-            target_b, self._hist_b = self._target_direction(g_b, self._hist_b, momentum)
+            target_b, self._hist_b = self._target_direction(g_b, self._hist_b)
             new_b = w_b + self.learning_rate * (target_b - w_b)
             w_b.copy_(normalize_last_dim(new_b))
 
@@ -123,7 +111,7 @@ class RotationalGD:
         w_m = model.token_mats
         g_m = model.token_mats.grad
         if g_m is not None:
-            target_m, self._hist_m = self._target_direction(g_m, self._hist_m, momentum)
+            target_m, self._hist_m = self._target_direction(g_m, self._hist_m)
             new_m = w_m + self.learning_rate * (target_m - w_m)
             w_m.copy_(normalize_last_dim(new_m))
 
@@ -131,7 +119,7 @@ class RotationalGD:
         w_d = model.decode_vecs
         g_d = model.decode_vecs.grad
         if g_d is not None:
-            target_d, self._hist_d = self._target_direction(g_d, self._hist_d, momentum)
+            target_d, self._hist_d = self._target_direction(g_d, self._hist_d)
             new_d = w_d + self.learning_rate * (target_d - w_d)
             w_d.copy_(normalize_last_dim(new_d))
 
@@ -139,7 +127,7 @@ class RotationalGD:
         w_q = model.query
         g_q = model.query.grad
         if g_q is not None:
-            target_q, self._hist_q = self._target_direction(g_q, self._hist_q, momentum)
+            target_q, self._hist_q = self._target_direction(g_q, self._hist_q)
             new_q = w_q + self.learning_rate * (target_q - w_q)
             w_q.copy_(normalize_last_dim(new_q))
 
@@ -249,9 +237,8 @@ def train(
     learning_rate: float,
     loss_temp: float,
     use_momentum: bool,
-    momentum_start: float,
-    momentum_end: float,
-    momentum_ramp_iters: int,
+    momentum_decay: float,
+    momentum_blend: float,
     addend_digits: int,
     seed: int,
     log_every: int,
@@ -269,9 +256,8 @@ def train(
     optim = RotationalGD(
         learning_rate=learning_rate,
         use_momentum=use_momentum,
-        momentum_start=momentum_start,
-        momentum_end=momentum_end,
-        momentum_ramp_iters=momentum_ramp_iters,
+        momentum_decay=momentum_decay,
+        momentum_blend=momentum_blend,
     )
     fixed_train: List[Problem] | None = None
     if fixed_train_size > 0:
@@ -376,25 +362,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--use-momentum",
         action="store_true",
-        help="Enable scheduled momentum on normalized gradient directions",
+        help="Enable EMA momentum on normalized gradient directions",
     )
     p.add_argument(
-        "--momentum-start",
-        type=float,
-        default=0.2,
-        help="Initial momentum weight for gradient history (used with --use-momentum)",
-    )
-    p.add_argument(
-        "--momentum-end",
+        "--momentum-decay",
         type=float,
         default=0.98,
-        help="Final momentum weight for gradient history after ramp (used with --use-momentum)",
+        help="EMA decay for momentum history (used with --use-momentum)",
     )
     p.add_argument(
-        "--momentum-ramp-iters",
-        type=int,
-        default=3000,
-        help="Iterations over which momentum increases from start to end (used with --use-momentum)",
+        "--momentum-blend",
+        type=float,
+        default=0.5,
+        help="Blend weight for EMA history vs current gradient (used with --use-momentum)",
     )
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
@@ -465,23 +445,16 @@ def main() -> None:
     args = parse_args()
     if args.loss_temp <= 0.0:
         raise ValueError("--loss-temp must be > 0")
-    if not (0.0 <= args.momentum_start < 1.0):
-        raise ValueError("--momentum-start must be in [0, 1)")
-    if not (0.0 <= args.momentum_end < 1.0):
-        raise ValueError("--momentum-end must be in [0, 1)")
-    if args.momentum_end < args.momentum_start:
-        raise ValueError("--momentum-end must be >= --momentum-start")
-    if args.momentum_ramp_iters < 0:
-        raise ValueError("--momentum-ramp-iters must be >= 0")
+    if not (0.0 <= args.momentum_decay < 1.0):
+        raise ValueError("--momentum-decay must be in [0, 1)")
+    if not (0.0 <= args.momentum_blend <= 1.0):
+        raise ValueError("--momentum-blend must be in [0, 1]")
 
     device = pick_device(args.device)
     print(f"device={device}")
     print(f"iters={args.iters} learning_rate={args.learning_rate} loss_temp={args.loss_temp}")
     if args.use_momentum:
-        print(
-            f"momentum=on start={args.momentum_start} end={args.momentum_end} "
-            f"ramp_iters={args.momentum_ramp_iters}"
-        )
+        print(f"momentum=on decay={args.momentum_decay} blend={args.momentum_blend}")
     else:
         print("momentum=off")
     model = None
@@ -503,9 +476,8 @@ def main() -> None:
         learning_rate=args.learning_rate,
         loss_temp=args.loss_temp,
         use_momentum=args.use_momentum,
-        momentum_start=args.momentum_start,
-        momentum_end=args.momentum_end,
-        momentum_ramp_iters=args.momentum_ramp_iters,
+        momentum_decay=args.momentum_decay,
+        momentum_blend=args.momentum_blend,
         addend_digits=addend_digits,
         seed=args.seed,
         log_every=args.log_every,
