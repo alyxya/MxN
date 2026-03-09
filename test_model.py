@@ -6,7 +6,13 @@ from typing import Tuple
 
 import torch
 
-from matrix_network_addition import MatrixNetwork, generate_until_eos, pick_device
+from matrix_network_addition import (
+    MatrixNetwork,
+    convert_legacy_token_state_if_needed,
+    generate_until_eos,
+    infer_token_rank_from_state_dict,
+    pick_device,
+)
 
 
 def required_max_gen_len(addend_digits: int) -> int:
@@ -49,8 +55,17 @@ def load_model(checkpoint_path: Path, device: torch.device) -> Tuple[MatrixNetwo
     if "n" not in ckpt or "state_dict" not in ckpt:
         raise ValueError("Checkpoint missing required keys: 'n' and 'state_dict'")
 
-    model = MatrixNetwork(n=int(ckpt["n"]), device=device)
-    incompatible = model.load_state_dict(ckpt["state_dict"], strict=False)
+    n = int(ckpt["n"])
+    base_mode = str(ckpt.get("base_mode", "learned"))
+    raw_state = ckpt["state_dict"]
+    if not isinstance(raw_state, dict):
+        raise ValueError("Checkpoint state_dict must be a dict")
+    state_dict = dict(raw_state)
+    inferred_rank = infer_token_rank_from_state_dict(state_dict, n=n)
+    token_rank = int(ckpt.get("token_rank", inferred_rank))
+    state_dict = convert_legacy_token_state_if_needed(state_dict, n=n)
+    model = MatrixNetwork(n=n, device=device, base_mode=base_mode, token_rank=token_rank)
+    incompatible = model.load_state_dict(state_dict, strict=False)
     allowed_missing = {"base_mat"}
     missing = set(incompatible.missing_keys)
     unexpected = set(incompatible.unexpected_keys)
@@ -100,7 +115,7 @@ def main() -> None:
     model, ckpt_addend_digits = load_model(ckpt_path, device)
     addend_digits = args.addend_digits if args.addend_digits is not None else ckpt_addend_digits
     print(
-        f"loaded={ckpt_path} device={device} n={model.n} "
+        f"loaded={ckpt_path} device={device} n={model.n} base_mode={model.base_mode} "
         f"addend_digits={addend_digits} max_gen_len={required_max_gen_len(addend_digits)}"
     )
 
