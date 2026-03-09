@@ -66,14 +66,16 @@ def load_model(checkpoint_path: Path, device: torch.device) -> Tuple[MatrixNetwo
     state_dict = convert_legacy_token_state_if_needed(state_dict, n=n)
     model = MatrixNetwork(n=n, device=device, base_mode=base_mode, token_rank=token_rank)
     incompatible = model.load_state_dict(state_dict, strict=False)
-    allowed_missing = {"base_mat"}
+    allowed_missing = {"base_mat", "eye_n"}
+    allowed_unexpected = {"eye_n"}
     missing = set(incompatible.missing_keys)
     unexpected = set(incompatible.unexpected_keys)
     disallowed_missing = missing - allowed_missing
+    disallowed_unexpected = unexpected - allowed_unexpected
     if disallowed_missing:
         raise ValueError(f"Checkpoint missing unsupported keys: {sorted(disallowed_missing)}")
-    if unexpected:
-        raise ValueError(f"Checkpoint has unexpected keys: {sorted(unexpected)}")
+    if disallowed_unexpected:
+        raise ValueError(f"Checkpoint has unexpected keys: {sorted(disallowed_unexpected)}")
     model.eval()
     addend_digits = int(ckpt.get("addend_digits", 3))
     return model, addend_digits

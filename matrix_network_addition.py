@@ -72,8 +72,8 @@ class MatrixNetwork(torch.nn.Module):
         self.learn_base_mat = base_mode == "learned"
         if token_rank is None:
             token_rank = max(1, n // 2)
-        if not (1 <= token_rank <= n):
-            raise ValueError(f"token_rank must be in [1, n], got {token_rank} for n={n}")
+        if token_rank < 1:
+            raise ValueError(f"token_rank must be >= 1, got {token_rank}")
         self.token_rank = int(token_rank)
         self.vocab = VOCAB
         self.vocab_size = len(self.vocab)
@@ -81,7 +81,7 @@ class MatrixNetwork(torch.nn.Module):
         self.itos: Dict[int, str] = {i: ch for ch, i in self.stoi.items()}
 
         std = (1.0 / n) ** 0.5
-        self.register_buffer("eye_n", torch.eye(n, device=device))
+        self.register_buffer("eye_n", torch.eye(n, device=device), persistent=False)
         if self.learn_base_mat:
             self.base_mat = torch.nn.Parameter(self.eye_n.clone() + torch.randn(n, n, device=device) * 1e-4)
         else:
@@ -119,6 +119,7 @@ class MatrixNetwork(torch.nn.Module):
 
     def forward_prefix_ids(self, token_ids: Sequence[int]) -> torch.Tensor:
         v = self.queried_vector_ids(token_ids)
+        v = normalize_last_dim(v)
         logits = self.decode_vecs @ v
         return logits
 
@@ -467,7 +468,7 @@ def parse_args() -> argparse.Namespace:
         "--token-rank",
         type=int,
         default=None,
-        help="Token matrix low-rank factor k in I + A@B (defaults to n//2)",
+        help="Token matrix factor width k in I + A@B (defaults to n//2; may be > n)",
     )
     p.add_argument(
         "--iters",
@@ -641,14 +642,16 @@ def load_checkpoint(load_path: str, device: torch.device) -> tuple[MatrixNetwork
     state_dict = convert_legacy_token_state_if_needed(state_dict, n=n)
     model = MatrixNetwork(n=n, device=device, base_mode=base_mode, token_rank=token_rank)
     incompatible = model.load_state_dict(state_dict, strict=False)
-    allowed_missing = {"base_mat"}
+    allowed_missing = {"base_mat", "eye_n"}
+    allowed_unexpected = {"eye_n"}
     missing = set(incompatible.missing_keys)
     unexpected = set(incompatible.unexpected_keys)
     disallowed_missing = missing - allowed_missing
+    disallowed_unexpected = unexpected - allowed_unexpected
     if disallowed_missing:
         raise ValueError(f"Checkpoint missing unsupported keys: {sorted(disallowed_missing)}")
-    if unexpected:
-        raise ValueError(f"Checkpoint has unexpected keys: {sorted(unexpected)}")
+    if disallowed_unexpected:
+        raise ValueError(f"Checkpoint has unexpected keys: {sorted(disallowed_unexpected)}")
     if "base_mat" in missing:
         print("checkpoint_missing_base_mat=true; using newly initialized base matrix")
     addend_digits = ckpt.get("addend_digits")
@@ -732,8 +735,6 @@ def main() -> None:
     resolved_n = model.n if model is not None else args.n
     if resolved_token_rank is None:
         resolved_token_rank = max(1, resolved_n // 2)
-    if resolved_token_rank > resolved_n:
-        raise ValueError(f"--token-rank must be <= n (got token_rank={resolved_token_rank}, n={resolved_n})")
     print(f"token_rank={resolved_token_rank}")
     max_gen_len = addend_digits + 2
     print(f"max_gen_len={max_gen_len}")
