@@ -15,6 +15,7 @@ EPS = 1e-12
 Problem = Tuple[int, int, str, str]
 BASE_MODES = ("learned", "identity_fixed")
 TOKEN_MODES = ("dense", "lowrank_ab", "subspace_rot")
+LOWRANK_AB_ORTH_REG = 1e-3
 
 
 def normalize_last_dim(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
@@ -161,14 +162,11 @@ class MatrixNetwork(torch.nn.Module):
         if self.token_mode == "dense":
             assert self.token_mats is not None
             self.token_mats.copy_(normalize_last_dim(self.token_mats))
-        elif self.token_mode == "lowrank_ab":
-            assert self.token_a is not None and self.token_b is not None
-            self.token_a.copy_(normalize_last_dim(self.token_a))
-            self.token_b.copy_(normalize_last_dim(self.token_b))
         else:
-            assert self.token_u is not None and self.token_r is not None
-            self.token_u.copy_(normalize_dim(self.token_u, dim=-2))
-            self.token_r.copy_(normalize_last_dim(self.token_r))
+            if self.token_mode == "subspace_rot":
+                assert self.token_u is not None and self.token_r is not None
+                self.token_u.copy_(normalize_dim(self.token_u, dim=-2))
+                self.token_r.copy_(normalize_last_dim(self.token_r))
         self.decode_vecs.copy_(normalize_last_dim(self.decode_vecs))
         self.query.copy_(normalize_last_dim(self.query))
 
@@ -184,6 +182,15 @@ class MatrixNetwork(torch.nn.Module):
             return self.eye_n() + self.token_a[tid].transpose(-1, -2) @ self.token_b[tid]
         assert self.token_u is not None and self.token_r is not None
         return self.eye_n() + self.token_u[tid] @ (self.token_r[tid] - self.eye_k()) @ self.token_u[tid].transpose(-1, -2)
+
+    def lowrank_ab_orthogonality_loss(self) -> torch.Tensor:
+        if self.token_mode != "lowrank_ab":
+            return torch.zeros((), device=self.query.device, dtype=self.query.dtype)
+        assert self.token_a is not None and self.token_b is not None
+        mats = self.eye_n().unsqueeze(0) + self.token_a.transpose(-1, -2) @ self.token_b
+        eye = self.eye_n().unsqueeze(0)
+        gram = mats @ mats.transpose(-1, -2)
+        return ((gram - eye) ** 2).mean()
 
     def queried_vector_ids(self, token_ids: Sequence[int]) -> torch.Tensor:
         p = self.base_matrix()
@@ -241,6 +248,21 @@ class RotationalGD:
         target = normalize_dim((1.0 - blend) * cur + blend * hist_dir, dim=norm_dim)
         return target, hist
 
+    def _blended_gradient(
+        self,
+        grad: torch.Tensor,
+        hist: torch.Tensor | None,
+        blend: float,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        cur = grad
+        if not self.use_momentum:
+            return cur, hist
+        if hist is None or hist.shape != cur.shape or hist.device != cur.device or hist.dtype != cur.dtype:
+            hist = cur.clone()
+        else:
+            hist = self.momentum_decay * hist + (1.0 - self.momentum_decay) * cur
+        return (1.0 - blend) * cur + blend * hist, hist
+
     @torch.no_grad()
     def step(self, model: MatrixNetwork) -> None:
         self._iter_count += 1
@@ -258,11 +280,11 @@ class RotationalGD:
         elif model.token_mode == "lowrank_ab":
             assert model.token_a is not None and model.token_b is not None
             if model.token_a.grad is not None:
-                target_a, self._hist_token_1 = self._target_direction(model.token_a.grad, self._hist_token_1, blend, norm_dim=-1)
-                model.token_a.copy_(normalize_last_dim(model.token_a + self.learning_rate * (target_a - model.token_a)))
+                grad_a, self._hist_token_1 = self._blended_gradient(model.token_a.grad, self._hist_token_1, blend)
+                model.token_a.add_(-self.learning_rate * grad_a)
             if model.token_b.grad is not None:
-                target_b, self._hist_token_2 = self._target_direction(model.token_b.grad, self._hist_token_2, blend, norm_dim=-1)
-                model.token_b.copy_(normalize_last_dim(model.token_b + self.learning_rate * (target_b - model.token_b)))
+                grad_b, self._hist_token_2 = self._blended_gradient(model.token_b.grad, self._hist_token_2, blend)
+                model.token_b.add_(-self.learning_rate * grad_b)
         else:
             assert model.token_u is not None and model.token_r is not None
             if model.token_u.grad is not None:
@@ -432,16 +454,30 @@ def train(
                 total_correct += int(int(logits.argmax().item()) == target_id)
                 total_targets += 1
 
-        loss = torch.stack(losses).mean()
+        ce_loss = torch.stack(losses).mean()
+        orth_loss = model.lowrank_ab_orthogonality_loss()
+        loss = ce_loss + (LOWRANK_AB_ORTH_REG * orth_loss)
         loss.backward()
         optim.step(model)
         acc = total_correct / max(total_targets, 1)
 
         if wandb_run is not None and (iter_idx == 1 or iter_idx % wandb_log_every == 0 or iter_idx == iters):
-            wandb_run.log({"train/loss": float(loss.item()), "train/token_acc": float(acc), "iter": iter_idx}, step=iter_idx)
+            wandb_run.log(
+                {
+                    "train/loss": float(loss.item()),
+                    "train/ce_loss": float(ce_loss.item()),
+                    "train/orth_loss": float(orth_loss.item()),
+                    "train/token_acc": float(acc),
+                    "iter": iter_idx,
+                },
+                step=iter_idx,
+            )
 
         if iter_idx % log_every == 0 or iter_idx == 1:
-            print(f"iter={iter_idx:5d} loss={loss.item():.4f} token_acc={acc:.3f}")
+            print(
+                f"iter={iter_idx:5d} loss={loss.item():.4f} ce_loss={ce_loss.item():.4f} "
+                f"orth_loss={orth_loss.item():.4f} token_acc={acc:.3f}"
+            )
 
         if iter_idx % eval_every == 0 or iter_idx == iters:
             eval_log: Dict[str, float | int] = {"iter": iter_idx}
