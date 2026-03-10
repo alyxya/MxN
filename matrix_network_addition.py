@@ -15,7 +15,7 @@ EPS = 1e-12
 Problem = Tuple[int, int, str, str]
 BASE_MODES = ("learned", "identity_fixed")
 TOKEN_MODES = ("dense", "lowrank_ab", "subspace_rot")
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 
 
 def normalize_last_dim(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
@@ -42,11 +42,11 @@ def infer_token_rank_from_state_dict(state_dict: Dict[str, torch.Tensor], token_
             raise ValueError("Low-rank AB checkpoint must include token_a and token_b")
         if token_a.ndim != 3 or token_b.ndim != 3:
             raise ValueError("token_a/token_b must be rank-3 tensors")
-        if token_a.shape[1] != n or token_b.shape[2] != n:
+        if token_a.shape[2] != n or token_b.shape[2] != n:
             raise ValueError(f"token_a/token_b shape mismatch for n={n}: {tuple(token_a.shape)} vs {tuple(token_b.shape)}")
-        if token_a.shape[0] != token_b.shape[0] or token_a.shape[2] != token_b.shape[1]:
+        if token_a.shape[0] != token_b.shape[0] or token_a.shape[1] != token_b.shape[1]:
             raise ValueError(f"token_a/token_b rank mismatch: {tuple(token_a.shape)} vs {tuple(token_b.shape)}")
-        return int(token_a.shape[2])
+        return int(token_a.shape[1])
 
     if token_mode == "subspace_rot":
         token_u = state_dict.get("token_u")
@@ -115,7 +115,7 @@ class MatrixNetwork(torch.nn.Module):
         elif self.token_mode == "lowrank_ab":
             k = int(self.token_rank)
             self.token_mats = None
-            self.token_a = torch.nn.Parameter(torch.randn(self.vocab_size, n, k, device=device) * 1e-2)
+            self.token_a = torch.nn.Parameter(torch.randn(self.vocab_size, k, n, device=device) * 1e-2)
             self.token_b = torch.nn.Parameter(torch.randn(self.vocab_size, k, n, device=device) * 1e-2)
             self.token_u = None
             self.token_r = None
@@ -164,7 +164,7 @@ class MatrixNetwork(torch.nn.Module):
             self.token_mats.copy_(normalize_last_dim(self.token_mats))
         elif self.token_mode == "lowrank_ab":
             assert self.token_a is not None and self.token_b is not None
-            self.token_a.copy_(normalize_dim(self.token_a, dim=-2))
+            self.token_a.copy_(normalize_last_dim(self.token_a))
             self.token_b.copy_(normalize_last_dim(self.token_b))
         else:
             assert self.token_u is not None and self.token_r is not None
@@ -182,7 +182,7 @@ class MatrixNetwork(torch.nn.Module):
             return self.token_mats[tid]
         if self.token_mode == "lowrank_ab":
             assert self.token_a is not None and self.token_b is not None
-            return normalize_last_dim(self.eye_n() + self.token_a[tid] @ self.token_b[tid])
+            return self.eye_n() + self.token_a[tid].transpose(-1, -2) @ self.token_b[tid]
         assert self.token_u is not None and self.token_r is not None
         return self.eye_n() + self.token_u[tid] @ (self.token_r[tid] - self.eye_k()) @ self.token_u[tid].transpose(-1, -2)
 
@@ -259,8 +259,8 @@ class RotationalGD:
         elif model.token_mode == "lowrank_ab":
             assert model.token_a is not None and model.token_b is not None
             if model.token_a.grad is not None:
-                target_a, self._hist_token_1 = self._target_direction(model.token_a.grad, self._hist_token_1, blend, norm_dim=-2)
-                model.token_a.copy_(normalize_dim(model.token_a + self.learning_rate * (target_a - model.token_a), dim=-2))
+                target_a, self._hist_token_1 = self._target_direction(model.token_a.grad, self._hist_token_1, blend, norm_dim=-1)
+                model.token_a.copy_(normalize_last_dim(model.token_a + self.learning_rate * (target_a - model.token_a)))
             if model.token_b.grad is not None:
                 target_b, self._hist_token_2 = self._target_direction(model.token_b.grad, self._hist_token_2, blend, norm_dim=-1)
                 model.token_b.copy_(normalize_last_dim(model.token_b + self.learning_rate * (target_b - model.token_b)))

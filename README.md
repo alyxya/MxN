@@ -8,7 +8,7 @@ Supported architecture switches:
 
 Token modes:
 - `dense`: one dense `n x n` matrix per token
-- `lowrank_ab`: `I + A @ B`, with `A` shape `n x k` and `B` shape `k x n`
+- `lowrank_ab`: `I + A^T @ B`, with `A` shape `k x n` and `B` shape `k x n`
 - `subspace_rot`: `I + U (R - I) U^T`, with `U` shape `n x k` and `R` shape `k x k`
 
 Checkpoints use one explicit format only. There is no legacy checkpoint compatibility layer in the code.
@@ -57,7 +57,7 @@ python matrix_network_addition.py \
   --save-path checkpoints/dense_learned_n30_d3.pt
 ```
 
-Low-rank `I + A @ B` tokens:
+Low-rank `I + A^T @ B` tokens:
 
 ```bash
 python matrix_network_addition.py \
