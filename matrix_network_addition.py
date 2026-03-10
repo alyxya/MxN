@@ -15,7 +15,6 @@ EPS = 1e-12
 Problem = Tuple[int, int, str, str]
 BASE_MODES = ("learned", "identity_fixed")
 TOKEN_MODES = ("dense", "lowrank_ab", "subspace_rot")
-CHECKPOINT_VERSION = 3
 
 
 def normalize_last_dim(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
@@ -598,8 +597,6 @@ def load_checkpoint(load_path: str, device: torch.device) -> tuple[MatrixNetwork
         ckpt = torch.load(path, map_location=device, weights_only=False)
     except TypeError:
         ckpt = torch.load(path, map_location=device)
-    if int(ckpt.get("version", 0)) != CHECKPOINT_VERSION:
-        raise ValueError(f"Unsupported checkpoint version for {path}. Expected version={CHECKPOINT_VERSION}.")
     n = int(ckpt["n"])
     base_mode = str(ckpt["base_mode"])
     token_mode = str(ckpt["token_mode"])
@@ -622,7 +619,6 @@ def save_checkpoint(model: MatrixNetwork, save_path: str, addend_digits: int) ->
         path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "version": CHECKPOINT_VERSION,
             "n": model.n,
             "vocab": model.vocab,
             "addend_digits": addend_digits,
