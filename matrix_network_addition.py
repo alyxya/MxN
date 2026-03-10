@@ -114,8 +114,8 @@ class MatrixNetwork(torch.nn.Module):
         elif self.token_mode == "lowrank_ab":
             k = int(self.token_rank)
             self.token_mats = None
-            self.token_a = torch.nn.Parameter(torch.randn(self.vocab_size, k, n, device=device) * 1e-2)
-            self.token_b = torch.nn.Parameter(torch.randn(self.vocab_size, k, n, device=device) * 1e-2)
+            self.token_a = torch.nn.Parameter(torch.randn(self.vocab_size, k, n, device=device) * std)
+            self.token_b = torch.nn.Parameter(torch.randn(self.vocab_size, k, n, device=device) * std)
             self.token_u = None
             self.token_r = None
         else:
