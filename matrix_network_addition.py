@@ -25,6 +25,22 @@ def normalize_dim(x: torch.Tensor, dim: int, eps: float = EPS) -> torch.Tensor:
 
 
 def infer_token_rank_from_state_dict(state_dict: Dict[str, torch.Tensor], n: int) -> int:
+    token_u = state_dict.get("token_u")
+    token_r = state_dict.get("token_r")
+    if token_u is not None or token_r is not None:
+        if token_u is None or token_r is None:
+            raise ValueError("Checkpoint state_dict must include both token_u and token_r")
+        if token_u.ndim != 3 or token_r.ndim != 3:
+            raise ValueError("token_u/token_r must be rank-3 tensors")
+        if token_u.shape[1] != n:
+            raise ValueError(f"token_u shape mismatch for n={n}: got {tuple(token_u.shape)}")
+        if token_r.shape[1] != token_r.shape[2]:
+            raise ValueError(f"token_r must be square: got {tuple(token_r.shape)}")
+        if token_u.shape[2] != token_r.shape[1]:
+            raise ValueError(f"token_u/token_r rank mismatch: {tuple(token_u.shape)} vs {tuple(token_r.shape)}")
+        if token_u.shape[0] != token_r.shape[0]:
+            raise ValueError(f"token_u/token_r vocab mismatch: {tuple(token_u.shape)} vs {tuple(token_r.shape)}")
+        return int(token_u.shape[2])
     token_a = state_dict.get("token_a")
     token_b = state_dict.get("token_b")
     if token_a is not None or token_b is not None:
@@ -40,25 +56,42 @@ def infer_token_rank_from_state_dict(state_dict: Dict[str, torch.Tensor], n: int
             raise ValueError(f"token_a/token_b rank mismatch: {tuple(token_a.shape)} vs {tuple(token_b.shape)}")
         if token_a.shape[0] != token_b.shape[0]:
             raise ValueError(f"token_a/token_b vocab mismatch: {tuple(token_a.shape)} vs {tuple(token_b.shape)}")
-        return int(token_a.shape[2])
+        # Legacy I + A@B checkpoints are expanded to k=n via U=I and R=old_token_matrix.
+        return n
     token_mats = state_dict.get("token_mats")
     if token_mats is not None:
         if token_mats.ndim != 3 or token_mats.shape[1] != n or token_mats.shape[2] != n:
             raise ValueError(f"legacy token_mats shape mismatch for n={n}: got {tuple(token_mats.shape)}")
         return n
-    raise ValueError("Checkpoint state_dict missing token representation keys (token_a/token_b or token_mats)")
+    raise ValueError("Checkpoint state_dict missing token representation keys")
 
 
 def convert_legacy_token_state_if_needed(state_dict: Dict[str, torch.Tensor], n: int) -> Dict[str, torch.Tensor]:
-    if "token_mats" not in state_dict or "token_a" in state_dict or "token_b" in state_dict:
+    if "token_u" in state_dict or "token_r" in state_dict:
+        return state_dict
+    converted = dict(state_dict)
+    if "token_a" in state_dict or "token_b" in state_dict:
+        if "token_a" not in state_dict or "token_b" not in state_dict:
+            raise ValueError("Legacy checkpoint must include both token_a and token_b")
+        token_a = state_dict["token_a"]
+        token_b = state_dict["token_b"]
+        vocab_size = token_a.shape[0]
+        eye = torch.eye(n, dtype=token_a.dtype, device=token_a.device).unsqueeze(0).expand(vocab_size, -1, -1)
+        full_mats = normalize_last_dim(eye + token_a @ token_b)
+        converted.pop("token_a")
+        converted.pop("token_b")
+        converted["token_u"] = eye.clone()
+        converted["token_r"] = full_mats
+        return converted
+    if "token_mats" not in state_dict:
         return state_dict
     token_mats = state_dict["token_mats"]
     vocab_size = token_mats.shape[0]
     eye = torch.eye(n, dtype=token_mats.dtype, device=token_mats.device).unsqueeze(0).expand(vocab_size, -1, -1)
     converted = dict(state_dict)
     converted.pop("token_mats")
-    converted["token_a"] = token_mats - eye
-    converted["token_b"] = eye.clone()
+    converted["token_u"] = eye.clone()
+    converted["token_r"] = token_mats
     return converted
 
 
@@ -82,12 +115,14 @@ class MatrixNetwork(torch.nn.Module):
 
         std = (1.0 / n) ** 0.5
         self.register_buffer("eye_n", torch.eye(n, device=device), persistent=False)
+        self.register_buffer("eye_k", torch.eye(self.token_rank, device=device), persistent=False)
         if self.learn_base_mat:
             self.base_mat = torch.nn.Parameter(self.eye_n.clone() + torch.randn(n, n, device=device) * 1e-4)
         else:
             self.register_buffer("base_mat", self.eye_n.clone())
-        self.token_a = torch.nn.Parameter(torch.randn(self.vocab_size, n, self.token_rank, device=device) * 1e-2)
-        self.token_b = torch.nn.Parameter(torch.randn(self.vocab_size, self.token_rank, n, device=device) * 1e-2)
+        self.token_u = torch.nn.Parameter(torch.randn(self.vocab_size, n, self.token_rank, device=device) * std)
+        token_r_init = self.eye_k.unsqueeze(0).repeat(self.vocab_size, 1, 1)
+        self.token_r = torch.nn.Parameter(token_r_init + torch.randn(self.vocab_size, self.token_rank, self.token_rank, device=device) * 1e-4)
         self.decode_vecs = torch.nn.Parameter(torch.randn(self.vocab_size, n, device=device) * std)
         self.query = torch.nn.Parameter(torch.randn(n, device=device) * std)
 
@@ -97,9 +132,8 @@ class MatrixNetwork(torch.nn.Module):
     def renormalize_in_place(self) -> None:
         if self.learn_base_mat:
             self.base_mat.copy_(normalize_last_dim(self.base_mat))
-        # Keep factor scales bounded in n-direction for stable low-rank products.
-        self.token_a.copy_(normalize_dim(self.token_a, dim=-2))
-        self.token_b.copy_(normalize_last_dim(self.token_b))
+        self.token_u.copy_(normalize_dim(self.token_u, dim=-2))
+        self.token_r.copy_(normalize_last_dim(self.token_r))
         self.decode_vecs.copy_(normalize_last_dim(self.decode_vecs))
         self.query.copy_(normalize_last_dim(self.query))
 
@@ -107,8 +141,9 @@ class MatrixNetwork(torch.nn.Module):
         return [self.stoi[ch] for ch in s]
 
     def token_matrix(self, tid: int) -> torch.Tensor:
-        m = self.eye_n + self.token_a[tid] @ self.token_b[tid]
-        return normalize_last_dim(m)
+        u = self.token_u[tid]
+        r = self.token_r[tid]
+        return self.eye_n + u @ (r - self.eye_k) @ u.transpose(-1, -2)
 
     def queried_vector_ids(self, token_ids: Sequence[int]) -> torch.Tensor:
         p = self.base_mat
@@ -140,8 +175,8 @@ class RotationalGD:
     momentum_blend_ramp_iters: int = 1000
     _iter_count: int = 0
     _hist_base: torch.Tensor | None = None
-    _hist_a: torch.Tensor | None = None
-    _hist_b: torch.Tensor | None = None
+    _hist_u: torch.Tensor | None = None
+    _hist_r: torch.Tensor | None = None
     _hist_d: torch.Tensor | None = None
     _hist_q: torch.Tensor | None = None
 
@@ -189,20 +224,20 @@ class RotationalGD:
                 new_b = w_b + self.learning_rate * (target_b - w_b)
                 w_b.copy_(normalize_last_dim(new_b))
 
-        # Token low-rank factors.
-        w_a = model.token_a
-        g_a = model.token_a.grad
-        if g_a is not None:
-            target_a, self._hist_a = self._target_direction(g_a, self._hist_a, blend, norm_dim=-2)
-            new_a = w_a + self.learning_rate * (target_a - w_a)
-            w_a.copy_(normalize_dim(new_a, dim=-2))
+        # Token subspace-rotation parameters.
+        w_u = model.token_u
+        g_u = model.token_u.grad
+        if g_u is not None:
+            target_u, self._hist_u = self._target_direction(g_u, self._hist_u, blend, norm_dim=-2)
+            new_u = w_u + self.learning_rate * (target_u - w_u)
+            w_u.copy_(normalize_dim(new_u, dim=-2))
 
-        w_b = model.token_b
-        g_b = model.token_b.grad
-        if g_b is not None:
-            target_b, self._hist_b = self._target_direction(g_b, self._hist_b, blend, norm_dim=-1)
-            new_b = w_b + self.learning_rate * (target_b - w_b)
-            w_b.copy_(normalize_last_dim(new_b))
+        w_r = model.token_r
+        g_r = model.token_r.grad
+        if g_r is not None:
+            target_r, self._hist_r = self._target_direction(g_r, self._hist_r, blend, norm_dim=-1)
+            new_r = w_r + self.learning_rate * (target_r - w_r)
+            w_r.copy_(normalize_last_dim(new_r))
 
         # Decoder vectors.
         w_d = model.decode_vecs
@@ -468,7 +503,7 @@ def parse_args() -> argparse.Namespace:
         "--token-rank",
         type=int,
         default=None,
-        help="Token matrix factor width k in I + A@B (defaults to n//2; may be > n)",
+        help="Token subspace width k in I + U(R-I)U^T (defaults to n//2; may be > n)",
     )
     p.add_argument(
         "--iters",
@@ -637,13 +672,14 @@ def load_checkpoint(load_path: str, device: torch.device) -> tuple[MatrixNetwork
     if not isinstance(raw_state, dict):
         raise ValueError("Checkpoint state_dict must be a dict")
     state_dict: Dict[str, torch.Tensor] = dict(raw_state)
+    has_native_ur = "token_u" in state_dict and "token_r" in state_dict
     inferred_rank = infer_token_rank_from_state_dict(state_dict, n=n)
-    token_rank = int(ckpt.get("token_rank", inferred_rank))
+    token_rank = int(ckpt.get("token_rank", inferred_rank)) if has_native_ur else inferred_rank
     state_dict = convert_legacy_token_state_if_needed(state_dict, n=n)
     model = MatrixNetwork(n=n, device=device, base_mode=base_mode, token_rank=token_rank)
     incompatible = model.load_state_dict(state_dict, strict=False)
-    allowed_missing = {"base_mat", "eye_n"}
-    allowed_unexpected = {"eye_n"}
+    allowed_missing = {"base_mat", "eye_n", "eye_k"}
+    allowed_unexpected = {"eye_n", "eye_k"}
     missing = set(incompatible.missing_keys)
     unexpected = set(incompatible.unexpected_keys)
     disallowed_missing = missing - allowed_missing

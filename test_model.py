@@ -61,13 +61,14 @@ def load_model(checkpoint_path: Path, device: torch.device) -> Tuple[MatrixNetwo
     if not isinstance(raw_state, dict):
         raise ValueError("Checkpoint state_dict must be a dict")
     state_dict = dict(raw_state)
+    has_native_ur = "token_u" in state_dict and "token_r" in state_dict
     inferred_rank = infer_token_rank_from_state_dict(state_dict, n=n)
-    token_rank = int(ckpt.get("token_rank", inferred_rank))
+    token_rank = int(ckpt.get("token_rank", inferred_rank)) if has_native_ur else inferred_rank
     state_dict = convert_legacy_token_state_if_needed(state_dict, n=n)
     model = MatrixNetwork(n=n, device=device, base_mode=base_mode, token_rank=token_rank)
     incompatible = model.load_state_dict(state_dict, strict=False)
-    allowed_missing = {"base_mat", "eye_n"}
-    allowed_unexpected = {"eye_n"}
+    allowed_missing = {"base_mat", "eye_n", "eye_k"}
+    allowed_unexpected = {"eye_n", "eye_k"}
     missing = set(incompatible.missing_keys)
     unexpected = set(incompatible.unexpected_keys)
     disallowed_missing = missing - allowed_missing
