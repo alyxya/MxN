@@ -17,6 +17,7 @@ from matrix_network_addition import evaluate, load_checkpoint, pick_device
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run controlled base-matrix ablation: learned vs fixed identity")
     p.add_argument("--n", type=int, default=50)
+    p.add_argument("--token-mode", type=str, default="dense", choices=["dense", "lowrank_ab", "subspace_rot"])
     p.add_argument("--token-rank", type=int, default=None)
     p.add_argument("--addend-digits", type=int, default=10)
     p.add_argument("--iters", type=int, default=10000)
@@ -50,21 +51,20 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def build_train_cmd(
-    args: argparse.Namespace,
-    repo_root: Path,
-    *,
-    base_mode: str,
-    seed: int,
-    save_path: Path,
-) -> List[str]:
+def resolved_rank(args: argparse.Namespace) -> int | None:
+    if args.token_mode == "dense":
+        return None
+    return args.token_rank if args.token_rank is not None else max(1, args.n // 2)
+
+
+def build_train_cmd(args: argparse.Namespace, repo_root: Path, *, base_mode: str, seed: int, save_path: Path) -> List[str]:
     cmd = [
         args.python,
         str(repo_root / "matrix_network_addition.py"),
         "--n",
         str(args.n),
-        "--token-rank",
-        str(args.token_rank if args.token_rank is not None else max(1, args.n // 2)),
+        "--token-mode",
+        args.token_mode,
         "--base-mode",
         base_mode,
         "--addend-digits",
@@ -88,6 +88,9 @@ def build_train_cmd(
         "--device",
         args.device,
     ]
+    rank = resolved_rank(args)
+    if rank is not None:
+        cmd.extend(["--token-rank", str(rank)])
     if args.fixed_train_size > 0:
         cmd.extend(["--fixed-train-size", str(args.fixed_train_size)])
     if args.fixed_train_seed is not None:
@@ -154,17 +157,14 @@ def summarize(results: List[Dict[str, float | int | str]]) -> None:
     by_mode: Dict[str, List[Dict[str, float | int | str]]] = {}
     for row in results:
         by_mode.setdefault(str(row["base_mode"]), []).append(row)
-
     print("\nAggregate by base_mode:")
     for mode in sorted(by_mode):
         rows = by_mode[mode]
         exact = [float(r["eval_exact_match"]) for r in rows]
         tf = [float(r["eval_teacher_forced_token_acc"]) for r in rows]
         print(
-            f"  {mode}: "
-            f"exact_mean={statistics.mean(exact):.4f} exact_std={statistics.pstdev(exact):.4f} "
-            f"tf_mean={statistics.mean(tf):.4f} tf_std={statistics.pstdev(tf):.4f} "
-            f"n={len(rows)}"
+            f"  {mode}: exact_mean={statistics.mean(exact):.4f} exact_std={statistics.pstdev(exact):.4f} "
+            f"tf_mean={statistics.mean(tf):.4f} tf_std={statistics.pstdev(tf):.4f} n={len(rows)}"
         )
 
 
@@ -178,11 +178,13 @@ def main() -> None:
     seeds = list(range(args.seed_start, args.seed_start + args.num_seeds))
     modes = ["learned", "identity_fixed"]
     results: List[Dict[str, float | int | str]] = []
+    rank = resolved_rank(args)
+    rank_tag = "dense" if rank is None else f"k{rank}"
 
     for seed in seeds:
         for base_mode in modes:
             save_path = out_dir / (
-                f"n{args.n}_k{args.token_rank if args.token_rank is not None else max(1, args.n // 2)}_d{args.addend_digits}_it{args.iters}_"
+                f"n{args.n}_{args.token_mode}_{rank_tag}_d{args.addend_digits}_it{args.iters}_"
                 f"lr{args.learning_rate:g}_{base_mode}_seed{seed}.pt"
             )
             cmd = build_train_cmd(args, repo_root, base_mode=base_mode, seed=seed, save_path=save_path)
@@ -190,27 +192,17 @@ def main() -> None:
             if args.dry_run:
                 continue
             subprocess.run(cmd, check=True, cwd=repo_root)
-            metrics = evaluate_checkpoint(
-                save_path,
-                eval_samples=max(1000, args.eval_samples),
-                eval_seed=2026,
-                device_name=args.device,
-            )
-            row: Dict[str, float | int | str] = {
-                "seed": seed,
-                "base_mode": base_mode,
-                "checkpoint": str(save_path),
-            }
+            metrics = evaluate_checkpoint(save_path, eval_samples=max(1000, args.eval_samples), eval_seed=2026, device_name=args.device)
+            row: Dict[str, float | int | str] = {"seed": seed, "base_mode": base_mode, "checkpoint": str(save_path)}
             row.update(metrics)
             results.append(row)
             print(
-                f"result seed={seed} mode={base_mode} "
-                f"exact={metrics['eval_exact_match']:.4f} tf={metrics['eval_teacher_forced_token_acc']:.4f}"
+                f"result seed={seed} mode={base_mode} exact={metrics['eval_exact_match']:.4f} "
+                f"tf={metrics['eval_teacher_forced_token_acc']:.4f}"
             )
 
     if args.dry_run:
         return
-
     if results:
         fields = [
             "seed",

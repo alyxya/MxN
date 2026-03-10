@@ -1,14 +1,37 @@
 # Matrix Networks
 
-Token representations use low-rank matrices: `M_token = I + A @ B`, with `A` shape `n x k` and `B` shape `k x n`.
-Use `--token-rank k` to choose `k` (default is `n//2`).
+This repo trains matrix-network toy models on integer addition.
 
-## Test A Trained Model
+Supported architecture switches:
+- base mode: `learned` or `identity_fixed`
+- token mode: `dense`, `lowrank_ab`, or `subspace_rot`
 
-Run one prediction:
+Token modes:
+- `dense`: one dense `n x n` matrix per token
+- `lowrank_ab`: `I + A @ B`, with `A` shape `n x k` and `B` shape `k x n`
+- `subspace_rot`: `I + U (R - I) U^T`, with `U` shape `n x k` and `R` shape `k x k`
+
+Checkpoints use one explicit format only. There is no legacy checkpoint compatibility layer in the code.
+
+## Kept Models
+
+- `models/dense_identity_n30_d3.pt`
+- `models/dense_learned_n30_d3.pt`
+- `models/lowrank_ab_learned_n30_k20_d3.pt`
+- `models/dense_identity_n50_d10.pt`
+
+## Test A Model
+
+Run one prediction with the default demo model:
 
 ```bash
 python test_model.py --expr "123+456"
+```
+
+Test a specific model:
+
+```bash
+python test_model.py --checkpoint models/dense_learned_n30_d3.pt --expr "817+662"
 ```
 
 Interactive mode:
@@ -17,57 +40,94 @@ Interactive mode:
 python test_model.py
 ```
 
-The default model path is:
-
-`models/matrix_network_n30_step0005_resume10k.pt`
-
-You can test a specific checkpoint:
-
-```bash
-python test_model.py --checkpoint checkpoints/matrix_network_n30_step0005_resume10k.pt --expr "817+662"
-```
-
 ## Train
 
-Example fresh training run:
+Dense token matrices with a learned base matrix:
 
 ```bash
 python matrix_network_addition.py \
   --n 30 \
-  --token-rank 15 \
+  --token-mode dense \
+  --base-mode learned \
+  --addend-digits 3 \
   --learning-rate 0.01 \
-  --iters 10000 \
+  --iters 3000 \
   --batch-size 64 \
   --eval-every 1000 \
-  --save-path checkpoints/matrix_network_n30_step001_10k.pt
+  --save-path checkpoints/dense_learned_n30_d3.pt
+```
+
+Low-rank `I + A @ B` tokens:
+
+```bash
+python matrix_network_addition.py \
+  --n 30 \
+  --token-mode lowrank_ab \
+  --token-rank 20 \
+  --base-mode learned \
+  --addend-digits 3 \
+  --learning-rate 0.01 \
+  --iters 3000 \
+  --batch-size 64 \
+  --eval-every 1000 \
+  --save-path checkpoints/lowrank_ab_learned_n30_k20_d3.pt
+```
+
+Subspace-rotation tokens:
+
+```bash
+python matrix_network_addition.py \
+  --n 30 \
+  --token-mode subspace_rot \
+  --token-rank 20 \
+  --base-mode learned \
+  --addend-digits 3 \
+  --learning-rate 0.01 \
+  --iters 3000 \
+  --batch-size 64 \
+  --eval-every 1000 \
+  --save-path checkpoints/subspace_rot_learned_n30_k20_d3.pt
+```
+
+Fixed identity base matrix:
+
+```bash
+python matrix_network_addition.py \
+  --n 30 \
+  --token-mode dense \
+  --base-mode identity_fixed \
+  --addend-digits 3 \
+  --learning-rate 0.01 \
+  --iters 3000 \
+  --batch-size 64 \
+  --eval-every 1000 \
+  --save-path checkpoints/dense_identity_n30_d3.pt
 ```
 
 ## Continue Training
 
-Resume from a checkpoint (same architecture, smaller step size):
+Resume from any checkpoint. The architecture is taken from the checkpoint itself.
 
 ```bash
 python matrix_network_addition.py \
-  --load-path checkpoints/matrix_network_n30_step001_10k.pt \
-  --n 30 \
-  --token-rank 15 \
-  --learning-rate 0.005 \
-  --iters 10000 \
+  --load-path models/dense_learned_n30_d3.pt \
+  --learning-rate 0.001 \
+  --iters 5000 \
   --batch-size 64 \
-  --eval-every 1000 \
-  --save-path checkpoints/matrix_network_n30_step0005_resume10k.pt
+  --save-path checkpoints/dense_learned_n30_d3_resume.pt
 ```
 
 ## Optional Momentum
 
-Enable EMA momentum on normalized gradient directions:
-
 ```bash
 python matrix_network_addition.py \
-  --n 30 \
-  --token-rank 15 \
-  --learning-rate 0.01 \
+  --n 50 \
+  --token-mode dense \
+  --base-mode learned \
+  --addend-digits 10 \
+  --learning-rate 0.0001 \
   --iters 10000 \
+  --batch-size 32 \
   --use-momentum \
   --momentum-decay 0.98 \
   --momentum-blend-start 0.0 \
@@ -77,59 +137,30 @@ python matrix_network_addition.py \
 
 ## W&B Logging
 
-Install W&B first:
-
 ```bash
 pip install wandb
 ```
 
-Then enable logging in training:
-
 ```bash
 python matrix_network_addition.py \
   --n 30 \
-  --token-rank 15 \
+  --token-mode dense \
+  --base-mode learned \
+  --addend-digits 3 \
   --learning-rate 0.01 \
-  --iters 10000 \
+  --iters 3000 \
   --wandb \
   --wandb-project matrix-networks \
-  --wandb-run-name n30-lr1e-2 \
-  --wandb-tags addition,baseline
+  --wandb-run-name dense-learned-n30-d3
 ```
 
-## Base Matrix A/B
-
-Train with a learned base matrix (default):
-
-```bash
-python matrix_network_addition.py \
-  --base-mode learned \
-  --addend-digits 10 \
-  --n 50 \
-  --token-rank 25 \
-  --learning-rate 0.0001 \
-  --iters 10000
-```
-
-Train with no learned base matrix (fixed identity):
-
-```bash
-python matrix_network_addition.py \
-  --base-mode identity_fixed \
-  --addend-digits 10 \
-  --n 50 \
-  --token-rank 25 \
-  --learning-rate 0.0001 \
-  --iters 10000
-```
-
-Run a controlled multi-seed A/B sweep and get a CSV summary:
+## Base-Mode Ablation Script
 
 ```bash
 python scripts/base_mode_ablation.py \
-  --addend-digits 10 \
   --n 50 \
-  --token-rank 25 \
+  --token-mode dense \
+  --addend-digits 10 \
   --learning-rate 0.0001 \
   --iters 10000 \
   --num-seeds 3 \

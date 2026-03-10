@@ -6,13 +6,7 @@ from typing import Tuple
 
 import torch
 
-from matrix_network_addition import (
-    MatrixNetwork,
-    convert_legacy_token_state_if_needed,
-    generate_until_eos,
-    infer_token_rank_from_state_dict,
-    pick_device,
-)
+from matrix_network_addition import generate_until_eos, load_checkpoint, pick_device
 
 
 def required_max_gen_len(addend_digits: int) -> int:
@@ -31,11 +25,9 @@ def parse_prompt_line(line: str) -> Tuple[int, int]:
     text = line.strip()
     if "+" in text:
         return parse_expression(text)
-
     parts = text.split()
     if len(parts) == 2 and all(p.isdigit() for p in parts):
         return int(parts[0]), int(parts[1])
-
     raise ValueError("Enter either '123+456' or '123 456'")
 
 
@@ -43,66 +35,19 @@ def format_lhs(a: int, b: int, addend_digits: int) -> str:
     return f"{a:0{addend_digits}d}+{b:0{addend_digits}d}="
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> Tuple[MatrixNetwork, int]:
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    try:
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    except TypeError:
-        ckpt = torch.load(checkpoint_path, map_location=device)
-
-    if "n" not in ckpt or "state_dict" not in ckpt:
-        raise ValueError("Checkpoint missing required keys: 'n' and 'state_dict'")
-
-    n = int(ckpt["n"])
-    base_mode = str(ckpt.get("base_mode", "learned"))
-    raw_state = ckpt["state_dict"]
-    if not isinstance(raw_state, dict):
-        raise ValueError("Checkpoint state_dict must be a dict")
-    state_dict = dict(raw_state)
-    has_native_ur = "token_u" in state_dict and "token_r" in state_dict
-    inferred_rank = infer_token_rank_from_state_dict(state_dict, n=n)
-    token_rank = int(ckpt.get("token_rank", inferred_rank)) if has_native_ur else inferred_rank
-    state_dict = convert_legacy_token_state_if_needed(state_dict, n=n)
-    model = MatrixNetwork(n=n, device=device, base_mode=base_mode, token_rank=token_rank)
-    incompatible = model.load_state_dict(state_dict, strict=False)
-    allowed_missing = {"base_mat", "eye_n", "eye_k"}
-    allowed_unexpected = {"eye_n", "eye_k"}
-    missing = set(incompatible.missing_keys)
-    unexpected = set(incompatible.unexpected_keys)
-    disallowed_missing = missing - allowed_missing
-    disallowed_unexpected = unexpected - allowed_unexpected
-    if disallowed_missing:
-        raise ValueError(f"Checkpoint missing unsupported keys: {sorted(disallowed_missing)}")
-    if disallowed_unexpected:
-        raise ValueError(f"Checkpoint has unexpected keys: {sorted(disallowed_unexpected)}")
-    model.eval()
-    addend_digits = int(ckpt.get("addend_digits", 3))
-    return model, addend_digits
-
-
 @torch.no_grad()
-def run_prediction(model: MatrixNetwork, a: int, b: int, addend_digits: int) -> None:
+def run_prediction(model, a: int, b: int, addend_digits: int) -> None:
     lhs = format_lhs(a, b, addend_digits)
-    max_gen_len = required_max_gen_len(addend_digits)
-    pred, did_stop = generate_until_eos(model, lhs, max_gen_len)
+    pred, did_stop = generate_until_eos(model, lhs, required_max_gen_len(addend_digits))
     expected = str(a + b)
     status = "eos" if did_stop else "max_len"
     correct = did_stop and pred == expected
-    print(
-        f"input={lhs} pred={pred} expected={expected} stop={status} correct={correct}"
-    )
+    print(f"input={lhs} pred={pred} expected={expected} stop={status} correct={correct}")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Interactive tester for trained matrix-network addition model")
-    p.add_argument(
-        "--checkpoint",
-        type=str,
-        default="models/matrix_network_n30_step0005_resume10k.pt",
-        help="Path to saved checkpoint",
-    )
+    p.add_argument("--checkpoint", type=str, default="models/dense_identity_n30_d3.pt", help="Path to saved checkpoint")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--addend-digits", type=int, default=None, help="Override addend width used for prompt formatting")
     p.add_argument("--expr", type=str, default=None, help="Single expression, e.g. '123+456'")
@@ -115,11 +60,13 @@ def main() -> None:
     args = parse_args()
     device = pick_device(args.device)
     ckpt_path = Path(args.checkpoint)
-    model, ckpt_addend_digits = load_model(ckpt_path, device)
-    addend_digits = args.addend_digits if args.addend_digits is not None else ckpt_addend_digits
+    model, ckpt_addend_digits = load_checkpoint(str(ckpt_path), device)
+    model.eval()
+    addend_digits = args.addend_digits if args.addend_digits is not None else int(ckpt_addend_digits or 3)
     print(
         f"loaded={ckpt_path} device={device} n={model.n} base_mode={model.base_mode} "
-        f"addend_digits={addend_digits} max_gen_len={required_max_gen_len(addend_digits)}"
+        f"token_mode={model.token_mode} addend_digits={addend_digits} "
+        f"max_gen_len={required_max_gen_len(addend_digits)}"
     )
 
     if args.expr is not None:
@@ -140,12 +87,10 @@ def main() -> None:
         except EOFError:
             print()
             break
-
         if not line:
             continue
         if line.lower() in {"q", "quit", "exit"}:
             break
-
         try:
             a, b = parse_prompt_line(line)
             run_prediction(model, a, b, addend_digits)

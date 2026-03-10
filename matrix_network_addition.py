@@ -14,6 +14,8 @@ VOCAB = f"0123456789+={EOS_TOKEN}"
 EPS = 1e-12
 Problem = Tuple[int, int, str, str]
 BASE_MODES = ("learned", "identity_fixed")
+TOKEN_MODES = ("dense", "lowrank_ab", "subspace_rot")
+CHECKPOINT_VERSION = 2
 
 
 def normalize_last_dim(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
@@ -24,116 +26,150 @@ def normalize_dim(x: torch.Tensor, dim: int, eps: float = EPS) -> torch.Tensor:
     return x / (x.norm(dim=dim, keepdim=True) + eps)
 
 
-def infer_token_rank_from_state_dict(state_dict: Dict[str, torch.Tensor], n: int) -> int:
-    token_u = state_dict.get("token_u")
-    token_r = state_dict.get("token_r")
-    if token_u is not None or token_r is not None:
+def infer_token_rank_from_state_dict(state_dict: Dict[str, torch.Tensor], token_mode: str, n: int) -> int | None:
+    if token_mode == "dense":
+        token_mats = state_dict.get("token_mats")
+        if token_mats is None:
+            raise ValueError("Dense checkpoint missing token_mats")
+        if token_mats.ndim != 3 or token_mats.shape[1:] != (n, n):
+            raise ValueError(f"token_mats shape mismatch for n={n}: got {tuple(token_mats.shape)}")
+        return None
+
+    if token_mode == "lowrank_ab":
+        token_a = state_dict.get("token_a")
+        token_b = state_dict.get("token_b")
+        if token_a is None or token_b is None:
+            raise ValueError("Low-rank AB checkpoint must include token_a and token_b")
+        if token_a.ndim != 3 or token_b.ndim != 3:
+            raise ValueError("token_a/token_b must be rank-3 tensors")
+        if token_a.shape[1] != n or token_b.shape[2] != n:
+            raise ValueError(f"token_a/token_b shape mismatch for n={n}: {tuple(token_a.shape)} vs {tuple(token_b.shape)}")
+        if token_a.shape[0] != token_b.shape[0] or token_a.shape[2] != token_b.shape[1]:
+            raise ValueError(f"token_a/token_b rank mismatch: {tuple(token_a.shape)} vs {tuple(token_b.shape)}")
+        return int(token_a.shape[2])
+
+    if token_mode == "subspace_rot":
+        token_u = state_dict.get("token_u")
+        token_r = state_dict.get("token_r")
         if token_u is None or token_r is None:
-            raise ValueError("Checkpoint state_dict must include both token_u and token_r")
+            raise ValueError("Subspace-rotation checkpoint must include token_u and token_r")
         if token_u.ndim != 3 or token_r.ndim != 3:
             raise ValueError("token_u/token_r must be rank-3 tensors")
         if token_u.shape[1] != n:
             raise ValueError(f"token_u shape mismatch for n={n}: got {tuple(token_u.shape)}")
-        if token_r.shape[1] != token_r.shape[2]:
-            raise ValueError(f"token_r must be square: got {tuple(token_r.shape)}")
-        if token_u.shape[2] != token_r.shape[1]:
+        if token_r.shape[1] != token_r.shape[2] or token_u.shape[2] != token_r.shape[1]:
             raise ValueError(f"token_u/token_r rank mismatch: {tuple(token_u.shape)} vs {tuple(token_r.shape)}")
         if token_u.shape[0] != token_r.shape[0]:
             raise ValueError(f"token_u/token_r vocab mismatch: {tuple(token_u.shape)} vs {tuple(token_r.shape)}")
         return int(token_u.shape[2])
-    token_a = state_dict.get("token_a")
-    token_b = state_dict.get("token_b")
-    if token_a is not None or token_b is not None:
-        if token_a is None or token_b is None:
-            raise ValueError("Checkpoint state_dict must include both token_a and token_b")
-        if token_a.ndim != 3 or token_b.ndim != 3:
-            raise ValueError("token_a/token_b must be rank-3 tensors")
-        if token_a.shape[1] != n:
-            raise ValueError(f"token_a shape mismatch for n={n}: got {tuple(token_a.shape)}")
-        if token_b.shape[2] != n:
-            raise ValueError(f"token_b shape mismatch for n={n}: got {tuple(token_b.shape)}")
-        if token_a.shape[2] != token_b.shape[1]:
-            raise ValueError(f"token_a/token_b rank mismatch: {tuple(token_a.shape)} vs {tuple(token_b.shape)}")
-        if token_a.shape[0] != token_b.shape[0]:
-            raise ValueError(f"token_a/token_b vocab mismatch: {tuple(token_a.shape)} vs {tuple(token_b.shape)}")
-        # Legacy I + A@B checkpoints are expanded to k=n via U=I and R=old_token_matrix.
-        return n
-    token_mats = state_dict.get("token_mats")
-    if token_mats is not None:
-        if token_mats.ndim != 3 or token_mats.shape[1] != n or token_mats.shape[2] != n:
-            raise ValueError(f"legacy token_mats shape mismatch for n={n}: got {tuple(token_mats.shape)}")
-        return n
-    raise ValueError("Checkpoint state_dict missing token representation keys")
 
-
-def convert_legacy_token_state_if_needed(state_dict: Dict[str, torch.Tensor], n: int) -> Dict[str, torch.Tensor]:
-    if "token_u" in state_dict or "token_r" in state_dict:
-        return state_dict
-    converted = dict(state_dict)
-    if "token_a" in state_dict or "token_b" in state_dict:
-        if "token_a" not in state_dict or "token_b" not in state_dict:
-            raise ValueError("Legacy checkpoint must include both token_a and token_b")
-        token_a = state_dict["token_a"]
-        token_b = state_dict["token_b"]
-        vocab_size = token_a.shape[0]
-        eye = torch.eye(n, dtype=token_a.dtype, device=token_a.device).unsqueeze(0).expand(vocab_size, -1, -1)
-        full_mats = normalize_last_dim(eye + token_a @ token_b)
-        converted.pop("token_a")
-        converted.pop("token_b")
-        converted["token_u"] = eye.clone()
-        converted["token_r"] = full_mats
-        return converted
-    if "token_mats" not in state_dict:
-        return state_dict
-    token_mats = state_dict["token_mats"]
-    vocab_size = token_mats.shape[0]
-    eye = torch.eye(n, dtype=token_mats.dtype, device=token_mats.device).unsqueeze(0).expand(vocab_size, -1, -1)
-    converted = dict(state_dict)
-    converted.pop("token_mats")
-    converted["token_u"] = eye.clone()
-    converted["token_r"] = token_mats
-    return converted
+    raise ValueError(f"Unsupported token_mode={token_mode!r}")
 
 
 class MatrixNetwork(torch.nn.Module):
-    def __init__(self, n: int, device: torch.device, base_mode: str = "learned", token_rank: int | None = None):
+    def __init__(
+        self,
+        n: int,
+        device: torch.device,
+        *,
+        base_mode: str = "learned",
+        token_mode: str = "dense",
+        token_rank: int | None = None,
+    ):
         super().__init__()
-        self.n = n
         if base_mode not in BASE_MODES:
             raise ValueError(f"Unsupported base_mode={base_mode!r}; expected one of {BASE_MODES}")
+        if token_mode not in TOKEN_MODES:
+            raise ValueError(f"Unsupported token_mode={token_mode!r}; expected one of {TOKEN_MODES}")
+
+        self.n = n
         self.base_mode = base_mode
+        self.token_mode = token_mode
         self.learn_base_mat = base_mode == "learned"
-        if token_rank is None:
-            token_rank = max(1, n // 2)
-        if token_rank < 1:
-            raise ValueError(f"token_rank must be >= 1, got {token_rank}")
-        self.token_rank = int(token_rank)
+        if token_mode == "dense":
+            if token_rank is not None:
+                raise ValueError("Dense token mode does not use --token-rank")
+        else:
+            if token_rank is None:
+                token_rank = max(1, n // 2)
+            if token_rank < 1:
+                raise ValueError(f"token_rank must be >= 1, got {token_rank}")
+        self.token_rank = None if token_mode == "dense" else int(token_rank)
         self.vocab = VOCAB
         self.vocab_size = len(self.vocab)
         self.stoi: Dict[str, int] = {ch: i for i, ch in enumerate(self.vocab)}
         self.itos: Dict[int, str] = {i: ch for ch, i in self.stoi.items()}
 
         std = (1.0 / n) ** 0.5
-        self.register_buffer("eye_n", torch.eye(n, device=device), persistent=False)
-        self.register_buffer("eye_k", torch.eye(self.token_rank, device=device), persistent=False)
         if self.learn_base_mat:
-            self.base_mat = torch.nn.Parameter(self.eye_n.clone() + torch.randn(n, n, device=device) * 1e-4)
+            self.base_mat = torch.nn.Parameter(self.eye_n(device) + torch.randn(n, n, device=device) * 1e-4)
         else:
-            self.register_buffer("base_mat", self.eye_n.clone())
-        self.token_u = torch.nn.Parameter(torch.randn(self.vocab_size, n, self.token_rank, device=device) * std)
-        token_r_init = self.eye_k.unsqueeze(0).repeat(self.vocab_size, 1, 1)
-        self.token_r = torch.nn.Parameter(token_r_init + torch.randn(self.vocab_size, self.token_rank, self.token_rank, device=device) * 1e-4)
+            self.base_mat = None
+
+        if self.token_mode == "dense":
+            self.token_mats = torch.nn.Parameter(self.eye_n(device).unsqueeze(0).repeat(self.vocab_size, 1, 1))
+            self.token_a = None
+            self.token_b = None
+            self.token_u = None
+            self.token_r = None
+        elif self.token_mode == "lowrank_ab":
+            k = int(self.token_rank)
+            self.token_mats = None
+            self.token_a = torch.nn.Parameter(torch.randn(self.vocab_size, n, k, device=device) * 1e-2)
+            self.token_b = torch.nn.Parameter(torch.randn(self.vocab_size, k, n, device=device) * 1e-2)
+            self.token_u = None
+            self.token_r = None
+        else:
+            k = int(self.token_rank)
+            self.token_mats = None
+            self.token_a = None
+            self.token_b = None
+            self.token_u = torch.nn.Parameter(torch.randn(self.vocab_size, n, k, device=device) * std)
+            self.token_r = torch.nn.Parameter(
+                self.eye_k(device).unsqueeze(0).repeat(self.vocab_size, 1, 1)
+                + torch.randn(self.vocab_size, k, k, device=device) * 1e-4
+            )
+
         self.decode_vecs = torch.nn.Parameter(torch.randn(self.vocab_size, n, device=device) * std)
         self.query = torch.nn.Parameter(torch.randn(n, device=device) * std)
-
         self.renormalize_in_place()
+
+    def eye_n(self, device: torch.device | None = None) -> torch.Tensor:
+        use_device = device if device is not None else (
+            self.query.device if hasattr(self, "query") else torch.device("cpu")
+        )
+        use_dtype = self.query.dtype if hasattr(self, "query") else torch.get_default_dtype()
+        return torch.eye(self.n, device=use_device, dtype=use_dtype)
+
+    def eye_k(self, device: torch.device | None = None) -> torch.Tensor:
+        if self.token_rank is None:
+            raise ValueError("Dense token mode does not use eye_k")
+        use_device = device if device is not None else (
+            self.query.device if hasattr(self, "query") else torch.device("cpu")
+        )
+        use_dtype = self.query.dtype if hasattr(self, "query") else torch.get_default_dtype()
+        return torch.eye(self.token_rank, device=use_device, dtype=use_dtype)
+
+    def base_matrix(self) -> torch.Tensor:
+        if self.base_mat is None:
+            return self.eye_n()
+        return self.base_mat
 
     @torch.no_grad()
     def renormalize_in_place(self) -> None:
-        if self.learn_base_mat:
+        if self.base_mat is not None:
             self.base_mat.copy_(normalize_last_dim(self.base_mat))
-        self.token_u.copy_(normalize_dim(self.token_u, dim=-2))
-        self.token_r.copy_(normalize_last_dim(self.token_r))
+        if self.token_mode == "dense":
+            assert self.token_mats is not None
+            self.token_mats.copy_(normalize_last_dim(self.token_mats))
+        elif self.token_mode == "lowrank_ab":
+            assert self.token_a is not None and self.token_b is not None
+            self.token_a.copy_(normalize_dim(self.token_a, dim=-2))
+            self.token_b.copy_(normalize_last_dim(self.token_b))
+        else:
+            assert self.token_u is not None and self.token_r is not None
+            self.token_u.copy_(normalize_dim(self.token_u, dim=-2))
+            self.token_r.copy_(normalize_last_dim(self.token_r))
         self.decode_vecs.copy_(normalize_last_dim(self.decode_vecs))
         self.query.copy_(normalize_last_dim(self.query))
 
@@ -141,27 +177,28 @@ class MatrixNetwork(torch.nn.Module):
         return [self.stoi[ch] for ch in s]
 
     def token_matrix(self, tid: int) -> torch.Tensor:
-        u = self.token_u[tid]
-        r = self.token_r[tid]
-        return self.eye_n + u @ (r - self.eye_k) @ u.transpose(-1, -2)
+        if self.token_mode == "dense":
+            assert self.token_mats is not None
+            return self.token_mats[tid]
+        if self.token_mode == "lowrank_ab":
+            assert self.token_a is not None and self.token_b is not None
+            return normalize_last_dim(self.eye_n() + self.token_a[tid] @ self.token_b[tid])
+        assert self.token_u is not None and self.token_r is not None
+        return self.eye_n() + self.token_u[tid] @ (self.token_r[tid] - self.eye_k()) @ self.token_u[tid].transpose(-1, -2)
 
     def queried_vector_ids(self, token_ids: Sequence[int]) -> torch.Tensor:
-        p = self.base_mat
+        p = self.base_matrix()
         for tid in token_ids:
             p = p @ self.token_matrix(tid)
-        v = p @ self.query
-        return v
+        return p @ self.query
 
     def forward_prefix_ids(self, token_ids: Sequence[int]) -> torch.Tensor:
-        v = self.queried_vector_ids(token_ids)
-        v = normalize_last_dim(v)
-        logits = self.decode_vecs @ v
-        return logits
+        v = normalize_last_dim(self.queried_vector_ids(token_ids))
+        return self.decode_vecs @ v
 
     @torch.no_grad()
     def predict_next(self, prefix: str) -> str:
-        token_ids = self.encode(prefix)
-        logits = self.forward_prefix_ids(token_ids)
+        logits = self.forward_prefix_ids(self.encode(prefix))
         return self.itos[int(logits.argmax().item())]
 
 
@@ -175,8 +212,8 @@ class RotationalGD:
     momentum_blend_ramp_iters: int = 1000
     _iter_count: int = 0
     _hist_base: torch.Tensor | None = None
-    _hist_u: torch.Tensor | None = None
-    _hist_r: torch.Tensor | None = None
+    _hist_token_1: torch.Tensor | None = None
+    _hist_token_2: torch.Tensor | None = None
     _hist_d: torch.Tensor | None = None
     _hist_q: torch.Tensor | None = None
 
@@ -197,12 +234,7 @@ class RotationalGD:
         cur = -normalize_dim(grad, dim=norm_dim)
         if not self.use_momentum:
             return cur, hist
-        if (
-            hist is None
-            or hist.shape != cur.shape
-            or hist.device != cur.device
-            or hist.dtype != cur.dtype
-        ):
+        if hist is None or hist.shape != cur.shape or hist.device != cur.device or hist.dtype != cur.dtype:
             hist = cur.clone()
         else:
             hist = self.momentum_decay * hist + (1.0 - self.momentum_decay) * cur
@@ -215,45 +247,39 @@ class RotationalGD:
         self._iter_count += 1
         blend = self._current_blend()
 
-        # Base matrix.
-        if model.learn_base_mat:
-            w_b = model.base_mat
-            g_b = model.base_mat.grad
-            if g_b is not None:
-                target_b, self._hist_base = self._target_direction(g_b, self._hist_base, blend, norm_dim=-1)
-                new_b = w_b + self.learning_rate * (target_b - w_b)
-                w_b.copy_(normalize_last_dim(new_b))
+        if model.base_mat is not None and model.base_mat.grad is not None:
+            target_base, self._hist_base = self._target_direction(model.base_mat.grad, self._hist_base, blend, norm_dim=-1)
+            model.base_mat.copy_(normalize_last_dim(model.base_mat + self.learning_rate * (target_base - model.base_mat)))
 
-        # Token subspace-rotation parameters.
-        w_u = model.token_u
-        g_u = model.token_u.grad
-        if g_u is not None:
-            target_u, self._hist_u = self._target_direction(g_u, self._hist_u, blend, norm_dim=-2)
-            new_u = w_u + self.learning_rate * (target_u - w_u)
-            w_u.copy_(normalize_dim(new_u, dim=-2))
+        if model.token_mode == "dense":
+            assert model.token_mats is not None
+            if model.token_mats.grad is not None:
+                target, self._hist_token_1 = self._target_direction(model.token_mats.grad, self._hist_token_1, blend, norm_dim=-1)
+                model.token_mats.copy_(normalize_last_dim(model.token_mats + self.learning_rate * (target - model.token_mats)))
+        elif model.token_mode == "lowrank_ab":
+            assert model.token_a is not None and model.token_b is not None
+            if model.token_a.grad is not None:
+                target_a, self._hist_token_1 = self._target_direction(model.token_a.grad, self._hist_token_1, blend, norm_dim=-2)
+                model.token_a.copy_(normalize_dim(model.token_a + self.learning_rate * (target_a - model.token_a), dim=-2))
+            if model.token_b.grad is not None:
+                target_b, self._hist_token_2 = self._target_direction(model.token_b.grad, self._hist_token_2, blend, norm_dim=-1)
+                model.token_b.copy_(normalize_last_dim(model.token_b + self.learning_rate * (target_b - model.token_b)))
+        else:
+            assert model.token_u is not None and model.token_r is not None
+            if model.token_u.grad is not None:
+                target_u, self._hist_token_1 = self._target_direction(model.token_u.grad, self._hist_token_1, blend, norm_dim=-2)
+                model.token_u.copy_(normalize_dim(model.token_u + self.learning_rate * (target_u - model.token_u), dim=-2))
+            if model.token_r.grad is not None:
+                target_r, self._hist_token_2 = self._target_direction(model.token_r.grad, self._hist_token_2, blend, norm_dim=-1)
+                model.token_r.copy_(normalize_last_dim(model.token_r + self.learning_rate * (target_r - model.token_r)))
 
-        w_r = model.token_r
-        g_r = model.token_r.grad
-        if g_r is not None:
-            target_r, self._hist_r = self._target_direction(g_r, self._hist_r, blend, norm_dim=-1)
-            new_r = w_r + self.learning_rate * (target_r - w_r)
-            w_r.copy_(normalize_last_dim(new_r))
+        if model.decode_vecs.grad is not None:
+            target_d, self._hist_d = self._target_direction(model.decode_vecs.grad, self._hist_d, blend, norm_dim=-1)
+            model.decode_vecs.copy_(normalize_last_dim(model.decode_vecs + self.learning_rate * (target_d - model.decode_vecs)))
 
-        # Decoder vectors.
-        w_d = model.decode_vecs
-        g_d = model.decode_vecs.grad
-        if g_d is not None:
-            target_d, self._hist_d = self._target_direction(g_d, self._hist_d, blend, norm_dim=-1)
-            new_d = w_d + self.learning_rate * (target_d - w_d)
-            w_d.copy_(normalize_last_dim(new_d))
-
-        # Query vector.
-        w_q = model.query
-        g_q = model.query.grad
-        if g_q is not None:
-            target_q, self._hist_q = self._target_direction(g_q, self._hist_q, blend, norm_dim=-1)
-            new_q = w_q + self.learning_rate * (target_q - w_q)
-            w_q.copy_(normalize_last_dim(new_q))
+        if model.query.grad is not None:
+            target_q, self._hist_q = self._target_direction(model.query.grad, self._hist_q, blend, norm_dim=-1)
+            model.query.copy_(normalize_last_dim(model.query + self.learning_rate * (target_q - model.query)))
 
         model.zero_grad(set_to_none=True)
 
@@ -297,7 +323,6 @@ def evaluate(
 
     for _ in range(eval_samples):
         _, _, lhs, rhs = random_problem(rng, addend_digits)
-
         pred, did_stop = generate_until_eos(model, lhs, max_gen_len)
         stopped += int(did_stop)
         if did_stop and pred == rhs:
@@ -312,11 +337,7 @@ def evaluate(
     return exact / eval_samples, tf_correct / max(tf_total, 1), stopped / eval_samples
 
 
-def evaluate_on_dataset(
-    model: MatrixNetwork,
-    dataset: Sequence[Problem],
-    max_gen_len: int,
-) -> Tuple[float, float, float]:
+def evaluate_on_dataset(model: MatrixNetwork, dataset: Sequence[Problem], max_gen_len: int) -> Tuple[float, float, float]:
     exact = 0
     tf_correct = 0
     tf_total = 0
@@ -338,13 +359,7 @@ def evaluate_on_dataset(
     return exact / total, tf_correct / max(tf_total, 1), stopped / total
 
 
-def show_samples(
-    model: MatrixNetwork,
-    seed: int,
-    max_gen_len: int,
-    addend_digits: int,
-    count: int = 10,
-) -> None:
+def show_samples(model: MatrixNetwork, seed: int, max_gen_len: int, addend_digits: int, count: int = 10) -> None:
     rng = random.Random(seed)
     for _ in range(count):
         a, b, lhs, rhs = random_problem(rng, addend_digits)
@@ -356,6 +371,7 @@ def show_samples(
 
 def train(
     n: int,
+    token_mode: str,
     token_rank: int | None,
     iters: int,
     batch_size: int,
@@ -382,7 +398,7 @@ def train(
 ) -> MatrixNetwork:
     rng = random.Random(seed)
     if model is None:
-        model = MatrixNetwork(n=n, device=device, base_mode=base_mode, token_rank=token_rank)
+        model = MatrixNetwork(n=n, device=device, base_mode=base_mode, token_mode=token_mode, token_rank=token_rank)
     optim = RotationalGD(
         learning_rate=learning_rate,
         use_momentum=use_momentum,
@@ -394,11 +410,7 @@ def train(
     fixed_train: List[Problem] | None = None
     if fixed_train_size > 0:
         fixed_seed = seed if fixed_train_seed is None else fixed_train_seed
-        fixed_train = make_fixed_dataset(
-            seed=fixed_seed,
-            size=fixed_train_size,
-            addend_digits=addend_digits,
-        )
+        fixed_train = make_fixed_dataset(seed=fixed_seed, size=fixed_train_size, addend_digits=addend_digits)
         print(f"fixed_train_size={len(fixed_train)} fixed_train_seed={fixed_seed}")
 
     for iter_idx in range(1, iters + 1):
@@ -416,14 +428,8 @@ def train(
             for i in range(len(target_seq)):
                 prefix = lhs + target_seq[:i]
                 target_id = model.stoi[target_seq[i]]
-                token_ids = model.encode(prefix)
-                logits = model.forward_prefix_ids(token_ids)
-                losses.append(
-                    F.cross_entropy(
-                        (logits / loss_temp).unsqueeze(0),
-                        torch.tensor([target_id], device=device),
-                    )
-                )
+                logits = model.forward_prefix_ids(model.encode(prefix))
+                losses.append(F.cross_entropy((logits / loss_temp).unsqueeze(0), torch.tensor([target_id], device=device)))
                 total_correct += int(int(logits.argmax().item()) == target_id)
                 total_targets += 1
 
@@ -433,14 +439,7 @@ def train(
         acc = total_correct / max(total_targets, 1)
 
         if wandb_run is not None and (iter_idx == 1 or iter_idx % wandb_log_every == 0 or iter_idx == iters):
-            wandb_run.log(
-                {
-                    "train/loss": float(loss.item()),
-                    "train/token_acc": float(acc),
-                    "iter": iter_idx,
-                },
-                step=iter_idx,
-            )
+            wandb_run.log({"train/loss": float(loss.item()), "train/token_acc": float(acc), "iter": iter_idx}, step=iter_idx)
 
         if iter_idx % log_every == 0 or iter_idx == 1:
             print(f"iter={iter_idx:5d} loss={loss.item():.4f} token_acc={acc:.3f}")
@@ -448,11 +447,7 @@ def train(
         if iter_idx % eval_every == 0 or iter_idx == iters:
             eval_log: Dict[str, float | int] = {"iter": iter_idx}
             if fixed_train is not None:
-                tr_exact, tr_tf_acc, tr_stop_rate = evaluate_on_dataset(
-                    model,
-                    dataset=fixed_train,
-                    max_gen_len=max_gen_len,
-                )
+                tr_exact, tr_tf_acc, tr_stop_rate = evaluate_on_dataset(model, dataset=fixed_train, max_gen_len=max_gen_len)
                 print(
                     f"  eval[fixed_train] exact_match={tr_exact:.3f} "
                     f"teacher_forced_token_acc={tr_tf_acc:.3f} stop_rate={tr_stop_rate:.3f}"
@@ -497,88 +492,29 @@ def pick_device(requested: str) -> torch.device:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Matrix-network toy model for 3-digit addition")
+    p = argparse.ArgumentParser(description="Matrix-network toy model for addition")
     p.add_argument("--n", type=int, default=16, help="Embedding matrix/vector dimension")
-    p.add_argument(
-        "--token-rank",
-        type=int,
-        default=None,
-        help="Token subspace width k in I + U(R-I)U^T (defaults to n//2; may be > n)",
-    )
-    p.add_argument(
-        "--iters",
-        type=int,
-        default=1500,
-        help="Training iterations",
-    )
+    p.add_argument("--token-mode", type=str, default="dense", choices=list(TOKEN_MODES), help="Token parameterization")
+    p.add_argument("--token-rank", type=int, default=None, help="Rank/subspace width for non-dense token modes")
+    p.add_argument("--iters", type=int, default=1500, help="Training iterations")
     p.add_argument("--batch-size", type=int, default=64, help="Problems per iteration")
-    p.add_argument(
-        "--learning-rate",
-        type=float,
-        default=0.2,
-        help="Rotational interpolation rate toward normalized negative gradient target",
-    )
-    p.add_argument(
-        "--loss-temp",
-        type=float,
-        default=1.0,
-        help="Cross-entropy temperature (loss is computed on logits / loss_temp)",
-    )
-    p.add_argument(
-        "--use-momentum",
-        action="store_true",
-        help="Enable EMA momentum on normalized gradient directions",
-    )
-    p.add_argument(
-        "--momentum-decay",
-        type=float,
-        default=0.98,
-        help="EMA decay for momentum history (used with --use-momentum)",
-    )
-    p.add_argument(
-        "--momentum-blend-start",
-        type=float,
-        default=0.0,
-        help="Initial blend weight for EMA history vs current gradient (used with --use-momentum)",
-    )
-    p.add_argument(
-        "--momentum-blend",
-        type=float,
-        default=0.5,
-        help="Final blend weight for EMA history vs current gradient after ramp (used with --use-momentum)",
-    )
-    p.add_argument(
-        "--momentum-blend-ramp-iters",
-        type=int,
-        default=1000,
-        help="Iterations for blend ramp from --momentum-blend-start to --momentum-blend (used with --use-momentum)",
-    )
-    p.add_argument(
-        "--base-mode",
-        type=str,
-        default="learned",
-        choices=list(BASE_MODES),
-        help="Base matrix behavior: learned trainable matrix or fixed identity (no base matrix learning)",
-    )
+    p.add_argument("--learning-rate", type=float, default=0.2, help="Rotational interpolation rate toward normalized negative gradient target")
+    p.add_argument("--loss-temp", type=float, default=1.0, help="Cross-entropy temperature (loss is computed on logits / loss_temp)")
+    p.add_argument("--use-momentum", action="store_true", help="Enable EMA momentum on normalized gradient directions")
+    p.add_argument("--momentum-decay", type=float, default=0.98, help="EMA decay for momentum history (used with --use-momentum)")
+    p.add_argument("--momentum-blend-start", type=float, default=0.0, help="Initial blend weight for EMA history vs current gradient")
+    p.add_argument("--momentum-blend", type=float, default=0.5, help="Final blend weight for EMA history vs current gradient after ramp")
+    p.add_argument("--momentum-blend-ramp-iters", type=int, default=1000, help="Iterations for blend ramp from start to final blend")
+    p.add_argument("--base-mode", type=str, default="learned", choices=list(BASE_MODES), help="Base matrix behavior")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
-    p.add_argument(
-        "--fixed-train-size",
-        type=int,
-        default=0,
-        help="If >0, sample this many training problems once and reuse them every iteration",
-    )
-    p.add_argument(
-        "--fixed-train-seed",
-        type=int,
-        default=None,
-        help="Seed used for fixed training set generation (defaults to --seed)",
-    )
+    p.add_argument("--fixed-train-size", type=int, default=0, help="If >0, sample this many training problems once and reuse them every iteration")
+    p.add_argument("--fixed-train-seed", type=int, default=None, help="Seed used for fixed training set generation (defaults to --seed)")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
-    p.add_argument("--save-path", type=str, default="checkpoints/matrix_network_addition.pt", help="Checkpoint path")
+    p.add_argument("--save-path", type=str, default="checkpoints/matrix_network.pt", help="Checkpoint path")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases experiment logging")
     p.add_argument("--wandb-project", type=str, default="matrix-networks", help="W&B project name")
@@ -587,13 +523,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb-group", type=str, default=None, help="W&B group")
     p.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated W&B tags")
     p.add_argument("--wandb-dir", type=str, default=None, help="Optional local directory for W&B files")
-    p.add_argument(
-        "--wandb-mode",
-        type=str,
-        default="online",
-        choices=["online", "offline", "disabled"],
-        help="W&B mode",
-    )
+    p.add_argument("--wandb-mode", type=str, default="online", choices=["online", "offline", "disabled"], help="W&B mode")
     p.add_argument("--wandb-log-every", type=int, default=10, help="Log train metrics to W&B every N iterations")
     return p.parse_args()
 
@@ -602,7 +532,8 @@ def init_wandb_run(
     args: argparse.Namespace,
     *,
     resolved_n: int,
-    resolved_token_rank: int,
+    resolved_token_mode: str,
+    resolved_token_rank: int | None,
     resolved_base_mode: str,
     addend_digits: int,
     max_gen_len: int,
@@ -621,6 +552,7 @@ def init_wandb_run(
 
     config = {
         "n": resolved_n,
+        "token_mode": resolved_token_mode,
         "token_rank": resolved_token_rank,
         "base_mode": resolved_base_mode,
         "iters": args.iters,
@@ -666,30 +598,18 @@ def load_checkpoint(load_path: str, device: torch.device) -> tuple[MatrixNetwork
         ckpt = torch.load(path, map_location=device, weights_only=False)
     except TypeError:
         ckpt = torch.load(path, map_location=device)
-    base_mode = str(ckpt.get("base_mode", "learned"))
+    if int(ckpt.get("version", 0)) != CHECKPOINT_VERSION:
+        raise ValueError(f"Unsupported checkpoint version for {path}. Expected version={CHECKPOINT_VERSION}.")
     n = int(ckpt["n"])
+    base_mode = str(ckpt["base_mode"])
+    token_mode = str(ckpt["token_mode"])
     raw_state = ckpt["state_dict"]
     if not isinstance(raw_state, dict):
         raise ValueError("Checkpoint state_dict must be a dict")
     state_dict: Dict[str, torch.Tensor] = dict(raw_state)
-    has_native_ur = "token_u" in state_dict and "token_r" in state_dict
-    inferred_rank = infer_token_rank_from_state_dict(state_dict, n=n)
-    token_rank = int(ckpt.get("token_rank", inferred_rank)) if has_native_ur else inferred_rank
-    state_dict = convert_legacy_token_state_if_needed(state_dict, n=n)
-    model = MatrixNetwork(n=n, device=device, base_mode=base_mode, token_rank=token_rank)
-    incompatible = model.load_state_dict(state_dict, strict=False)
-    allowed_missing = {"base_mat", "eye_n", "eye_k"}
-    allowed_unexpected = {"eye_n", "eye_k"}
-    missing = set(incompatible.missing_keys)
-    unexpected = set(incompatible.unexpected_keys)
-    disallowed_missing = missing - allowed_missing
-    disallowed_unexpected = unexpected - allowed_unexpected
-    if disallowed_missing:
-        raise ValueError(f"Checkpoint missing unsupported keys: {sorted(disallowed_missing)}")
-    if disallowed_unexpected:
-        raise ValueError(f"Checkpoint has unexpected keys: {sorted(disallowed_unexpected)}")
-    if "base_mat" in missing:
-        print("checkpoint_missing_base_mat=true; using newly initialized base matrix")
+    token_rank = infer_token_rank_from_state_dict(state_dict, token_mode=token_mode, n=n)
+    model = MatrixNetwork(n=n, device=device, base_mode=base_mode, token_mode=token_mode, token_rank=token_rank)
+    model.load_state_dict(state_dict, strict=True)
     addend_digits = ckpt.get("addend_digits")
     if addend_digits is not None:
         addend_digits = int(addend_digits)
@@ -702,10 +622,12 @@ def save_checkpoint(model: MatrixNetwork, save_path: str, addend_digits: int) ->
         path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
+            "version": CHECKPOINT_VERSION,
             "n": model.n,
             "vocab": model.vocab,
             "addend_digits": addend_digits,
             "base_mode": model.base_mode,
+            "token_mode": model.token_mode,
             "token_rank": model.token_rank,
             "state_dict": model.state_dict(),
         },
@@ -719,6 +641,8 @@ def main() -> None:
         raise ValueError("--loss-temp must be > 0")
     if args.token_rank is not None and args.token_rank <= 0:
         raise ValueError("--token-rank must be > 0")
+    if args.token_mode == "dense" and args.token_rank is not None:
+        raise ValueError("--token-rank is only valid for --token-mode lowrank_ab or subspace_rot")
     if not (0.0 <= args.momentum_decay < 1.0):
         raise ValueError("--momentum-decay must be in [0, 1)")
     if not (0.0 <= args.momentum_blend_start <= 1.0):
@@ -739,44 +663,51 @@ def main() -> None:
     device = pick_device(args.device)
     print(f"device={device}")
     print(f"iters={args.iters} learning_rate={args.learning_rate} loss_temp={args.loss_temp}")
-    if args.use_momentum:
-        print(
-            f"momentum=on decay={args.momentum_decay} "
-            f"blend_start={args.momentum_blend_start} blend={args.momentum_blend} "
-            f"blend_ramp_iters={args.momentum_blend_ramp_iters}"
-        )
-    else:
-        print("momentum=off")
+    print("momentum=off" if not args.use_momentum else (
+        f"momentum=on decay={args.momentum_decay} blend_start={args.momentum_blend_start} "
+        f"blend={args.momentum_blend} blend_ramp_iters={args.momentum_blend_ramp_iters}"
+    ))
+
     model = None
+    resolved_n = args.n
     resolved_base_mode = args.base_mode
-    addend_digits = args.addend_digits
+    resolved_token_mode = args.token_mode
     resolved_token_rank = args.token_rank
+    addend_digits = args.addend_digits
+
     if args.load_path is not None:
         model, loaded_addend_digits = load_checkpoint(args.load_path, device)
         if model.base_mode != args.base_mode:
             print(f"loaded_base_mode={model.base_mode}; overriding --base-mode={args.base_mode}")
-        resolved_base_mode = model.base_mode
-        if args.token_rank is not None and args.token_rank != model.token_rank:
+        if model.token_mode != args.token_mode:
+            print(f"loaded_token_mode={model.token_mode}; overriding --token-mode={args.token_mode}")
+        if args.token_rank != model.token_rank and args.token_rank is not None:
             print(f"loaded_token_rank={model.token_rank}; overriding --token-rank={args.token_rank}")
-        resolved_token_rank = model.token_rank
         if model.n != args.n:
             print(f"loaded_n={model.n}; overriding --n={args.n} with checkpoint dimension")
         if loaded_addend_digits is not None and loaded_addend_digits != args.addend_digits:
-            print(
-                f"loaded_addend_digits={loaded_addend_digits}; overriding --addend-digits={args.addend_digits}"
-            )
+            print(f"loaded_addend_digits={loaded_addend_digits}; overriding --addend-digits={args.addend_digits}")
             addend_digits = loaded_addend_digits
+        resolved_n = model.n
+        resolved_base_mode = model.base_mode
+        resolved_token_mode = model.token_mode
+        resolved_token_rank = model.token_rank
+
+    if resolved_token_mode != "dense" and resolved_token_rank is None:
+        resolved_token_rank = max(1, resolved_n // 2)
+
     print(f"addend_digits={addend_digits}")
     print(f"base_mode={resolved_base_mode}")
-    resolved_n = model.n if model is not None else args.n
-    if resolved_token_rank is None:
-        resolved_token_rank = max(1, resolved_n // 2)
-    print(f"token_rank={resolved_token_rank}")
+    print(f"token_mode={resolved_token_mode}")
+    if resolved_token_rank is not None:
+        print(f"token_rank={resolved_token_rank}")
     max_gen_len = addend_digits + 2
     print(f"max_gen_len={max_gen_len}")
+
     wandb_run = init_wandb_run(
         args,
         resolved_n=resolved_n,
+        resolved_token_mode=resolved_token_mode,
         resolved_token_rank=resolved_token_rank,
         resolved_base_mode=resolved_base_mode,
         addend_digits=addend_digits,
@@ -785,6 +716,7 @@ def main() -> None:
     try:
         model = train(
             n=resolved_n,
+            token_mode=resolved_token_mode,
             token_rank=resolved_token_rank,
             iters=args.iters,
             batch_size=args.batch_size,
@@ -812,15 +744,11 @@ def main() -> None:
     finally:
         if wandb_run is not None:
             wandb_run.finish()
+
     save_checkpoint(model, args.save_path, addend_digits=addend_digits)
     print(f"saved_checkpoint={args.save_path}")
     print("\nSample predictions:")
-    show_samples(
-        model,
-        seed=args.seed + 999,
-        max_gen_len=max_gen_len,
-        addend_digits=addend_digits,
-    )
+    show_samples(model, seed=args.seed + 999, max_gen_len=max_gen_len, addend_digits=addend_digits)
 
 
 if __name__ == "__main__":
