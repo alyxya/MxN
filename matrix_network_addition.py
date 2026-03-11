@@ -183,6 +183,17 @@ class MatrixNetwork(torch.nn.Module):
         assert self.token_u is not None and self.token_r is not None
         return self.eye_n() + self.token_u[tid] @ (self.token_r[tid] - self.eye_k()) @ self.token_u[tid].transpose(-1, -2)
 
+    @torch.no_grad()
+    def rescale_lowrank_ab_in_place(self) -> None:
+        if self.token_mode != "lowrank_ab":
+            return
+        assert self.token_a is not None and self.token_b is not None
+        r = self.eye_n().unsqueeze(0) + self.token_a.transpose(-1, -2) @ self.token_b
+        size = r.norm(dim=-1).mean(dim=-1, keepdim=True).clamp_min(EPS)
+        scale = torch.sqrt(1.0 / size).unsqueeze(-1)
+        self.token_a.mul_(scale)
+        self.token_b.mul_(scale)
+
     def queried_vector_ids(self, token_ids: Sequence[int], matrix_trace: TokenMatrixTrace | None = None) -> torch.Tensor:
         p = self.base_matrix()
         for tid in token_ids:
@@ -263,6 +274,7 @@ class RotationalGD:
                 model.token_a.add_(-self.learning_rate * model.token_a.grad)
             if model.token_b.grad is not None:
                 model.token_b.add_(-self.learning_rate * model.token_b.grad)
+            model.rescale_lowrank_ab_in_place()
         else:
             assert model.token_u is not None and model.token_r is not None
             if model.token_u.grad is not None:
