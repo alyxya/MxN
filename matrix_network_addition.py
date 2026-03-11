@@ -13,7 +13,6 @@ EOS_TOKEN = "~"
 VOCAB = f"0123456789+={EOS_TOKEN}"
 EPS = 1e-12
 Problem = Tuple[int, int, str, str]
-TokenMatrixTrace = List[Tuple[int, torch.Tensor]]
 BASE_MODES = ("learned", "identity_fixed")
 TOKEN_MODES = ("dense", "lowrank_ab", "subspace_rot")
 
@@ -115,9 +114,8 @@ class MatrixNetwork(torch.nn.Module):
         elif self.token_mode == "lowrank_ab":
             k = int(self.token_rank)
             self.token_mats = None
-            lowrank_std = 1.0 / ((n ** 0.5) * (k ** 0.25))
-            self.token_a = torch.nn.Parameter(torch.randn(self.vocab_size, k, n, device=device) * lowrank_std)
-            self.token_b = torch.nn.Parameter(torch.randn(self.vocab_size, k, n, device=device) * lowrank_std)
+            self.token_a = torch.nn.Parameter(torch.randn(self.vocab_size, k, n, device=device) * std)
+            self.token_b = torch.nn.Parameter(torch.randn(self.vocab_size, k, n, device=device) * std)
             self.token_u = None
             self.token_r = None
         else:
@@ -163,6 +161,10 @@ class MatrixNetwork(torch.nn.Module):
         if self.token_mode == "dense":
             assert self.token_mats is not None
             self.token_mats.copy_(normalize_last_dim(self.token_mats))
+        elif self.token_mode == "lowrank_ab":
+            assert self.token_a is not None and self.token_b is not None
+            self.token_a.copy_(normalize_last_dim(self.token_a))
+            self.token_b.copy_(normalize_last_dim(self.token_b))
         elif self.token_mode == "subspace_rot":
             assert self.token_u is not None and self.token_r is not None
             self.token_u.copy_(normalize_dim(self.token_u, dim=-2))
@@ -183,18 +185,14 @@ class MatrixNetwork(torch.nn.Module):
         assert self.token_u is not None and self.token_r is not None
         return self.eye_n() + self.token_u[tid] @ (self.token_r[tid] - self.eye_k()) @ self.token_u[tid].transpose(-1, -2)
 
-    def queried_vector_ids(self, token_ids: Sequence[int], matrix_trace: TokenMatrixTrace | None = None) -> torch.Tensor:
+    def queried_vector_ids(self, token_ids: Sequence[int]) -> torch.Tensor:
         p = self.base_matrix()
         for tid in token_ids:
-            m = self.token_matrix(tid)
-            if matrix_trace is not None:
-                m.retain_grad()
-                matrix_trace.append((tid, m))
-            p = p @ m
+            p = p @ self.token_matrix(tid)
         return p @ self.query
 
-    def forward_prefix_ids(self, token_ids: Sequence[int], matrix_trace: TokenMatrixTrace | None = None) -> torch.Tensor:
-        v = normalize_last_dim(self.queried_vector_ids(token_ids, matrix_trace=matrix_trace))
+    def forward_prefix_ids(self, token_ids: Sequence[int]) -> torch.Tensor:
+        v = normalize_last_dim(self.queried_vector_ids(token_ids))
         return self.decode_vecs @ v
 
     @torch.no_grad()
@@ -260,9 +258,11 @@ class RotationalGD:
         elif model.token_mode == "lowrank_ab":
             assert model.token_a is not None and model.token_b is not None
             if model.token_a.grad is not None:
-                model.token_a.add_(-self.learning_rate * model.token_a.grad)
+                target_a, self._hist_token_1 = self._target_direction(model.token_a.grad, self._hist_token_1, blend, norm_dim=-1)
+                model.token_a.copy_(normalize_last_dim(model.token_a + self.learning_rate * (target_a - model.token_a)))
             if model.token_b.grad is not None:
-                model.token_b.add_(-self.learning_rate * model.token_b.grad)
+                target_b, self._hist_token_2 = self._target_direction(model.token_b.grad, self._hist_token_2, blend, norm_dim=-1)
+                model.token_b.copy_(normalize_last_dim(model.token_b + self.learning_rate * (target_b - model.token_b)))
         else:
             assert model.token_u is not None and model.token_r is not None
             if model.token_u.grad is not None:
@@ -368,33 +368,6 @@ def show_samples(model: MatrixNetwork, seed: int, max_gen_len: int, addend_digit
         print(f"{lhs}{rhs:>4s} | pred={pred:>4s} ({stop_txt}) [{ok}]   ({a}+{b})")
 
 
-@torch.no_grad()
-def overwrite_lowrank_ab_grads_from_matrix_trace(model: MatrixNetwork, matrix_trace: TokenMatrixTrace) -> None:
-    assert model.token_mode == "lowrank_ab"
-    assert model.token_a is not None and model.token_b is not None
-
-    grad_r_by_tid: Dict[int, torch.Tensor] = {}
-    for tid, mat in matrix_trace:
-        if mat.grad is None:
-            continue
-        if tid not in grad_r_by_tid:
-            grad_r_by_tid[tid] = torch.zeros_like(mat.grad)
-        grad_r_by_tid[tid].add_(mat.grad)
-
-    grad_a = torch.zeros_like(model.token_a)
-    grad_b = torch.zeros_like(model.token_b)
-
-    for tid, grad_r in grad_r_by_tid.items():
-        grad_r = normalize_last_dim(grad_r)
-        a = model.token_a[tid]
-        b = model.token_b[tid]
-        grad_a[tid].copy_(b @ grad_r.transpose(-1, -2))
-        grad_b[tid].copy_(a @ grad_r)
-
-    model.token_a.grad = grad_a
-    model.token_b.grad = grad_b
-
-
 def train(
     n: int,
     token_mode: str,
@@ -444,7 +417,6 @@ def train(
         losses: List[torch.Tensor] = []
         total_correct = 0
         total_targets = 0
-        matrix_trace: TokenMatrixTrace | None = [] if model.token_mode == "lowrank_ab" else None
 
         for _ in range(batch_size):
             if fixed_train is None:
@@ -455,15 +427,13 @@ def train(
             for i in range(len(target_seq)):
                 prefix = lhs + target_seq[:i]
                 target_id = model.stoi[target_seq[i]]
-                logits = model.forward_prefix_ids(model.encode(prefix), matrix_trace=matrix_trace)
+                logits = model.forward_prefix_ids(model.encode(prefix))
                 losses.append(F.cross_entropy((logits / loss_temp).unsqueeze(0), torch.tensor([target_id], device=device)))
                 total_correct += int(int(logits.argmax().item()) == target_id)
                 total_targets += 1
 
         loss = torch.stack(losses).mean()
         loss.backward()
-        if matrix_trace is not None:
-            overwrite_lowrank_ab_grads_from_matrix_trace(model, matrix_trace)
         optim.step(model)
         acc = total_correct / max(total_targets, 1)
 
