@@ -26,6 +26,12 @@ def orthogonalize_newton_schulz(w: torch.Tensor, steps: int) -> torch.Tensor:
     return out
 
 
+def maybe_orthogonalize(w: torch.Tensor, steps: int) -> torch.Tensor:
+    if steps <= 0:
+        return w
+    return orthogonalize_newton_schulz(w, steps)
+
+
 def random_rotation_perturbation(
     n: int,
     device: torch.device,
@@ -244,7 +250,9 @@ def apply_batch_update(
     target_ids: Sequence[int],
     learning_rate: float,
     orthogonalize_steps: int,
+    orthogonalize_every: int,
     count_power: float,
+    iter_idx: int,
 ) -> Tuple[float, float]:
     n = model.n
     base_delta = torch.zeros(n, n, device=model.device)
@@ -288,17 +296,17 @@ def apply_batch_update(
             left_target = model.token_mats[tid].transpose(-1, -2) @ left_target
 
     eye = model.eye()
+    do_orth = orthogonalize_every > 0 and (iter_idx % orthogonalize_every == 0)
     if model.learn_base_mat and base_count > 0:
         scaled_delta = base_delta / (float(base_count) ** count_power)
-        model.base_mat = orthogonalize_newton_schulz((eye + learning_rate * scaled_delta) @ model.base_mat, orthogonalize_steps)
+        updated = (eye + learning_rate * scaled_delta) @ model.base_mat
+        model.base_mat = maybe_orthogonalize(updated, orthogonalize_steps) if do_orth else updated
 
     active = token_count > 0
     if active.any():
         scaled_delta = token_delta[active] / token_count[active].pow(count_power).view(-1, 1, 1)
-        model.token_mats[active] = orthogonalize_newton_schulz(
-            (eye.unsqueeze(0) + learning_rate * scaled_delta) @ model.token_mats[active],
-            orthogonalize_steps,
-        )
+        updated = (eye.unsqueeze(0) + learning_rate * scaled_delta) @ model.token_mats[active]
+        model.token_mats[active] = maybe_orthogonalize(updated, orthogonalize_steps) if do_orth else updated
 
     return mean_target_score / max(total, 1), correct / max(total, 1)
 
@@ -334,6 +342,7 @@ def train(
     eval_samples: int,
     max_gen_len: int,
     orthogonalize_steps: int,
+    orthogonalize_every: int,
     noise_every: int,
     noise_scale: float,
     count_power: float,
@@ -357,7 +366,9 @@ def train(
             target_ids=target_ids,
             learning_rate=learning_rate,
             orthogonalize_steps=orthogonalize_steps,
+            orthogonalize_every=orthogonalize_every,
             count_power=count_power,
+            iter_idx=iter_idx,
         )
 
         if noise_every > 0 and iter_idx % noise_every == 0:
@@ -393,6 +404,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-samples", type=int, default=300)
     p.add_argument("--init-sigma", type=float, default=0.0, help="Initialize matrices as orthogonalize(I + sigma * random), with random having variance 1/n")
     p.add_argument("--orthogonalize-steps", type=int, default=1, help="Newton-Schulz orthogonalization steps after each update")
+    p.add_argument("--orthogonalize-every", type=int, default=1, help="Apply Newton-Schulz re-orthogonalization every N iterations; 0 disables it")
     p.add_argument("--noise-every", type=int, default=10, help="Inject a small random orthogonal perturbation into token matrices every N iterations; 0 disables it")
     p.add_argument("--noise-scale", type=float, default=1e-3, help="Scale of random perturbation before Newton-Schulz re-orthogonalization")
     p.add_argument("--count-power", type=float, default=0.5, help="Scale accumulated updates by count**count_power; 0=sum, 0.5=sum/sqrt(count), 1=mean")
@@ -410,6 +422,8 @@ def main() -> None:
         raise ValueError("--init-sigma must be >= 0")
     if args.orthogonalize_steps < 0:
         raise ValueError("--orthogonalize-steps must be >= 0")
+    if args.orthogonalize_every < 0:
+        raise ValueError("--orthogonalize-every must be >= 0")
     if args.noise_every < 0:
         raise ValueError("--noise-every must be >= 0")
     if args.noise_scale < 0.0:
@@ -425,7 +439,10 @@ def main() -> None:
     print(f"device={device}")
     print(f"iters={args.iters} learning_rate={args.learning_rate}")
     print(f"base_mode={args.base_mode} addend_digits={args.addend_digits}")
-    print(f"init_sigma={args.init_sigma} init_random_var={1.0 / args.n:.6f} orthogonalize_steps={args.orthogonalize_steps}")
+    print(
+        f"init_sigma={args.init_sigma} init_random_var={1.0 / args.n:.6f} "
+        f"orthogonalize_steps={args.orthogonalize_steps} orthogonalize_every={args.orthogonalize_every}"
+    )
     print(f"noise_every={args.noise_every} noise_scale={args.noise_scale}")
     print(f"count_power={args.count_power}")
 
@@ -464,6 +481,7 @@ def main() -> None:
         eval_samples=args.eval_samples,
         max_gen_len=max_gen_len,
         orthogonalize_steps=args.orthogonalize_steps,
+        orthogonalize_every=args.orthogonalize_every,
         noise_every=args.noise_every,
         noise_scale=args.noise_scale,
         count_power=args.count_power,
