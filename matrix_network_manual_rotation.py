@@ -26,9 +26,16 @@ def orthogonalize_newton_schulz(w: torch.Tensor, steps: int) -> torch.Tensor:
     return out
 
 
-def init_random_orthogonal(n: int, device: torch.device, orthogonalize_steps: int) -> torch.Tensor:
-    std = (1.0 / n) ** 0.5
-    return orthogonalize_newton_schulz(torch.randn(n, n, device=device) * std, orthogonalize_steps)
+def random_rotation_perturbation(
+    n: int,
+    device: torch.device,
+    scale: float,
+    orthogonalize_steps: int,
+    batch: int | None = None,
+) -> torch.Tensor:
+    shape = (batch, n, n) if batch is not None else (n, n)
+    noise = torch.randn(*shape, device=device) * scale
+    return orthogonalize_newton_schulz(torch.eye(n, device=device).expand(shape) + noise, orthogonalize_steps)
 
 
 def random_problem(rng: random.Random, addend_digits: int) -> Problem:
@@ -80,14 +87,11 @@ class ManualRotationMatrixNetwork:
         self.unembed = torch.eye(n, device=device)[: self.output_vocab_size]
 
         self.base_mat = (
-            init_random_orthogonal(n, device, orthogonalize_steps)
+            torch.eye(n, device=device)
             if self.learn_base_mat
             else torch.eye(n, device=device)
         )
-        self.token_mats = torch.stack(
-            [init_random_orthogonal(n, device, orthogonalize_steps) for _ in range(self.vocab_size)],
-            dim=0,
-        )
+        self.token_mats = torch.eye(n, device=device).unsqueeze(0).repeat(self.vocab_size, 1, 1)
 
     def eye(self) -> torch.Tensor:
         return torch.eye(self.n, device=self.device)
@@ -274,6 +278,24 @@ def apply_batch_update(
     return mean_target_score / max(total, 1), correct / max(total, 1)
 
 
+@torch.no_grad()
+def inject_token_rotation_noise(
+    model: ManualRotationMatrixNetwork,
+    noise_scale: float,
+    orthogonalize_steps: int,
+) -> None:
+    if noise_scale <= 0.0:
+        return
+    perturb = random_rotation_perturbation(
+        model.n,
+        model.device,
+        scale=noise_scale,
+        orthogonalize_steps=orthogonalize_steps,
+        batch=model.vocab_size,
+    )
+    model.token_mats = perturb @ model.token_mats
+
+
 def train(
     *,
     model: ManualRotationMatrixNetwork,
@@ -287,6 +309,8 @@ def train(
     eval_samples: int,
     max_gen_len: int,
     orthogonalize_steps: int,
+    noise_every: int,
+    noise_scale: float,
 ) -> ManualRotationMatrixNetwork:
     rng = random.Random(seed)
 
@@ -308,6 +332,9 @@ def train(
             learning_rate=learning_rate,
             orthogonalize_steps=orthogonalize_steps,
         )
+
+        if noise_every > 0 and iter_idx % noise_every == 0:
+            inject_token_rotation_noise(model, noise_scale=noise_scale, orthogonalize_steps=orthogonalize_steps)
 
         if iter_idx % log_every == 0 or iter_idx == 1:
             print(f"iter={iter_idx:5d} mean_target_score={mean_target_score:.4f} token_acc={token_acc:.3f}")
@@ -338,6 +365,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
     p.add_argument("--orthogonalize-steps", type=int, default=1, help="Newton-Schulz orthogonalization steps after each update")
+    p.add_argument("--noise-every", type=int, default=10, help="Inject a small random orthogonal perturbation into token matrices every N iterations; 0 disables it")
+    p.add_argument("--noise-scale", type=float, default=1e-3, help="Scale of random perturbation before Newton-Schulz re-orthogonalization")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default="checkpoints/matrix_network_manual_rotation.pt", help="Checkpoint path")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -350,6 +379,10 @@ def main() -> None:
         raise ValueError("--learning-rate must be > 0")
     if args.orthogonalize_steps < 0:
         raise ValueError("--orthogonalize-steps must be >= 0")
+    if args.noise_every < 0:
+        raise ValueError("--noise-every must be >= 0")
+    if args.noise_scale < 0.0:
+        raise ValueError("--noise-scale must be >= 0")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -359,7 +392,8 @@ def main() -> None:
     print(f"device={device}")
     print(f"iters={args.iters} learning_rate={args.learning_rate}")
     print(f"base_mode={args.base_mode} addend_digits={args.addend_digits}")
-    print(f"init_var={1.0 / args.n:.6f} orthogonalize_steps={args.orthogonalize_steps}")
+    print(f"init=identity orthogonalize_steps={args.orthogonalize_steps}")
+    print(f"noise_every={args.noise_every} noise_scale={args.noise_scale}")
 
     if args.load_path is None:
         model = ManualRotationMatrixNetwork(
@@ -395,6 +429,8 @@ def main() -> None:
         eval_samples=args.eval_samples,
         max_gen_len=max_gen_len,
         orthogonalize_steps=args.orthogonalize_steps,
+        noise_every=args.noise_every,
+        noise_scale=args.noise_scale,
     )
 
     save_checkpoint(model, args.save_path, addend_digits=addend_digits)
