@@ -166,3 +166,26 @@ python scripts/base_mode_ablation.py \
   --num-seeds 3 \
   --out-dir checkpoints/base_mode_ablation
 ```
+
+## Matrix/Subspace Analysis
+
+Analyze saved checkpoints to estimate how much of the ambient space each base or token matrix acts on.
+
+```bash
+python scripts/analyze_matrix_subspaces.py models/dense_learned_n30_d3.pt
+```
+
+Analyze multiple checkpoints and save the full results as JSON:
+
+```bash
+python scripts/analyze_matrix_subspaces.py models checkpoints --json-out analysis/matrix_subspaces.json
+```
+
+The script reports several complementary views:
+- raw update rank from `M - I`
+- skew-update rank from the antisymmetric part of `M - I`, which is the cleanest proxy for rotation-like action
+- polar-factor rotation rank from the nearest orthogonal matrix `Q`
+- active-subspace closure from the learned query and decoder vectors
+- empirical state-span rank over sampled teacher-forced prefixes
+
+For low-rank `A^T @ B` checkpoints, `update_*` is the tightest measure of rank collapse; the skew part can spread across a somewhat larger support even when the raw update is low-rank.
