@@ -253,6 +253,7 @@ def apply_batch_update(
     orthogonalize_every: int,
     count_power: float,
     iter_idx: int,
+    context_length_power: float,
 ) -> Tuple[float, float]:
     n = model.n
     base_delta = torch.zeros(n, n, device=model.device)
@@ -273,6 +274,7 @@ def apply_batch_update(
         mean_target_score += float(state[target_id].item())
 
         target_vec = target_basis[target_id]
+        context_scale = float(len(prefix_ids) ** (-context_length_power)) if len(prefix_ids) > 0 else 1.0
         suffix_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
         suffix = model.query
         for idx in range(len(prefix_ids) - 1, -1, -1):
@@ -283,16 +285,17 @@ def apply_batch_update(
         if model.learn_base_mat:
             u_base = normalize_vector(base @ base_input)
             v_base = target_vec
-            base_delta.add_(torch.outer(v_base - u_base, u_base))
-            base_count += 1
+            base_delta.add_(context_scale * torch.outer(v_base - u_base, u_base))
+            base_count += context_scale
 
         left_target = base.transpose(-1, -2) @ target_vec
         for idx, tid in enumerate(prefix_ids):
             x_in = suffix_inputs[idx]
             u = normalize_vector(model.token_mats[tid] @ x_in)
             v = normalize_vector(left_target)
-            token_delta[tid].add_(torch.outer(v - u, u))
-            token_count[tid] += 1.0
+            weight = context_scale
+            token_delta[tid].add_(weight * torch.outer(v - u, u))
+            token_count[tid] += weight
             left_target = model.token_mats[tid].transpose(-1, -2) @ left_target
 
     eye = model.eye()
@@ -346,6 +349,7 @@ def train(
     noise_every: int,
     noise_scale: float,
     count_power: float,
+    context_length_power: float,
 ) -> ManualRotationMatrixNetwork:
     rng = random.Random(seed)
 
@@ -369,6 +373,7 @@ def train(
             orthogonalize_every=orthogonalize_every,
             count_power=count_power,
             iter_idx=iter_idx,
+            context_length_power=context_length_power,
         )
 
         if noise_every > 0 and iter_idx % noise_every == 0:
@@ -408,6 +413,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--noise-every", type=int, default=10, help="Inject a small random orthogonal perturbation into token matrices every N iterations; 0 disables it")
     p.add_argument("--noise-scale", type=float, default=1e-3, help="Scale of random perturbation before Newton-Schulz re-orthogonalization")
     p.add_argument("--count-power", type=float, default=0.5, help="Scale accumulated updates by count**count_power; 0=sum, 0.5=sum/sqrt(count), 1=mean")
+    p.add_argument("--context-length-power", type=float, default=0.0, help="Scale each prediction context by len(prefix)**(-power); 1.0 gives each context a fixed total update budget")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default="checkpoints/matrix_network_manual_rotation.pt", help="Checkpoint path")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -430,6 +436,8 @@ def main() -> None:
         raise ValueError("--noise-scale must be >= 0")
     if args.count_power < 0.0:
         raise ValueError("--count-power must be >= 0")
+    if args.context_length_power < 0.0:
+        raise ValueError("--context-length-power must be >= 0")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -445,6 +453,7 @@ def main() -> None:
     )
     print(f"noise_every={args.noise_every} noise_scale={args.noise_scale}")
     print(f"count_power={args.count_power}")
+    print(f"context_length_power={args.context_length_power}")
 
     if args.load_path is None:
         model = ManualRotationMatrixNetwork(
@@ -485,6 +494,7 @@ def main() -> None:
         noise_every=args.noise_every,
         noise_scale=args.noise_scale,
         count_power=args.count_power,
+        context_length_power=args.context_length_power,
     )
 
     save_checkpoint(model, args.save_path, addend_digits=addend_digits)
