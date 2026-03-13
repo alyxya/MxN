@@ -184,7 +184,6 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
         f"_it{args.iters}"
         f"_bs{args.batch_size}"
         f"_lr{format_float_token(args.learning_rate)}"
-        f"_count{format_float_token(args.count_power)}"
         f"_ctx{format_float_token(args.context_length_power)}"
         f"_mem{format_float_token(args.memory_weight)}"
         f"_seed{args.seed}"
@@ -248,15 +247,12 @@ def apply_batch_update(
     prefixes: Sequence[Sequence[int]],
     target_ids: Sequence[int],
     learning_rate: float,
-    count_power: float,
     context_length_power: float,
     memory_weight: float,
 ) -> Tuple[float, float]:
     n = model.n
     base_delta = torch.zeros(n, n, device=model.device)
-    base_count = 0
     token_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
-    token_count = torch.zeros(model.vocab_size, device=model.device)
     correct = 0
     total = 0
     mean_target_score = 0.0
@@ -297,28 +293,23 @@ def apply_batch_update(
 
         u_base = normalize_columns(state_mat)
         base_delta.add_(manual_rotation_delta(u_base, target_mat, weights))
-        base_count += context_scale
 
         left_target = base.transpose(-1, -2) @ target_mat
-        weight_sum = float(weights.sum().item())
         for idx, tid in enumerate(prefix_ids):
             x_in = suffix_inputs[idx]
             u = normalize_columns(model.token_mats[tid] @ x_in)
             v = normalize_columns(left_target)
             token_delta[tid].add_(manual_rotation_delta(u, v, weights))
-            token_count[tid] += weight_sum
             left_target = model.token_mats[tid].transpose(-1, -2) @ left_target
 
     eye = model.eye()
-    if base_count > 0:
-        scaled_delta = base_delta / (float(base_count) ** count_power)
-        updated = (eye + learning_rate * scaled_delta) @ model.base_mat
+    if total > 0:
+        updated = (eye + learning_rate * base_delta) @ model.base_mat
         model.base_mat = orthogonalize_newton_schulz(updated)
 
-    active = token_count > 0
+    active = token_delta.abs().amax(dim=(1, 2)) > 0
     if active.any():
-        scaled_delta = token_delta[active] / token_count[active].pow(count_power).view(-1, 1, 1)
-        updated = (eye.unsqueeze(0) + learning_rate * scaled_delta) @ model.token_mats[active]
+        updated = (eye.unsqueeze(0) + learning_rate * token_delta[active]) @ model.token_mats[active]
         model.token_mats[active] = orthogonalize_newton_schulz(updated)
 
     return mean_target_score / max(total, 1), correct / max(total, 1)
@@ -336,7 +327,6 @@ def train(
     eval_every: int,
     eval_samples: int,
     max_gen_len: int,
-    count_power: float,
     context_length_power: float,
     memory_weight: float,
 ) -> ManualRotationMatrixNetwork:
@@ -358,7 +348,6 @@ def train(
             prefixes=prefixes,
             target_ids=target_ids,
             learning_rate=learning_rate,
-            count_power=count_power,
             context_length_power=context_length_power,
             memory_weight=memory_weight,
         )
@@ -390,7 +379,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
-    p.add_argument("--count-power", type=float, default=0.5, help="Scale accumulated updates by count**count_power; 0=sum, 0.5=sum/sqrt(count), 1=mean")
     p.add_argument("--context-length-power", type=float, default=0.0, help="Scale each prediction context by len(prefix)**(-power); 1.0 gives each context a fixed total update budget")
     p.add_argument("--memory-weight", type=float, default=0.0, help="Total weight of the auxiliary memory objective per prefix, distributed across active memory lags")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
@@ -403,8 +391,6 @@ def main() -> None:
     args = parse_args()
     if args.learning_rate <= 0.0:
         raise ValueError("--learning-rate must be > 0")
-    if args.count_power < 0.0:
-        raise ValueError("--count-power must be >= 0")
     if args.context_length_power < 0.0:
         raise ValueError("--context-length-power must be >= 0")
     if args.memory_weight < 0.0:
@@ -419,7 +405,6 @@ def main() -> None:
     print(f"iters={args.iters} learning_rate={args.learning_rate}")
     print(f"base_mode=learned addend_digits={args.addend_digits}")
     print("init_mode=identity orthogonalize=one_step_per_update")
-    print(f"count_power={args.count_power}")
     print(f"context_length_power={args.context_length_power}")
     print(f"memory_scope=full_prefix memory_weight={args.memory_weight}")
 
@@ -454,7 +439,6 @@ def main() -> None:
         eval_every=args.eval_every,
         eval_samples=args.eval_samples,
         max_gen_len=max_gen_len,
-        count_power=args.count_power,
         context_length_power=args.context_length_power,
         memory_weight=args.memory_weight,
     )
