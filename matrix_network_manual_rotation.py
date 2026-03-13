@@ -246,6 +246,7 @@ def apply_batch_update(
     model: ManualRotationMatrixNetwork,
     prefixes: Sequence[Sequence[int]],
     target_ids: Sequence[int],
+    problem_count: int,
     learning_rate: float,
     context_length_power: float,
     memory_weight: float,
@@ -303,13 +304,14 @@ def apply_batch_update(
             left_target = model.token_mats[tid].transpose(-1, -2) @ left_target
 
     eye = model.eye()
+    batch_scale = 1.0 / float(max(problem_count, 1))
     if total > 0:
-        updated = (eye + learning_rate * base_delta) @ model.base_mat
+        updated = (eye + learning_rate * (base_delta * batch_scale)) @ model.base_mat
         model.base_mat = orthogonalize_newton_schulz(updated)
 
     active = token_delta.abs().amax(dim=(1, 2)) > 0
     if active.any():
-        updated = (eye.unsqueeze(0) + learning_rate * token_delta[active]) @ model.token_mats[active]
+        updated = (eye.unsqueeze(0) + learning_rate * (token_delta[active] * batch_scale)) @ model.token_mats[active]
         model.token_mats[active] = orthogonalize_newton_schulz(updated)
 
     return mean_target_score / max(total, 1), correct / max(total, 1)
@@ -347,6 +349,7 @@ def train(
             model,
             prefixes=prefixes,
             target_ids=target_ids,
+            problem_count=batch_size,
             learning_rate=learning_rate,
             context_length_power=context_length_power,
             memory_weight=memory_weight,
