@@ -332,6 +332,17 @@ def inject_token_rotation_noise(
     model.token_mats = perturb @ model.token_mats
 
 
+def scheduled_noise_scale(iter_idx: int, total_iters: int, noise_scale: float, noise_scale_final: float, noise_decay_iters: int) -> float:
+    if noise_scale_final < 0.0:
+        return noise_scale
+    if noise_decay_iters <= 0:
+        decay_iters = total_iters
+    else:
+        decay_iters = noise_decay_iters
+    t = min(max(iter_idx - 1, 0), decay_iters) / max(decay_iters, 1)
+    return (1.0 - t) * noise_scale + t * noise_scale_final
+
+
 def train(
     *,
     model: ManualRotationMatrixNetwork,
@@ -348,6 +359,8 @@ def train(
     orthogonalize_every: int,
     noise_every: int,
     noise_scale: float,
+    noise_scale_final: float,
+    noise_decay_iters: int,
     count_power: float,
     context_length_power: float,
 ) -> ManualRotationMatrixNetwork:
@@ -376,11 +389,21 @@ def train(
             context_length_power=context_length_power,
         )
 
-        if noise_every > 0 and iter_idx % noise_every == 0:
-            inject_token_rotation_noise(model, noise_scale=noise_scale, orthogonalize_steps=orthogonalize_steps)
+        current_noise_scale = scheduled_noise_scale(
+            iter_idx=iter_idx,
+            total_iters=iters,
+            noise_scale=noise_scale,
+            noise_scale_final=noise_scale_final,
+            noise_decay_iters=noise_decay_iters,
+        )
+        if noise_every > 0 and current_noise_scale > 0.0 and iter_idx % noise_every == 0:
+            inject_token_rotation_noise(model, noise_scale=current_noise_scale, orthogonalize_steps=orthogonalize_steps)
 
         if iter_idx % log_every == 0 or iter_idx == 1:
-            print(f"iter={iter_idx:5d} mean_target_score={mean_target_score:.4f} token_acc={token_acc:.3f}")
+            print(
+                f"iter={iter_idx:5d} mean_target_score={mean_target_score:.4f} "
+                f"token_acc={token_acc:.3f} noise_scale={current_noise_scale:.6f}"
+            )
 
         if iter_idx % eval_every == 0 or iter_idx == iters:
             exact, tf_acc, stop_rate = evaluate(
@@ -412,6 +435,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--orthogonalize-every", type=int, default=1, help="Apply Newton-Schulz re-orthogonalization every N iterations; 0 disables it")
     p.add_argument("--noise-every", type=int, default=10, help="Inject a small random orthogonal perturbation into token matrices every N iterations; 0 disables it")
     p.add_argument("--noise-scale", type=float, default=1e-3, help="Scale of random perturbation before Newton-Schulz re-orthogonalization")
+    p.add_argument("--noise-scale-final", type=float, default=-1.0, help="Optional final noise scale for linear decay; negative keeps constant noise")
+    p.add_argument("--noise-decay-iters", type=int, default=0, help="Iterations over which to linearly decay noise_scale to noise_scale_final; 0 means use full training length")
     p.add_argument("--count-power", type=float, default=0.5, help="Scale accumulated updates by count**count_power; 0=sum, 0.5=sum/sqrt(count), 1=mean")
     p.add_argument("--context-length-power", type=float, default=0.0, help="Scale each prediction context by len(prefix)**(-power); 1.0 gives each context a fixed total update budget")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
@@ -434,6 +459,10 @@ def main() -> None:
         raise ValueError("--noise-every must be >= 0")
     if args.noise_scale < 0.0:
         raise ValueError("--noise-scale must be >= 0")
+    if args.noise_scale_final < 0.0 and args.noise_scale_final != -1.0:
+        raise ValueError("--noise-scale-final must be >= 0 or -1 for constant noise")
+    if args.noise_decay_iters < 0:
+        raise ValueError("--noise-decay-iters must be >= 0")
     if args.count_power < 0.0:
         raise ValueError("--count-power must be >= 0")
     if args.context_length_power < 0.0:
@@ -451,7 +480,10 @@ def main() -> None:
         f"init_sigma={args.init_sigma} init_random_var={1.0 / args.n:.6f} "
         f"orthogonalize_steps={args.orthogonalize_steps} orthogonalize_every={args.orthogonalize_every}"
     )
-    print(f"noise_every={args.noise_every} noise_scale={args.noise_scale}")
+    print(
+        f"noise_every={args.noise_every} noise_scale={args.noise_scale} "
+        f"noise_scale_final={args.noise_scale_final} noise_decay_iters={args.noise_decay_iters}"
+    )
     print(f"count_power={args.count_power}")
     print(f"context_length_power={args.context_length_power}")
 
@@ -493,6 +525,8 @@ def main() -> None:
         orthogonalize_every=args.orthogonalize_every,
         noise_every=args.noise_every,
         noise_scale=args.noise_scale,
+        noise_scale_final=args.noise_scale_final,
+        noise_decay_iters=args.noise_decay_iters,
         count_power=args.count_power,
         context_length_power=args.context_length_power,
     )
