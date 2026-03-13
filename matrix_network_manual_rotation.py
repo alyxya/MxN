@@ -12,11 +12,20 @@ OUTPUT_VOCAB = f"{EOS_TOKEN}0123456789"
 VOCAB = OUTPUT_VOCAB + "+="
 EPS = 1e-12
 BASE_MODES = ("learned", "identity_fixed")
+UPDATE_MODES = ("outer_diff", "skew")
 Problem = Tuple[int, int, str, str]
 
 
 def normalize_vector(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
     return x / (x.norm() + eps)
+
+
+def manual_rotation_delta(u: torch.Tensor, v: torch.Tensor, update_mode: str) -> torch.Tensor:
+    if update_mode == "outer_diff":
+        return torch.outer(v - u, u)
+    if update_mode == "skew":
+        return torch.outer(v, u) - torch.outer(u, v)
+    raise ValueError(f"Unsupported update_mode={update_mode!r}; expected one of {UPDATE_MODES}")
 
 
 def orthogonalize_newton_schulz(w: torch.Tensor, steps: int) -> torch.Tensor:
@@ -254,6 +263,7 @@ def apply_batch_update(
     count_power: float,
     iter_idx: int,
     context_length_power: float,
+    update_mode: str,
 ) -> Tuple[float, float]:
     n = model.n
     base_delta = torch.zeros(n, n, device=model.device)
@@ -285,7 +295,7 @@ def apply_batch_update(
         if model.learn_base_mat:
             u_base = normalize_vector(base @ base_input)
             v_base = target_vec
-            base_delta.add_(context_scale * torch.outer(v_base - u_base, u_base))
+            base_delta.add_(context_scale * manual_rotation_delta(u_base, v_base, update_mode))
             base_count += context_scale
 
         left_target = base.transpose(-1, -2) @ target_vec
@@ -294,7 +304,7 @@ def apply_batch_update(
             u = normalize_vector(model.token_mats[tid] @ x_in)
             v = normalize_vector(left_target)
             weight = context_scale
-            token_delta[tid].add_(weight * torch.outer(v - u, u))
+            token_delta[tid].add_(weight * manual_rotation_delta(u, v, update_mode))
             token_count[tid] += weight
             left_target = model.token_mats[tid].transpose(-1, -2) @ left_target
 
@@ -363,6 +373,7 @@ def train(
     noise_decay_iters: int,
     count_power: float,
     context_length_power: float,
+    update_mode: str,
 ) -> ManualRotationMatrixNetwork:
     rng = random.Random(seed)
 
@@ -387,6 +398,7 @@ def train(
             count_power=count_power,
             iter_idx=iter_idx,
             context_length_power=context_length_power,
+            update_mode=update_mode,
         )
 
         current_noise_scale = scheduled_noise_scale(
@@ -439,6 +451,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--noise-decay-iters", type=int, default=0, help="Iterations over which to linearly decay noise_scale to noise_scale_final; 0 means use full training length")
     p.add_argument("--count-power", type=float, default=0.5, help="Scale accumulated updates by count**count_power; 0=sum, 0.5=sum/sqrt(count), 1=mean")
     p.add_argument("--context-length-power", type=float, default=0.0, help="Scale each prediction context by len(prefix)**(-power); 1.0 gives each context a fixed total update budget")
+    p.add_argument("--update-mode", type=str, default="outer_diff", choices=list(UPDATE_MODES), help="Local manual update rule: original outer-difference or skew-symmetric first-order rotation")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default="checkpoints/matrix_network_manual_rotation.pt", help="Checkpoint path")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -484,6 +497,7 @@ def main() -> None:
         f"noise_every={args.noise_every} noise_scale={args.noise_scale} "
         f"noise_scale_final={args.noise_scale_final} noise_decay_iters={args.noise_decay_iters}"
     )
+    print(f"update_mode={args.update_mode}")
     print(f"count_power={args.count_power}")
     print(f"context_length_power={args.context_length_power}")
 
@@ -529,6 +543,7 @@ def main() -> None:
         noise_decay_iters=args.noise_decay_iters,
         count_power=args.count_power,
         context_length_power=args.context_length_power,
+        update_mode=args.update_mode,
     )
 
     save_checkpoint(model, args.save_path, addend_digits=addend_digits)
