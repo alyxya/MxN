@@ -28,17 +28,8 @@ def manual_rotation_delta(u: torch.Tensor, v: torch.Tensor, update_mode: str) ->
     raise ValueError(f"Unsupported update_mode={update_mode!r}; expected one of {UPDATE_MODES}")
 
 
-def orthogonalize_newton_schulz(w: torch.Tensor, steps: int) -> torch.Tensor:
-    out = w
-    for _ in range(steps):
-        out = 1.5 * out - 0.5 * (out @ out.transpose(-1, -2) @ out)
-    return out
-
-
-def maybe_orthogonalize(w: torch.Tensor, steps: int) -> torch.Tensor:
-    if steps <= 0:
-        return w
-    return orthogonalize_newton_schulz(w, steps)
+def orthogonalize_newton_schulz(w: torch.Tensor) -> torch.Tensor:
+    return 1.5 * w - 0.5 * (w @ w.transpose(-1, -2) @ w)
 
 
 def random_problem(rng: random.Random, addend_digits: int) -> Problem:
@@ -224,10 +215,7 @@ def apply_batch_update(
     prefixes: Sequence[Sequence[int]],
     target_ids: Sequence[int],
     learning_rate: float,
-    orthogonalize_steps: int,
-    orthogonalize_every: int,
     count_power: float,
-    iter_idx: int,
     context_length_power: float,
     update_mode: str,
     memory_weight: float,
@@ -301,17 +289,16 @@ def apply_batch_update(
                     left_memory_target = model.token_mats[tid].transpose(-1, -2) @ left_memory_target
 
     eye = model.eye()
-    do_orth = orthogonalize_every > 0 and (iter_idx % orthogonalize_every == 0)
     if base_count > 0:
         scaled_delta = base_delta / (float(base_count) ** count_power)
         updated = (eye + learning_rate * scaled_delta) @ model.base_mat
-        model.base_mat = maybe_orthogonalize(updated, orthogonalize_steps) if do_orth else updated
+        model.base_mat = orthogonalize_newton_schulz(updated)
 
     active = token_count > 0
     if active.any():
         scaled_delta = token_delta[active] / token_count[active].pow(count_power).view(-1, 1, 1)
         updated = (eye.unsqueeze(0) + learning_rate * scaled_delta) @ model.token_mats[active]
-        model.token_mats[active] = maybe_orthogonalize(updated, orthogonalize_steps) if do_orth else updated
+        model.token_mats[active] = orthogonalize_newton_schulz(updated)
 
     return mean_target_score / max(total, 1), correct / max(total, 1)
 
@@ -328,8 +315,6 @@ def train(
     eval_every: int,
     eval_samples: int,
     max_gen_len: int,
-    orthogonalize_steps: int,
-    orthogonalize_every: int,
     count_power: float,
     context_length_power: float,
     update_mode: str,
@@ -353,10 +338,7 @@ def train(
             prefixes=prefixes,
             target_ids=target_ids,
             learning_rate=learning_rate,
-            orthogonalize_steps=orthogonalize_steps,
-            orthogonalize_every=orthogonalize_every,
             count_power=count_power,
-            iter_idx=iter_idx,
             context_length_power=context_length_power,
             update_mode=update_mode,
             memory_weight=memory_weight,
@@ -389,8 +371,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
-    p.add_argument("--orthogonalize-steps", type=int, default=1, help="Newton-Schulz orthogonalization steps after each update")
-    p.add_argument("--orthogonalize-every", type=int, default=1, help="Apply Newton-Schulz re-orthogonalization every N iterations; 0 disables it")
     p.add_argument("--count-power", type=float, default=0.5, help="Scale accumulated updates by count**count_power; 0=sum, 0.5=sum/sqrt(count), 1=mean")
     p.add_argument("--context-length-power", type=float, default=0.0, help="Scale each prediction context by len(prefix)**(-power); 1.0 gives each context a fixed total update budget")
     p.add_argument("--update-mode", type=str, default="outer_diff", choices=list(UPDATE_MODES), help="Local manual update rule: original outer-difference or skew-symmetric first-order rotation")
@@ -405,10 +385,6 @@ def main() -> None:
     args = parse_args()
     if args.learning_rate <= 0.0:
         raise ValueError("--learning-rate must be > 0")
-    if args.orthogonalize_steps < 0:
-        raise ValueError("--orthogonalize-steps must be >= 0")
-    if args.orthogonalize_every < 0:
-        raise ValueError("--orthogonalize-every must be >= 0")
     if args.count_power < 0.0:
         raise ValueError("--count-power must be >= 0")
     if args.context_length_power < 0.0:
@@ -424,7 +400,7 @@ def main() -> None:
     print(f"device={device}")
     print(f"iters={args.iters} learning_rate={args.learning_rate}")
     print(f"base_mode=learned addend_digits={args.addend_digits}")
-    print(f"init_mode=identity orthogonalize_steps={args.orthogonalize_steps} orthogonalize_every={args.orthogonalize_every}")
+    print("init_mode=identity orthogonalize=one_step_per_update")
     print(f"update_mode={args.update_mode}")
     print(f"count_power={args.count_power}")
     print(f"context_length_power={args.context_length_power}")
@@ -459,8 +435,6 @@ def main() -> None:
         eval_every=args.eval_every,
         eval_samples=args.eval_samples,
         max_gen_len=max_gen_len,
-        orthogonalize_steps=args.orthogonalize_steps,
-        orthogonalize_every=args.orthogonalize_every,
         count_power=args.count_power,
         context_length_power=args.context_length_power,
         update_mode=args.update_mode,
