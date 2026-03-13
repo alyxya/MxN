@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import random
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -156,6 +157,27 @@ def save_checkpoint(model: ManualRotationMatrixNetwork, save_path: str, addend_d
         },
         path,
     )
+
+
+def format_float_token(x: float) -> str:
+    return format(x, ".6g").replace("-", "m").replace(".", "p")
+
+
+def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    name = (
+        f"manual_rotation_n{args.n}"
+        f"_d{addend_digits}"
+        f"_it{args.iters}"
+        f"_bs{args.batch_size}"
+        f"_lr{format_float_token(args.learning_rate)}"
+        f"_count{format_float_token(args.count_power)}"
+        f"_ctx{format_float_token(args.context_length_power)}"
+        f"_mem{format_float_token(args.memory_weight)}"
+        f"_seed{args.seed}"
+        f"_{timestamp}.pt"
+    )
+    return str(Path("checkpoints") / name)
 
 
 def generate_until_eos(model: ManualRotationMatrixNetwork, lhs: str, max_len: int) -> Tuple[str, bool]:
@@ -370,7 +392,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--context-length-power", type=float, default=0.0, help="Scale each prediction context by len(prefix)**(-power); 1.0 gives each context a fixed total update budget")
     p.add_argument("--memory-weight", type=float, default=0.0, help="Total weight of the auxiliary memory objective per prefix, distributed across active memory lags")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
-    p.add_argument("--save-path", type=str, default="checkpoints/matrix_network_manual_rotation.pt", help="Checkpoint path")
+    p.add_argument("--save-path", type=str, default=None, help="Optional checkpoint path override")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
     return p.parse_args()
 
@@ -414,8 +436,10 @@ def main() -> None:
             print(f"loaded_addend_digits={loaded_addend_digits}; overriding --addend-digits={args.addend_digits}")
 
     max_gen_len = addend_digits + 2
+    save_path = args.save_path or default_save_path(args, addend_digits)
     print(f"max_gen_len={max_gen_len}")
     print(f"output_vocab={OUTPUT_VOCAB}")
+    print(f"save_path={save_path}")
 
     model = train(
         model=model,
@@ -433,8 +457,8 @@ def main() -> None:
         memory_weight=args.memory_weight,
     )
 
-    save_checkpoint(model, args.save_path, addend_digits=addend_digits)
-    print(f"saved_checkpoint={args.save_path}")
+    save_checkpoint(model, save_path, addend_digits=addend_digits)
+    print(f"saved_checkpoint={save_path}")
     print("\nSample predictions:")
     show_samples(model, seed=args.seed + 999, max_gen_len=max_gen_len, addend_digits=addend_digits)
 
