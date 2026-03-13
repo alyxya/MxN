@@ -6,6 +6,13 @@ Supported architecture switches:
 - base mode: `learned` or `identity_fixed`
 - token mode: `dense`, `lowrank_ab`, or `subspace_rot`
 
+There is also a separate experimental trainer:
+- `matrix_network_manual_rotation.py`
+- dense-only, fixed one-hot next-token query/readout
+- deterministic identity initialization
+- manual rotation-style updates without autograd
+- optional auxiliary full-prefix past-memory objective
+
 Token modes:
 - `dense`: one dense `n x n` matrix per token
 - `lowrank_ab`: `I + A^T @ B`, with `A` shape `k x n` and `B` shape `k x n`
@@ -102,6 +109,47 @@ python matrix_network_addition.py \
   --batch-size 64 \
   --eval-every 1000 \
   --save-path checkpoints/dense_identity_n30_d3.pt
+```
+
+## Manual Rotation Trainer
+
+This is a separate experimental path from `matrix_network_addition.py`.
+
+Current behavior:
+- dense matrices only
+- fixed next-token query vector and fixed one-hot output basis
+- all matrices start as identity
+- no init randomness or periodic noise injection
+- manual local update rule selected by `--update-mode`
+- optional auxiliary past-memory supervision controlled by `--memory-weight`
+
+Basic 3-digit run:
+
+```bash
+python matrix_network_manual_rotation.py \
+  --n 30 \
+  --base-mode learned \
+  --addend-digits 3 \
+  --learning-rate 0.2 \
+  --iters 1500 \
+  --batch-size 64 \
+  --eval-every 500 \
+  --save-path checkpoints/manual_rotation_dense_n30_d3.pt
+```
+
+With auxiliary full-prefix past-memory supervision:
+
+```bash
+python matrix_network_manual_rotation.py \
+  --n 30 \
+  --base-mode learned \
+  --addend-digits 3 \
+  --learning-rate 0.2 \
+  --iters 1500 \
+  --batch-size 64 \
+  --eval-every 500 \
+  --memory-weight 0.1 \
+  --save-path checkpoints/manual_rotation_dense_n30_d3_memw01.pt
 ```
 
 ## Continue Training
