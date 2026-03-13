@@ -11,7 +11,6 @@ EOS_TOKEN = "~"
 OUTPUT_VOCAB = f"{EOS_TOKEN}0123456789"
 VOCAB = OUTPUT_VOCAB + "+="
 EPS = 1e-12
-UPDATE_MODES = ("outer_diff", "skew")
 Problem = Tuple[int, int, str, str]
 TAU = 2.0 * torch.pi
 
@@ -20,12 +19,11 @@ def normalize_vector(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
     return x / (x.norm() + eps)
 
 
-def manual_rotation_delta(u: torch.Tensor, v: torch.Tensor, update_mode: str) -> torch.Tensor:
-    if update_mode == "outer_diff":
-        return torch.outer(v - u, u)
-    if update_mode == "skew":
-        return torch.outer(v, u) - torch.outer(u, v)
-    raise ValueError(f"Unsupported update_mode={update_mode!r}; expected one of {UPDATE_MODES}")
+def manual_rotation_delta(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    # A skew-symmetric alternative is outer(v, u) - outer(u, v), which is a
+    # cleaner first-order rotation update, but this trainer currently uses the
+    # simpler outer-difference rule.
+    return torch.outer(v - u, u)
 
 
 def orthogonalize_newton_schulz(w: torch.Tensor) -> torch.Tensor:
@@ -217,7 +215,6 @@ def apply_batch_update(
     learning_rate: float,
     count_power: float,
     context_length_power: float,
-    update_mode: str,
     memory_weight: float,
 ) -> Tuple[float, float]:
     n = model.n
@@ -249,7 +246,7 @@ def apply_batch_update(
         base_input = suffix
         u_base = normalize_vector(base @ base_input)
         v_base = target_vec
-        base_delta.add_(context_scale * manual_rotation_delta(u_base, v_base, update_mode))
+        base_delta.add_(context_scale * manual_rotation_delta(u_base, v_base))
         base_count += context_scale
 
         left_target = base.transpose(-1, -2) @ target_vec
@@ -258,7 +255,7 @@ def apply_batch_update(
             u = normalize_vector(model.token_mats[tid] @ x_in)
             v = normalize_vector(left_target)
             weight = context_scale
-            token_delta[tid].add_(weight * manual_rotation_delta(u, v, update_mode))
+            token_delta[tid].add_(weight * manual_rotation_delta(u, v))
             token_count[tid] += weight
             left_target = model.token_mats[tid].transpose(-1, -2) @ left_target
 
@@ -278,14 +275,14 @@ def apply_batch_update(
                 memory_base_input = memory_suffix
                 u_base_mem = normalize_vector(base @ memory_base_input)
                 v_base_mem = memory_target
-                base_delta.add_(memory_scale * manual_rotation_delta(u_base_mem, v_base_mem, update_mode))
+                base_delta.add_(memory_scale * manual_rotation_delta(u_base_mem, v_base_mem))
 
                 left_memory_target = base.transpose(-1, -2) @ memory_target
                 for idx, tid in enumerate(prefix_ids):
                     x_in = memory_suffix_inputs[idx]
                     u_mem = normalize_vector(model.token_mats[tid] @ x_in)
                     v_mem = normalize_vector(left_memory_target)
-                    token_delta[tid].add_(memory_scale * manual_rotation_delta(u_mem, v_mem, update_mode))
+                    token_delta[tid].add_(memory_scale * manual_rotation_delta(u_mem, v_mem))
                     left_memory_target = model.token_mats[tid].transpose(-1, -2) @ left_memory_target
 
     eye = model.eye()
@@ -317,7 +314,6 @@ def train(
     max_gen_len: int,
     count_power: float,
     context_length_power: float,
-    update_mode: str,
     memory_weight: float,
 ) -> ManualRotationMatrixNetwork:
     rng = random.Random(seed)
@@ -340,7 +336,6 @@ def train(
             learning_rate=learning_rate,
             count_power=count_power,
             context_length_power=context_length_power,
-            update_mode=update_mode,
             memory_weight=memory_weight,
         )
 
@@ -373,7 +368,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-samples", type=int, default=300)
     p.add_argument("--count-power", type=float, default=0.5, help="Scale accumulated updates by count**count_power; 0=sum, 0.5=sum/sqrt(count), 1=mean")
     p.add_argument("--context-length-power", type=float, default=0.0, help="Scale each prediction context by len(prefix)**(-power); 1.0 gives each context a fixed total update budget")
-    p.add_argument("--update-mode", type=str, default="outer_diff", choices=list(UPDATE_MODES), help="Local manual update rule: original outer-difference or skew-symmetric first-order rotation")
     p.add_argument("--memory-weight", type=float, default=0.0, help="Total weight of the auxiliary memory objective per prefix, distributed across active memory lags")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default="checkpoints/matrix_network_manual_rotation.pt", help="Checkpoint path")
@@ -401,7 +395,6 @@ def main() -> None:
     print(f"iters={args.iters} learning_rate={args.learning_rate}")
     print(f"base_mode=learned addend_digits={args.addend_digits}")
     print("init_mode=identity orthogonalize=one_step_per_update")
-    print(f"update_mode={args.update_mode}")
     print(f"count_power={args.count_power}")
     print(f"context_length_power={args.context_length_power}")
     print(f"memory_scope=full_prefix memory_weight={args.memory_weight}")
@@ -437,7 +430,6 @@ def main() -> None:
         max_gen_len=max_gen_len,
         count_power=args.count_power,
         context_length_power=args.context_length_power,
-        update_mode=args.update_mode,
         memory_weight=args.memory_weight,
     )
 
