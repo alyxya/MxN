@@ -240,7 +240,6 @@ def apply_batch_update(
     iter_idx: int,
     context_length_power: float,
     update_mode: str,
-    memory_horizon: int,
     memory_weight: float,
 ) -> Tuple[float, float]:
     n = model.n
@@ -286,8 +285,8 @@ def apply_batch_update(
             token_count[tid] += weight
             left_target = model.token_mats[tid].transpose(-1, -2) @ left_target
 
-        if memory_horizon > 0 and memory_weight > 0.0 and prefix_ids:
-            memory_terms = min(memory_horizon, len(prefix_ids))
+        if memory_weight > 0.0 and prefix_ids:
+            memory_terms = len(prefix_ids)
             memory_scale = context_scale * (memory_weight / float(memory_terms))
             for lag in range(1, memory_terms + 1):
                 memory_query = model.past_query(lag)
@@ -346,7 +345,6 @@ def train(
     count_power: float,
     context_length_power: float,
     update_mode: str,
-    memory_horizon: int,
     memory_weight: float,
 ) -> ManualRotationMatrixNetwork:
     rng = random.Random(seed)
@@ -373,7 +371,6 @@ def train(
             iter_idx=iter_idx,
             context_length_power=context_length_power,
             update_mode=update_mode,
-            memory_horizon=memory_horizon,
             memory_weight=memory_weight,
         )
 
@@ -410,7 +407,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--count-power", type=float, default=0.5, help="Scale accumulated updates by count**count_power; 0=sum, 0.5=sum/sqrt(count), 1=mean")
     p.add_argument("--context-length-power", type=float, default=0.0, help="Scale each prediction context by len(prefix)**(-power); 1.0 gives each context a fixed total update budget")
     p.add_argument("--update-mode", type=str, default="outer_diff", choices=list(UPDATE_MODES), help="Local manual update rule: original outer-difference or skew-symmetric first-order rotation")
-    p.add_argument("--memory-horizon", type=int, default=0, help="Supervise up to this many past tokens using sinusoidal past-query objectives; 0 disables memory supervision")
     p.add_argument("--memory-weight", type=float, default=0.0, help="Total weight of the auxiliary memory objective per prefix, distributed across active memory lags")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default="checkpoints/matrix_network_manual_rotation.pt", help="Checkpoint path")
@@ -430,8 +426,6 @@ def main() -> None:
         raise ValueError("--count-power must be >= 0")
     if args.context_length_power < 0.0:
         raise ValueError("--context-length-power must be >= 0")
-    if args.memory_horizon < 0:
-        raise ValueError("--memory-horizon must be >= 0")
     if args.memory_weight < 0.0:
         raise ValueError("--memory-weight must be >= 0")
 
@@ -447,7 +441,7 @@ def main() -> None:
     print(f"update_mode={args.update_mode}")
     print(f"count_power={args.count_power}")
     print(f"context_length_power={args.context_length_power}")
-    print(f"memory_horizon={args.memory_horizon} memory_weight={args.memory_weight}")
+    print(f"memory_scope=full_prefix memory_weight={args.memory_weight}")
 
     if args.load_path is None:
         model = ManualRotationMatrixNetwork(
@@ -486,7 +480,6 @@ def main() -> None:
         count_power=args.count_power,
         context_length_power=args.context_length_power,
         update_mode=args.update_mode,
-        memory_horizon=args.memory_horizon,
         memory_weight=args.memory_weight,
     )
 
