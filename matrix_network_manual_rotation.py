@@ -11,7 +11,6 @@ EOS_TOKEN = "~"
 OUTPUT_VOCAB = f"{EOS_TOKEN}0123456789"
 VOCAB = OUTPUT_VOCAB + "+="
 EPS = 1e-12
-BASE_MODES = ("learned", "identity_fixed")
 UPDATE_MODES = ("outer_diff", "skew")
 Problem = Tuple[int, int, str, str]
 TAU = 2.0 * torch.pi
@@ -67,17 +66,12 @@ class ManualRotationMatrixNetwork:
         *,
         n: int,
         device: torch.device,
-        base_mode: str = "learned",
     ):
-        if base_mode not in BASE_MODES:
-            raise ValueError(f"Unsupported base_mode={base_mode!r}; expected one of {BASE_MODES}")
         if n < len(VOCAB):
             raise ValueError(f"n must be >= {len(VOCAB)} to fit fixed one-hot heads, got {n}")
 
         self.n = n
         self.device = device
-        self.base_mode = base_mode
-        self.learn_base_mat = base_mode == "learned"
         self.vocab = VOCAB
         self.output_vocab = OUTPUT_VOCAB
         self.vocab_size = len(self.vocab)
@@ -99,7 +93,7 @@ class ManualRotationMatrixNetwork:
         return torch.eye(self.n, device=self.device)
 
     def base_matrix(self) -> torch.Tensor:
-        return self.base_mat if self.learn_base_mat else self.eye()
+        return self.base_mat
 
     def encode(self, s: str) -> List[int]:
         return [self.stoi[ch] for ch in s]
@@ -137,13 +131,11 @@ class ManualRotationMatrixNetwork:
             "n": self.n,
             "vocab": self.vocab,
             "output_vocab": self.output_vocab,
-            "base_mode": self.base_mode,
             "token_mats": self.token_mats,
             "past_freqs": self.past_freqs,
             "past_phases": self.past_phases,
+            "base_mat": self.base_mat,
         }
-        if self.learn_base_mat:
-            out["base_mat"] = self.base_mat
         return out
 
     @classmethod
@@ -153,13 +145,11 @@ class ManualRotationMatrixNetwork:
         except TypeError:
             ckpt = torch.load(path, map_location=device)
         n = int(ckpt["n"])
-        base_mode = str(ckpt["base_mode"])
-        model = cls(n=n, device=device, base_mode=base_mode)
+        model = cls(n=n, device=device)
         model.token_mats = ckpt["token_mats"].to(device)
         model.past_freqs = ckpt["past_freqs"].to(device)
         model.past_phases = ckpt["past_phases"].to(device)
-        if model.learn_base_mat:
-            model.base_mat = ckpt["base_mat"].to(device)
+        model.base_mat = ckpt["base_mat"].to(device)
         addend_digits = ckpt.get("addend_digits")
         if addend_digits is not None:
             addend_digits = int(addend_digits)
@@ -269,11 +259,10 @@ def apply_batch_update(
             suffix = model.token_mats[prefix_ids[idx]] @ suffix
 
         base_input = suffix
-        if model.learn_base_mat:
-            u_base = normalize_vector(base @ base_input)
-            v_base = target_vec
-            base_delta.add_(context_scale * manual_rotation_delta(u_base, v_base, update_mode))
-            base_count += context_scale
+        u_base = normalize_vector(base @ base_input)
+        v_base = target_vec
+        base_delta.add_(context_scale * manual_rotation_delta(u_base, v_base, update_mode))
+        base_count += context_scale
 
         left_target = base.transpose(-1, -2) @ target_vec
         for idx, tid in enumerate(prefix_ids):
@@ -299,10 +288,9 @@ def apply_batch_update(
                     memory_suffix = model.token_mats[prefix_ids[idx]] @ memory_suffix
 
                 memory_base_input = memory_suffix
-                if model.learn_base_mat:
-                    u_base_mem = normalize_vector(base @ memory_base_input)
-                    v_base_mem = memory_target
-                    base_delta.add_(memory_scale * manual_rotation_delta(u_base_mem, v_base_mem, update_mode))
+                u_base_mem = normalize_vector(base @ memory_base_input)
+                v_base_mem = memory_target
+                base_delta.add_(memory_scale * manual_rotation_delta(u_base_mem, v_base_mem, update_mode))
 
                 left_memory_target = base.transpose(-1, -2) @ memory_target
                 for idx, tid in enumerate(prefix_ids):
@@ -314,7 +302,7 @@ def apply_batch_update(
 
     eye = model.eye()
     do_orth = orthogonalize_every > 0 and (iter_idx % orthogonalize_every == 0)
-    if model.learn_base_mat and base_count > 0:
+    if base_count > 0:
         scaled_delta = base_delta / (float(base_count) ** count_power)
         updated = (eye + learning_rate * scaled_delta) @ model.base_mat
         model.base_mat = maybe_orthogonalize(updated, orthogonalize_steps) if do_orth else updated
@@ -396,7 +384,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--iters", type=int, default=1500, help="Training iterations")
     p.add_argument("--batch-size", type=int, default=64, help="Problems per iteration")
     p.add_argument("--learning-rate", type=float, default=0.01, help="Manual rotation step size")
-    p.add_argument("--base-mode", type=str, default="learned", choices=list(BASE_MODES), help="Base matrix behavior")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
@@ -436,7 +423,7 @@ def main() -> None:
     device = pick_device(args.device)
     print(f"device={device}")
     print(f"iters={args.iters} learning_rate={args.learning_rate}")
-    print(f"base_mode={args.base_mode} addend_digits={args.addend_digits}")
+    print(f"base_mode=learned addend_digits={args.addend_digits}")
     print(f"init_mode=identity orthogonalize_steps={args.orthogonalize_steps} orthogonalize_every={args.orthogonalize_every}")
     print(f"update_mode={args.update_mode}")
     print(f"count_power={args.count_power}")
@@ -447,15 +434,12 @@ def main() -> None:
         model = ManualRotationMatrixNetwork(
             n=args.n,
             device=device,
-            base_mode=args.base_mode,
         )
         addend_digits = args.addend_digits
     else:
         model, loaded_addend_digits = ManualRotationMatrixNetwork.from_checkpoint(args.load_path, device)
         if model.n != args.n:
             print(f"loaded_n={model.n}; overriding --n={args.n}")
-        if model.base_mode != args.base_mode:
-            print(f"loaded_base_mode={model.base_mode}; overriding --base-mode={args.base_mode}")
         addend_digits = int(loaded_addend_digits or args.addend_digits)
         if loaded_addend_digits is not None and loaded_addend_digits != args.addend_digits:
             print(f"loaded_addend_digits={loaded_addend_digits}; overriding --addend-digits={args.addend_digits}")
