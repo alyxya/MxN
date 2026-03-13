@@ -380,9 +380,9 @@ def train(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Dense matrix network with manual rotation updates and fixed query/unembedding")
-    p.add_argument("--n", type=int, default=16, help="Square matrix dimension; must be >= vocab size")
+    p.add_argument("--n", type=int, required=True, help="Square matrix dimension; must be >= vocab size")
     p.add_argument("--iters", type=int, default=1500, help="Training iterations")
-    p.add_argument("--batch-size", type=int, default=64, help="Problems per iteration")
+    p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
     p.add_argument("--learning-rate", type=float, default=0.01, help="Manual rotation step size")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
