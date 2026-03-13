@@ -20,11 +20,15 @@ def normalize_vector(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
     return x / (x.norm() + eps)
 
 
-def manual_rotation_delta(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def normalize_columns(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
+    return x / (x.norm(dim=0, keepdim=True) + eps)
+
+
+def manual_rotation_delta(u: torch.Tensor, v: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     # A skew-symmetric alternative is outer(v, u) - outer(u, v), which is a
     # cleaner first-order rotation update, but this trainer currently uses the
     # simpler outer-difference rule.
-    return torch.outer(v - u, u)
+    return ((v - u) * weights.unsqueeze(0)) @ u.transpose(-1, -2)
 
 
 def orthogonalize_newton_schulz(w: torch.Tensor) -> torch.Tensor:
@@ -102,7 +106,8 @@ class ManualRotationMatrixNetwork:
         return self.itos[self.predict_next_id(self.encode(prefix))]
 
     def _encode_past_angles(self, angles: torch.Tensor) -> torch.Tensor:
-        out = torch.zeros(self.n, device=self.device)
+        out_shape = (self.n,) + tuple(angles.shape[1:])
+        out = torch.zeros(out_shape, device=self.device)
         if self.past_pairs == 0:
             return out
         scale = 1.0 / (self.past_pairs ** 0.5)
@@ -110,11 +115,19 @@ class ManualRotationMatrixNetwork:
         out[1 : 2 * self.past_pairs : 2] = torch.cos(angles) * scale
         return out
 
-    def past_query(self, lag: int) -> torch.Tensor:
-        return self._encode_past_angles(self.past_freqs * float(lag))
+    def past_query(self, lag: int | torch.Tensor) -> torch.Tensor:
+        lag_t = torch.as_tensor(lag, device=self.device, dtype=self.past_freqs.dtype)
+        if lag_t.ndim == 0:
+            return self._encode_past_angles(self.past_freqs * lag_t)
+        return self._encode_past_angles(self.past_freqs.unsqueeze(1) * lag_t.unsqueeze(0))
 
-    def past_target(self, token_id: int, lag: int) -> torch.Tensor:
-        return self._encode_past_angles(self.past_freqs * float(lag) + self.past_phases[token_id])
+    def past_target(self, token_id: int | torch.Tensor, lag: int | torch.Tensor) -> torch.Tensor:
+        lag_t = torch.as_tensor(lag, device=self.device, dtype=self.past_freqs.dtype)
+        token_t = torch.as_tensor(token_id, device=self.device, dtype=torch.long)
+        if lag_t.ndim == 0:
+            return self._encode_past_angles(self.past_freqs * lag_t + self.past_phases[int(token_t.item())])
+        phases = self.past_phases[token_t].transpose(0, 1)
+        return self._encode_past_angles(self.past_freqs.unsqueeze(1) * lag_t.unsqueeze(0) + phases)
 
     def state_dict(self) -> Dict[str, torch.Tensor | str | int]:
         out: Dict[str, torch.Tensor | str | int] = {
@@ -252,60 +265,49 @@ def apply_batch_update(
     target_basis = model.unembed
 
     for prefix_ids, target_id in zip(prefixes, target_ids):
-        state = model.prefix_state_ids(prefix_ids)
-        correct += int(int(state[: model.output_vocab_size].argmax().item()) == target_id)
-        total += 1
-        mean_target_score += float(state[target_id].item())
-
         target_vec = target_basis[target_id]
         context_scale = float(len(prefix_ids) ** (-context_length_power)) if len(prefix_ids) > 0 else 1.0
+
+        if memory_weight > 0.0 and prefix_ids:
+            memory_terms = len(prefix_ids)
+            lags = torch.arange(1, memory_terms + 1, device=model.device, dtype=target_vec.dtype)
+            memory_scale = context_scale * (memory_weight / float(memory_terms))
+            query_mat = torch.cat([model.query.unsqueeze(1), model.past_query(lags)], dim=1)
+            token_history = torch.tensor(prefix_ids[::-1], device=model.device, dtype=torch.long)
+            target_mat = torch.cat([target_vec.unsqueeze(1), model.past_target(token_history, lags)], dim=1)
+            weights = torch.empty(memory_terms + 1, device=model.device, dtype=target_vec.dtype)
+            weights[0] = context_scale
+            weights[1:] = memory_scale
+        else:
+            query_mat = model.query.unsqueeze(1)
+            target_mat = target_vec.unsqueeze(1)
+            weights = torch.tensor([context_scale], device=model.device, dtype=target_vec.dtype)
+
         suffix_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
-        suffix = model.query
+        suffix = query_mat
         for idx in range(len(prefix_ids) - 1, -1, -1):
             suffix_inputs[idx] = suffix
             suffix = model.token_mats[prefix_ids[idx]] @ suffix
 
-        base_input = suffix
-        u_base = normalize_vector(base @ base_input)
-        v_base = target_vec
-        base_delta.add_(context_scale * manual_rotation_delta(u_base, v_base))
+        state_mat = base @ suffix
+        state = state_mat[:, 0]
+        correct += int(int(state[: model.output_vocab_size].argmax().item()) == target_id)
+        total += 1
+        mean_target_score += float(state[target_id].item())
+
+        u_base = normalize_columns(state_mat)
+        base_delta.add_(manual_rotation_delta(u_base, target_mat, weights))
         base_count += context_scale
 
-        left_target = base.transpose(-1, -2) @ target_vec
+        left_target = base.transpose(-1, -2) @ target_mat
+        weight_sum = float(weights.sum().item())
         for idx, tid in enumerate(prefix_ids):
             x_in = suffix_inputs[idx]
-            u = normalize_vector(model.token_mats[tid] @ x_in)
-            v = normalize_vector(left_target)
-            weight = context_scale
-            token_delta[tid].add_(weight * manual_rotation_delta(u, v))
-            token_count[tid] += weight
+            u = normalize_columns(model.token_mats[tid] @ x_in)
+            v = normalize_columns(left_target)
+            token_delta[tid].add_(manual_rotation_delta(u, v, weights))
+            token_count[tid] += weight_sum
             left_target = model.token_mats[tid].transpose(-1, -2) @ left_target
-
-        if memory_weight > 0.0 and prefix_ids:
-            memory_terms = len(prefix_ids)
-            memory_scale = context_scale * (memory_weight / float(memory_terms))
-            for lag in range(1, memory_terms + 1):
-                memory_query = model.past_query(lag)
-                memory_target = model.past_target(prefix_ids[-lag], lag)
-
-                memory_suffix_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
-                memory_suffix = memory_query
-                for idx in range(len(prefix_ids) - 1, -1, -1):
-                    memory_suffix_inputs[idx] = memory_suffix
-                    memory_suffix = model.token_mats[prefix_ids[idx]] @ memory_suffix
-
-                memory_base_input = memory_suffix
-                u_base_mem = normalize_vector(base @ memory_base_input)
-                v_base_mem = memory_target
-                base_delta.add_(memory_scale * manual_rotation_delta(u_base_mem, v_base_mem))
-
-                left_memory_target = base.transpose(-1, -2) @ memory_target
-                for idx, tid in enumerate(prefix_ids):
-                    x_in = memory_suffix_inputs[idx]
-                    u_mem = normalize_vector(model.token_mats[tid] @ x_in)
-                    v_mem = normalize_vector(left_memory_target)
-                    token_delta[tid].add_(memory_scale * manual_rotation_delta(u_mem, v_mem))
-                    left_memory_target = model.token_mats[tid].transpose(-1, -2) @ left_memory_target
 
     eye = model.eye()
     if base_count > 0:
