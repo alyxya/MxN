@@ -14,6 +14,7 @@ EPS = 1e-12
 BASE_MODES = ("learned", "identity_fixed")
 UPDATE_MODES = ("outer_diff", "skew")
 Problem = Tuple[int, int, str, str]
+TAU = 2.0 * torch.pi
 
 
 def normalize_vector(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
@@ -81,12 +82,15 @@ class ManualRotationMatrixNetwork:
         self.output_vocab = OUTPUT_VOCAB
         self.vocab_size = len(self.vocab)
         self.output_vocab_size = len(self.output_vocab)
+        self.past_pairs = n // 2
         self.stoi: Dict[str, int] = {ch: i for i, ch in enumerate(self.vocab)}
         self.itos: Dict[int, str] = {i: ch for ch, i in self.stoi.items()}
 
         self.query = torch.zeros(n, device=device)
         self.query[0] = 1.0
         self.unembed = torch.eye(n, device=device)[: self.output_vocab_size]
+        self.past_freqs = torch.rand(self.past_pairs, device=device) * TAU
+        self.past_phases = torch.rand(self.vocab_size, self.past_pairs, device=device) * TAU
 
         self.base_mat = torch.eye(n, device=device)
         self.token_mats = torch.eye(n, device=device).expand(self.vocab_size, n, n).clone()
@@ -113,6 +117,21 @@ class ManualRotationMatrixNetwork:
     def predict_next(self, prefix: str) -> str:
         return self.itos[self.predict_next_id(self.encode(prefix))]
 
+    def _encode_past_angles(self, angles: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros(self.n, device=self.device)
+        if self.past_pairs == 0:
+            return out
+        scale = 1.0 / (self.past_pairs ** 0.5)
+        out[0 : 2 * self.past_pairs : 2] = torch.sin(angles) * scale
+        out[1 : 2 * self.past_pairs : 2] = torch.cos(angles) * scale
+        return out
+
+    def past_query(self, lag: int) -> torch.Tensor:
+        return self._encode_past_angles(self.past_freqs * float(lag))
+
+    def past_target(self, token_id: int, lag: int) -> torch.Tensor:
+        return self._encode_past_angles(self.past_freqs * float(lag) + self.past_phases[token_id])
+
     def state_dict(self) -> Dict[str, torch.Tensor | str | int]:
         out: Dict[str, torch.Tensor | str | int] = {
             "n": self.n,
@@ -120,6 +139,8 @@ class ManualRotationMatrixNetwork:
             "output_vocab": self.output_vocab,
             "base_mode": self.base_mode,
             "token_mats": self.token_mats,
+            "past_freqs": self.past_freqs,
+            "past_phases": self.past_phases,
         }
         if self.learn_base_mat:
             out["base_mat"] = self.base_mat
@@ -134,15 +155,11 @@ class ManualRotationMatrixNetwork:
         n = int(ckpt["n"])
         base_mode = str(ckpt["base_mode"])
         model = cls(n=n, device=device, base_mode=base_mode)
-        token_mats = ckpt["token_mats"].to(device)
-        if token_mats.shape != (model.vocab_size, n, n):
-            raise ValueError(f"token_mats shape mismatch: expected {(model.vocab_size, n, n)}, got {tuple(token_mats.shape)}")
-        model.token_mats = token_mats
+        model.token_mats = ckpt["token_mats"].to(device)
+        model.past_freqs = ckpt["past_freqs"].to(device)
+        model.past_phases = ckpt["past_phases"].to(device)
         if model.learn_base_mat:
-            base_mat = ckpt.get("base_mat")
-            if base_mat is None or tuple(base_mat.shape) != (n, n):
-                raise ValueError("Learned-base checkpoint missing valid base_mat")
-            model.base_mat = base_mat.to(device)
+            model.base_mat = ckpt["base_mat"].to(device)
         addend_digits = ckpt.get("addend_digits")
         if addend_digits is not None:
             addend_digits = int(addend_digits)
@@ -223,6 +240,8 @@ def apply_batch_update(
     iter_idx: int,
     context_length_power: float,
     update_mode: str,
+    memory_horizon: int,
+    memory_weight: float,
 ) -> Tuple[float, float]:
     n = model.n
     base_delta = torch.zeros(n, n, device=model.device)
@@ -267,6 +286,33 @@ def apply_batch_update(
             token_count[tid] += weight
             left_target = model.token_mats[tid].transpose(-1, -2) @ left_target
 
+        if memory_horizon > 0 and memory_weight > 0.0 and prefix_ids:
+            memory_terms = min(memory_horizon, len(prefix_ids))
+            memory_scale = context_scale * (memory_weight / float(memory_terms))
+            for lag in range(1, memory_terms + 1):
+                memory_query = model.past_query(lag)
+                memory_target = model.past_target(prefix_ids[-lag], lag)
+
+                memory_suffix_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
+                memory_suffix = memory_query
+                for idx in range(len(prefix_ids) - 1, -1, -1):
+                    memory_suffix_inputs[idx] = memory_suffix
+                    memory_suffix = model.token_mats[prefix_ids[idx]] @ memory_suffix
+
+                memory_base_input = memory_suffix
+                if model.learn_base_mat:
+                    u_base_mem = normalize_vector(base @ memory_base_input)
+                    v_base_mem = memory_target
+                    base_delta.add_(memory_scale * manual_rotation_delta(u_base_mem, v_base_mem, update_mode))
+
+                left_memory_target = base.transpose(-1, -2) @ memory_target
+                for idx, tid in enumerate(prefix_ids):
+                    x_in = memory_suffix_inputs[idx]
+                    u_mem = normalize_vector(model.token_mats[tid] @ x_in)
+                    v_mem = normalize_vector(left_memory_target)
+                    token_delta[tid].add_(memory_scale * manual_rotation_delta(u_mem, v_mem, update_mode))
+                    left_memory_target = model.token_mats[tid].transpose(-1, -2) @ left_memory_target
+
     eye = model.eye()
     do_orth = orthogonalize_every > 0 and (iter_idx % orthogonalize_every == 0)
     if model.learn_base_mat and base_count > 0:
@@ -300,6 +346,8 @@ def train(
     count_power: float,
     context_length_power: float,
     update_mode: str,
+    memory_horizon: int,
+    memory_weight: float,
 ) -> ManualRotationMatrixNetwork:
     rng = random.Random(seed)
 
@@ -325,6 +373,8 @@ def train(
             iter_idx=iter_idx,
             context_length_power=context_length_power,
             update_mode=update_mode,
+            memory_horizon=memory_horizon,
+            memory_weight=memory_weight,
         )
 
         if iter_idx % log_every == 0 or iter_idx == 1:
@@ -360,6 +410,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--count-power", type=float, default=0.5, help="Scale accumulated updates by count**count_power; 0=sum, 0.5=sum/sqrt(count), 1=mean")
     p.add_argument("--context-length-power", type=float, default=0.0, help="Scale each prediction context by len(prefix)**(-power); 1.0 gives each context a fixed total update budget")
     p.add_argument("--update-mode", type=str, default="outer_diff", choices=list(UPDATE_MODES), help="Local manual update rule: original outer-difference or skew-symmetric first-order rotation")
+    p.add_argument("--memory-horizon", type=int, default=0, help="Supervise up to this many past tokens using sinusoidal past-query objectives; 0 disables memory supervision")
+    p.add_argument("--memory-weight", type=float, default=0.0, help="Total weight of the auxiliary memory objective per prefix, distributed across active memory lags")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default="checkpoints/matrix_network_manual_rotation.pt", help="Checkpoint path")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -378,6 +430,10 @@ def main() -> None:
         raise ValueError("--count-power must be >= 0")
     if args.context_length_power < 0.0:
         raise ValueError("--context-length-power must be >= 0")
+    if args.memory_horizon < 0:
+        raise ValueError("--memory-horizon must be >= 0")
+    if args.memory_weight < 0.0:
+        raise ValueError("--memory-weight must be >= 0")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -391,6 +447,7 @@ def main() -> None:
     print(f"update_mode={args.update_mode}")
     print(f"count_power={args.count_power}")
     print(f"context_length_power={args.context_length_power}")
+    print(f"memory_horizon={args.memory_horizon} memory_weight={args.memory_weight}")
 
     if args.load_path is None:
         model = ManualRotationMatrixNetwork(
@@ -429,6 +486,8 @@ def main() -> None:
         count_power=args.count_power,
         context_length_power=args.context_length_power,
         update_mode=args.update_mode,
+        memory_horizon=args.memory_horizon,
+        memory_weight=args.memory_weight,
     )
 
     save_checkpoint(model, args.save_path, addend_digits=addend_digits)
