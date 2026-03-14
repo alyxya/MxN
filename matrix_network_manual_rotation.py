@@ -245,7 +245,7 @@ def apply_batch_update(
     model: ManualRotationMatrixNetwork,
     prefixes: Sequence[Sequence[int]],
     target_ids: Sequence[Optional[int]],
-    problem_count: int,
+    objective_count: int,
     learning_rate: float,
     context_length_power: float,
     memory_weight: float,
@@ -279,7 +279,7 @@ def apply_batch_update(
             lags = torch.arange(1, memory_terms + 1, device=model.device, dtype=base.dtype)
             token_history = torch.tensor(prefix_ids[::-1], device=model.device, dtype=torch.long)
             memory_source_positions = torch.arange(memory_terms - 1, -1, -1, device=model.device, dtype=torch.long)
-            memory_scale = context_scale * (memory_weight / float(memory_terms))
+            memory_scale = context_scale * memory_weight
             query_cols.append(model.past_query(lags))
             target_cols.append(model.past_target(token_history, lags))
             weight_cols.append(torch.full((memory_terms,), memory_scale, device=model.device, dtype=base.dtype))
@@ -339,14 +339,14 @@ def apply_batch_update(
             left_target = model.token_mats[tid].transpose(-1, -2) @ left_target
 
     eye = model.eye()
-    batch_scale = 1.0 / float(max(problem_count, 1))
+    objective_scale = 1.0 / float(max(objective_count, 1))
     if total > 0:
-        updated = (eye + learning_rate * (base_delta * batch_scale)) @ model.base_mat
+        updated = (eye + learning_rate * (base_delta * objective_scale)) @ model.base_mat
         model.base_mat = orthogonalize_newton_schulz(updated)
 
     active = token_delta.abs().amax(dim=(1, 2)) > 0
     if active.any():
-        updated = (eye.unsqueeze(0) + learning_rate * (token_delta[active] * batch_scale)) @ model.token_mats[active]
+        updated = (eye.unsqueeze(0) + learning_rate * (token_delta[active] * objective_scale)) @ model.token_mats[active]
         model.token_mats[active] = orthogonalize_newton_schulz(updated)
 
     return mean_target_score / max(total, 1), correct / max(total, 1)
@@ -377,22 +377,16 @@ def train(
 
         for _ in range(batch_size):
             _, _, lhs, rhs = random_problem(rng, addend_digits)
-            full_seq = lhs + rhs + EOS_TOKEN
-            lhs_len = len(lhs)
-            token_ids = model.encode(full_seq)
-
-            for prefix_len in range(1, len(token_ids) + 1):
-                prefixes.append(token_ids[:prefix_len])
-                if lhs_len <= prefix_len < len(token_ids):
-                    target_ids.append(token_ids[prefix_len])
-                else:
-                    target_ids.append(None)
+            target_seq = rhs + EOS_TOKEN
+            for i, ch in enumerate(target_seq):
+                prefixes.append(model.encode(lhs + target_seq[:i]))
+                target_ids.append(model.stoi[ch])
 
         mean_target_score, token_acc = apply_batch_update(
             model,
             prefixes=prefixes,
             target_ids=target_ids,
-            problem_count=batch_size,
+            objective_count=len(prefixes),
             learning_rate=learning_rate,
             context_length_power=context_length_power,
             memory_weight=memory_weight,
@@ -454,7 +448,7 @@ def main() -> None:
     print(f"base_mode=learned addend_digits={args.addend_digits}")
     print("init_mode=identity orthogonalize=one_step_per_update")
     print(f"context_length_power={args.context_length_power}")
-    print(f"memory_scope=full_prefix memory_weight={args.memory_weight}")
+    print(f"memory_scope=output_prefixes memory_weight={args.memory_weight}")
     print(f"causal_memory={args.causal_memory}")
 
     if args.load_path is None:
