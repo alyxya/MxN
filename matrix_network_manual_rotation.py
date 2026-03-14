@@ -369,9 +369,8 @@ def train(
     causal_memory: bool,
 ) -> ManualRotationMatrixNetwork:
     rng = random.Random(seed)
-    prefix_target_pairs: List[Tuple[List[int], Optional[int]]]
 
-    for iter_idx in range(1, iters + 1):
+    def sample_batch() -> Tuple[List[List[int]], List[Optional[int]]]:
         prefixes: List[List[int]] = []
         target_ids: List[Optional[int]] = []
 
@@ -382,6 +381,10 @@ def train(
                 prefixes.append(model.encode(lhs + target_seq[:i]))
                 target_ids.append(model.stoi[ch])
 
+        return prefixes, target_ids
+
+    for iter_idx in range(1, iters + 1):
+        prefixes, target_ids = sample_batch()
         mean_target_score, token_acc = apply_batch_update(
             model,
             prefixes=prefixes,
