@@ -77,7 +77,7 @@ class ManualRotationMatrixNetwork:
         self.query[0] = 1.0
         self.unembed = torch.eye(n, device=device)[: self.output_vocab_size]
         self.past_freqs = torch.rand(self.past_pairs, device=device) * TAU
-        self.past_phases = torch.rand(self.vocab_size, self.past_pairs, device=device) * TAU
+        self.past_token_freqs = torch.rand(self.vocab_size, self.past_pairs, device=device) * TAU
 
         self.base_mat = torch.eye(n, device=device)
         self.token_mats = torch.eye(n, device=device).expand(self.vocab_size, n, n).clone()
@@ -124,9 +124,9 @@ class ManualRotationMatrixNetwork:
         lag_t = torch.as_tensor(lag, device=self.device, dtype=self.past_freqs.dtype)
         token_t = torch.as_tensor(token_id, device=self.device, dtype=torch.long)
         if lag_t.ndim == 0:
-            return self._encode_past_angles(self.past_freqs * lag_t + self.past_phases[int(token_t.item())])
-        phases = self.past_phases[token_t].transpose(0, 1)
-        return self._encode_past_angles(self.past_freqs.unsqueeze(1) * lag_t.unsqueeze(0) + phases)
+            return self._encode_past_angles(self.past_token_freqs[int(token_t.item())] * lag_t)
+        token_freqs = self.past_token_freqs[token_t].transpose(0, 1)
+        return self._encode_past_angles(token_freqs * lag_t.unsqueeze(0))
 
     def state_dict(self) -> Dict[str, torch.Tensor | str | int]:
         out: Dict[str, torch.Tensor | str | int] = {
@@ -135,7 +135,7 @@ class ManualRotationMatrixNetwork:
             "output_vocab": self.output_vocab,
             "token_mats": self.token_mats,
             "past_freqs": self.past_freqs,
-            "past_phases": self.past_phases,
+            "past_token_freqs": self.past_token_freqs,
             "base_mat": self.base_mat,
         }
         return out
@@ -150,7 +150,7 @@ class ManualRotationMatrixNetwork:
         model = cls(n=n, device=device)
         model.token_mats = ckpt["token_mats"].to(device)
         model.past_freqs = ckpt["past_freqs"].to(device)
-        model.past_phases = ckpt["past_phases"].to(device)
+        model.past_token_freqs = ckpt["past_token_freqs"].to(device)
         model.base_mat = ckpt["base_mat"].to(device)
         addend_digits = ckpt.get("addend_digits")
         if addend_digits is not None:
