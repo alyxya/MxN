@@ -127,12 +127,6 @@ class ManualRotationMatrixNetwork:
         self.left_token_mats = initialize_rotation_like((self.vocab_size, n, n), device, token_randomize)
         self.right_token_mats = initialize_rotation_like((self.vocab_size, n, n), device, token_randomize)
 
-    def eye(self) -> torch.Tensor:
-        return torch.eye(self.n, device=self.device)
-
-    def base_matrix(self) -> torch.Tensor:
-        return self.base_mat
-
     def uses_left_token_mats(self) -> bool:
         return self.token_mat_mode in {"left", "both"}
 
@@ -147,7 +141,7 @@ class ManualRotationMatrixNetwork:
         if self.uses_right_token_mats():
             for tid in reversed(token_ids):
                 v = self.right_token_mats[tid] @ v
-        v = self.base_matrix() @ v
+        v = self.base_mat @ v
         if self.uses_left_token_mats():
             for tid in token_ids:
                 v = self.left_token_mats[tid] @ v
@@ -178,21 +172,6 @@ class ManualRotationMatrixNetwork:
         cols = torch.arange(token_ids.numel(), device=self.device)
         target[token_ids, cols] = self.token_subspace_target_norm
         return target
-
-    def state_dict(self) -> Dict[str, torch.Tensor | str | int]:
-        out: Dict[str, torch.Tensor | str | int] = {
-            "n": self.n,
-            "number_base": self.number_base,
-            "vocab": self.vocab,
-            "output_vocab": self.output_vocab,
-            "token_mat_mode": self.token_mat_mode,
-            "base_randomize": self.base_randomize,
-            "token_randomize": self.token_randomize,
-            "left_token_mats": self.left_token_mats,
-            "right_token_mats": self.right_token_mats,
-            "base_mat": self.base_mat,
-        }
-        return out
 
     @classmethod
     def from_checkpoint(cls, path: str, device: torch.device) -> Tuple["ManualRotationMatrixNetwork", int | None]:
@@ -228,7 +207,16 @@ def save_checkpoint(model: ManualRotationMatrixNetwork, save_path: str, addend_d
         path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            **model.state_dict(),
+            "n": model.n,
+            "number_base": model.number_base,
+            "vocab": model.vocab,
+            "output_vocab": model.output_vocab,
+            "token_mat_mode": model.token_mat_mode,
+            "base_randomize": model.base_randomize,
+            "token_randomize": model.token_randomize,
+            "left_token_mats": model.left_token_mats,
+            "right_token_mats": model.right_token_mats,
+            "base_mat": model.base_mat,
             "addend_digits": addend_digits,
         },
         path,
@@ -336,7 +324,7 @@ def apply_batch_update(
     mean_target_subspace_norm = 0.0
     target_subspace_count = 0
 
-    base = model.base_matrix()
+    base = model.base_mat
     for prefix_ids, target_id in zip(prefixes, target_ids):
         query_mat = model.query.unsqueeze(1)
         weights = torch.ones(1, device=model.device, dtype=base.dtype)
@@ -394,7 +382,7 @@ def apply_batch_update(
                 right_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
                 right_target = model.right_token_mats[tid].transpose(-1, -2) @ right_target
 
-    eye = model.eye()
+    eye = torch.eye(model.n, device=model.device)
     objective_scale = 1.0 / float(max(total_objective_columns, 1))
     if total > 0:
         updated = (eye + learning_rate * (base_delta * objective_scale)) @ model.base_mat
@@ -515,7 +503,7 @@ def main() -> None:
     print(f"device={device}")
     print(f"iters={args.iters} learning_rate={args.learning_rate}")
     print(
-        f"base_mode=learned token_mat_mode={args.token_mat_mode} "
+        f"token_mat_mode={args.token_mat_mode} "
         f"addend_digits={args.addend_digits} number_base={args.number_base}"
     )
     print(
