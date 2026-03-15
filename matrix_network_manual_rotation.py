@@ -14,6 +14,7 @@ VOCAB = OUTPUT_VOCAB + "+="
 EPS = 1e-12
 Problem = Tuple[int, int, str, str]
 TAU = 2.0 * torch.pi
+INIT_ORTHOGONALIZE_STEPS = 4
 
 
 def normalize_vector(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
@@ -32,6 +33,25 @@ def manual_rotation_delta(u: torch.Tensor, v: torch.Tensor, weights: torch.Tenso
 
 def orthogonalize_newton_schulz(w: torch.Tensor) -> torch.Tensor:
     return 1.5 * w - 0.5 * (w @ w.transpose(-1, -2) @ w)
+
+
+def initialize_rotation_like(shape: Tuple[int, ...], device: torch.device, mode: str) -> torch.Tensor:
+    n = shape[-1]
+    eye = torch.eye(n, device=device)
+    if len(shape) > 2:
+        eye = eye.expand(*shape[:-2], n, n).clone()
+    if mode == "identity":
+        return eye
+    noise = torch.randn(shape, device=device) / (n**0.5)
+    if mode == "full_random":
+        w = noise
+    elif mode == "partial_random":
+        w = (eye + noise) / (2.0**0.5)
+    else:
+        raise ValueError(f"unsupported init mode={mode}")
+    for _ in range(INIT_ORTHOGONALIZE_STEPS):
+        w = orthogonalize_newton_schulz(w)
+    return w
 
 
 def random_problem(rng: random.Random, addend_digits: int) -> Problem:
@@ -60,15 +80,23 @@ class ManualRotationMatrixNetwork:
         n: int,
         device: torch.device,
         token_mat_mode: str,
+        base_init_mode: str,
+        token_init_mode: str,
     ):
         if n < len(VOCAB):
             raise ValueError(f"n must be >= {len(VOCAB)} to fit fixed one-hot heads, got {n}")
         if token_mat_mode not in {"left", "right", "both"}:
             raise ValueError(f"unsupported token_mat_mode={token_mat_mode}")
+        if base_init_mode not in {"identity", "full_random", "partial_random"}:
+            raise ValueError(f"unsupported base_init_mode={base_init_mode}")
+        if token_init_mode not in {"identity", "full_random", "partial_random"}:
+            raise ValueError(f"unsupported token_init_mode={token_init_mode}")
 
         self.n = n
         self.device = device
         self.token_mat_mode = token_mat_mode
+        self.base_init_mode = base_init_mode
+        self.token_init_mode = token_init_mode
         self.vocab = VOCAB
         self.output_vocab = OUTPUT_VOCAB
         self.vocab_size = len(self.vocab)
@@ -82,9 +110,9 @@ class ManualRotationMatrixNetwork:
         self.query[0] = 1.0
         self.past_freqs = torch.rand(self.past_pairs, device=device) * TAU
 
-        self.base_mat = torch.eye(n, device=device)
-        self.left_token_mats = torch.eye(n, device=device).expand(self.vocab_size, n, n).clone()
-        self.right_token_mats = torch.eye(n, device=device).expand(self.vocab_size, n, n).clone()
+        self.base_mat = initialize_rotation_like((n, n), device, base_init_mode)
+        self.left_token_mats = initialize_rotation_like((self.vocab_size, n, n), device, token_init_mode)
+        self.right_token_mats = initialize_rotation_like((self.vocab_size, n, n), device, token_init_mode)
 
     def eye(self) -> torch.Tensor:
         return torch.eye(self.n, device=self.device)
@@ -173,6 +201,8 @@ class ManualRotationMatrixNetwork:
             "vocab": self.vocab,
             "output_vocab": self.output_vocab,
             "token_mat_mode": self.token_mat_mode,
+            "base_init_mode": self.base_init_mode,
+            "token_init_mode": self.token_init_mode,
             "left_token_mats": self.left_token_mats,
             "right_token_mats": self.right_token_mats,
             "past_freqs": self.past_freqs,
@@ -188,7 +218,15 @@ class ManualRotationMatrixNetwork:
             ckpt = torch.load(path, map_location=device)
         n = int(ckpt["n"])
         token_mat_mode = str(ckpt.get("token_mat_mode", "right"))
-        model = cls(n=n, device=device, token_mat_mode=token_mat_mode)
+        base_init_mode = str(ckpt.get("base_init_mode", "identity"))
+        token_init_mode = str(ckpt.get("token_init_mode", "identity"))
+        model = cls(
+            n=n,
+            device=device,
+            token_mat_mode=token_mat_mode,
+            base_init_mode=base_init_mode,
+            token_init_mode=token_init_mode,
+        )
         if "left_token_mats" in ckpt:
             model.left_token_mats = ckpt["left_token_mats"].to(device)
         if "right_token_mats" in ckpt:
@@ -226,6 +264,8 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
         f"manual_rotation_n{args.n}"
         f"_d{addend_digits}"
         f"_mode{args.token_mat_mode}"
+        f"_binit{args.base_init_mode}"
+        f"_tinit{args.token_init_mode}"
         f"_it{args.iters}"
         f"_bs{args.batch_size}"
         f"_lr{format_float_token(args.learning_rate)}"
@@ -525,6 +565,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Dense matrix network with manual rotation updates and fixed query/unembedding")
     p.add_argument("--n", type=int, required=True, help="Square matrix dimension; must be >= vocab size")
     p.add_argument("--token-mat-mode", type=str, default="right", choices=["left", "right", "both"], help="Apply learned token matrices on the left of base, right of base, or both")
+    p.add_argument("--base-init-mode", type=str, default="identity", choices=["identity", "full_random", "partial_random"], help="Initialization for the base matrix")
+    p.add_argument("--token-init-mode", type=str, default="identity", choices=["identity", "full_random", "partial_random"], help="Initialization for per-token matrices")
     p.add_argument("--iters", type=int, default=1500, help="Training iterations")
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
     p.add_argument("--learning-rate", type=float, default=0.01, help="Manual rotation step size")
@@ -558,7 +600,10 @@ def main() -> None:
     print(f"device={device}")
     print(f"iters={args.iters} learning_rate={args.learning_rate}")
     print(f"base_mode=learned token_mat_mode={args.token_mat_mode} addend_digits={args.addend_digits}")
-    print("init_mode=identity orthogonalize=one_step_per_update")
+    print(
+        f"base_init_mode={args.base_init_mode} token_init_mode={args.token_init_mode} "
+        f"orthogonalize=one_step_per_update"
+    )
     print(f"context_length_power={args.context_length_power}")
     print(f"memory_scope=all_prefixes memory_weight={args.memory_weight}")
 
@@ -567,6 +612,8 @@ def main() -> None:
             n=args.n,
             device=device,
             token_mat_mode=args.token_mat_mode,
+            base_init_mode=args.base_init_mode,
+            token_init_mode=args.token_init_mode,
         )
         addend_digits = args.addend_digits
     else:
@@ -575,6 +622,10 @@ def main() -> None:
             print(f"loaded_n={model.n}; overriding --n={args.n}")
         if model.token_mat_mode != args.token_mat_mode:
             print(f"loaded_token_mat_mode={model.token_mat_mode}; ignoring --token-mat-mode={args.token_mat_mode}")
+        if model.base_init_mode != args.base_init_mode:
+            print(f"loaded_base_init_mode={model.base_init_mode}; ignoring --base-init-mode={args.base_init_mode}")
+        if model.token_init_mode != args.token_init_mode:
+            print(f"loaded_token_init_mode={model.token_init_mode}; ignoring --token-init-mode={args.token_init_mode}")
         addend_digits = int(loaded_addend_digits or args.addend_digits)
         if loaded_addend_digits is not None and loaded_addend_digits != args.addend_digits:
             print(f"loaded_addend_digits={loaded_addend_digits}; overriding --addend-digits={args.addend_digits}")
