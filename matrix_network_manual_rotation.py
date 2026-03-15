@@ -482,10 +482,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.learning_rate <= 0.0:
-        raise ValueError("--learning-rate must be > 0")
-    if not (2 <= args.number_base <= len(DIGIT_SYMBOLS)):
-        raise ValueError(f"--number-base must be in [2, {len(DIGIT_SYMBOLS)}]")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
