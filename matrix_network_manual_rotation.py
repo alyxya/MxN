@@ -36,10 +36,6 @@ def initialize_rotation_like(shape: Tuple[int, ...], device: torch.device, stren
     eye = torch.eye(n, device=device)
     if len(shape) > 2:
         eye = eye.expand(*shape[:-2], n, n).clone()
-    if strength == 0.0:
-        return eye
-    if strength < 0.0:
-        raise ValueError(f"init strength must be >= 0, got {strength}")
     noise = torch.randn(shape, device=device) / (n**0.5)
     w = (eye + strength * noise) / ((1.0 + strength**2) ** 0.5)
     for _ in range(INIT_ORTHOGONALIZE_STEPS):
@@ -110,11 +106,6 @@ class ManualRotationMatrixNetwork:
             raise ValueError(f"n must be >= {len(vocab)} to fit fixed one-hot heads, got {n}")
         if token_mat_mode not in {"left", "right", "both"}:
             raise ValueError(f"unsupported token_mat_mode={token_mat_mode}")
-        if base_randomize < 0.0:
-            raise ValueError(f"base_randomize must be >= 0, got {base_randomize}")
-        if token_randomize < 0.0:
-            raise ValueError(f"token_randomize must be >= 0, got {token_randomize}")
-
         self.n = n
         self.device = device
         self.number_base = number_base
@@ -513,10 +504,6 @@ def main() -> None:
     args = parse_args()
     if args.learning_rate <= 0.0:
         raise ValueError("--learning-rate must be > 0")
-    if args.base_randomize < 0.0:
-        raise ValueError("--base-randomize must be >= 0")
-    if args.token_randomize < 0.0:
-        raise ValueError("--token-randomize must be >= 0")
     if not (2 <= args.number_base <= len(DIGIT_SYMBOLS)):
         raise ValueError(f"--number-base must be in [2, {len(DIGIT_SYMBOLS)}]")
 
