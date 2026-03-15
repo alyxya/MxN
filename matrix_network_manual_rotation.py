@@ -182,15 +182,13 @@ class ManualRotationMatrixNetwork:
         n = int(ckpt["n"])
         number_base = int(ckpt["number_base"])
         token_mat_mode = str(ckpt["token_mat_mode"])
-        base_randomize = float(ckpt["base_randomize"])
-        token_randomize = float(ckpt["token_randomize"])
         model = cls(
             n=n,
             device=device,
             number_base=number_base,
             token_mat_mode=token_mat_mode,
-            base_randomize=base_randomize,
-            token_randomize=token_randomize,
+            base_randomize=0.0,
+            token_randomize=0.0,
         )
         model.left_token_mats = ckpt["left_token_mats"].to(device)
         model.right_token_mats = ckpt["right_token_mats"].to(device)
@@ -212,8 +210,6 @@ def save_checkpoint(model: ManualRotationMatrixNetwork, save_path: str, addend_d
             "vocab": model.vocab,
             "output_vocab": model.output_vocab,
             "token_mat_mode": model.token_mat_mode,
-            "base_randomize": model.base_randomize,
-            "token_randomize": model.token_randomize,
             "left_token_mats": model.left_token_mats,
             "right_token_mats": model.right_token_mats,
             "base_mat": model.base_mat,
@@ -529,10 +525,6 @@ def main() -> None:
             print(f"loaded_number_base={model.number_base}; ignoring --number-base={args.number_base}")
         if model.token_mat_mode != args.token_mat_mode:
             print(f"loaded_token_mat_mode={model.token_mat_mode}; ignoring --token-mat-mode={args.token_mat_mode}")
-        if model.base_randomize != args.base_randomize:
-            print(f"loaded_base_randomize={model.base_randomize}; ignoring --base-randomize={args.base_randomize}")
-        if model.token_randomize != args.token_randomize:
-            print(f"loaded_token_randomize={model.token_randomize}; ignoring --token-randomize={args.token_randomize}")
         addend_digits = int(loaded_addend_digits or args.addend_digits)
         if loaded_addend_digits is not None and loaded_addend_digits != args.addend_digits:
             print(f"loaded_addend_digits={loaded_addend_digits}; overriding --addend-digits={args.addend_digits}")
