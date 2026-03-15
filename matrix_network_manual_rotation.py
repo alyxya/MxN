@@ -9,8 +9,9 @@ import torch
 
 
 EOS_TOKEN = "~"
-OUTPUT_VOCAB = f"{EOS_TOKEN}0123456789"
-VOCAB = OUTPUT_VOCAB + "+="
+PLUS_TOKEN = "+"
+EQUALS_TOKEN = "="
+DIGIT_SYMBOLS = "0123456789ABCDEF"
 EPS = 1e-12
 Problem = Tuple[int, int, str, str]
 TAU = 2.0 * torch.pi
@@ -54,12 +55,39 @@ def initialize_rotation_like(shape: Tuple[int, ...], device: torch.device, mode:
     return w
 
 
-def random_problem(rng: random.Random, addend_digits: int) -> Problem:
-    max_val = (10**addend_digits) - 1
+def digit_alphabet(number_base: int) -> str:
+    if not (2 <= number_base <= len(DIGIT_SYMBOLS)):
+        raise ValueError(f"number_base must be in [2, {len(DIGIT_SYMBOLS)}], got {number_base}")
+    return DIGIT_SYMBOLS[:number_base]
+
+
+def format_in_base(value: int, number_base: int, min_digits: int = 1) -> str:
+    digits = digit_alphabet(number_base)
+    if value == 0:
+        out = "0"
+    else:
+        chars: List[str] = []
+        x = value
+        while x > 0:
+            x, rem = divmod(x, number_base)
+            chars.append(digits[rem])
+        out = "".join(reversed(chars))
+    if len(out) < min_digits:
+        out = ("0" * (min_digits - len(out))) + out
+    return out
+
+
+def random_problem(rng: random.Random, addend_digits: int, number_base: int) -> Problem:
+    max_val = (number_base**addend_digits) - 1
     left_addend = rng.randint(0, max_val)
     right_addend = rng.randint(0, max_val)
-    prompt_text = f"{left_addend:0{addend_digits}d}+{right_addend:0{addend_digits}d}="
-    target_text = str(left_addend + right_addend)
+    prompt_text = (
+        f"{format_in_base(left_addend, number_base, min_digits=addend_digits)}"
+        f"{PLUS_TOKEN}"
+        f"{format_in_base(right_addend, number_base, min_digits=addend_digits)}"
+        f"{EQUALS_TOKEN}"
+    )
+    target_text = format_in_base(left_addend + right_addend, number_base)
     return left_addend, right_addend, prompt_text, target_text
 
 
@@ -79,12 +107,15 @@ class ManualRotationMatrixNetwork:
         *,
         n: int,
         device: torch.device,
+        number_base: int,
         token_mat_mode: str,
         base_init_mode: str,
         token_init_mode: str,
     ):
-        if n < len(VOCAB):
-            raise ValueError(f"n must be >= {len(VOCAB)} to fit fixed one-hot heads, got {n}")
+        output_vocab = EOS_TOKEN + digit_alphabet(number_base)
+        vocab = output_vocab + PLUS_TOKEN + EQUALS_TOKEN
+        if n < len(vocab):
+            raise ValueError(f"n must be >= {len(vocab)} to fit fixed one-hot heads, got {n}")
         if token_mat_mode not in {"left", "right", "both"}:
             raise ValueError(f"unsupported token_mat_mode={token_mat_mode}")
         if base_init_mode not in {"identity", "full_random", "partial_random"}:
@@ -94,11 +125,12 @@ class ManualRotationMatrixNetwork:
 
         self.n = n
         self.device = device
+        self.number_base = number_base
         self.token_mat_mode = token_mat_mode
         self.base_init_mode = base_init_mode
         self.token_init_mode = token_init_mode
-        self.vocab = VOCAB
-        self.output_vocab = OUTPUT_VOCAB
+        self.vocab = vocab
+        self.output_vocab = output_vocab
         self.vocab_size = len(self.vocab)
         self.output_vocab_size = len(self.output_vocab)
         self.past_pairs = n // 2
@@ -198,6 +230,7 @@ class ManualRotationMatrixNetwork:
     def state_dict(self) -> Dict[str, torch.Tensor | str | int]:
         out: Dict[str, torch.Tensor | str | int] = {
             "n": self.n,
+            "number_base": self.number_base,
             "vocab": self.vocab,
             "output_vocab": self.output_vocab,
             "token_mat_mode": self.token_mat_mode,
@@ -217,12 +250,14 @@ class ManualRotationMatrixNetwork:
         except TypeError:
             ckpt = torch.load(path, map_location=device)
         n = int(ckpt["n"])
+        number_base = int(ckpt.get("number_base", len(ckpt["output_vocab"]) - 1))
         token_mat_mode = str(ckpt.get("token_mat_mode", "right"))
         base_init_mode = str(ckpt.get("base_init_mode", "identity"))
         token_init_mode = str(ckpt.get("token_init_mode", "identity"))
         model = cls(
             n=n,
             device=device,
+            number_base=number_base,
             token_mat_mode=token_mat_mode,
             base_init_mode=base_init_mode,
             token_init_mode=token_init_mode,
@@ -263,6 +298,7 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
     name = (
         f"manual_rotation_n{args.n}"
         f"_d{addend_digits}"
+        f"_radix{args.number_base}"
         f"_mode{args.token_mat_mode}"
         f"_binit{args.base_init_mode}"
         f"_tinit{args.token_init_mode}"
@@ -293,6 +329,7 @@ def evaluate(
     seed: int,
     max_gen_len: int,
     addend_digits: int,
+    number_base: int,
 ) -> Tuple[float, float, float, float, float]:
     rng = random.Random(seed)
     exact = 0
@@ -304,7 +341,7 @@ def evaluate(
     memory_subspace_norm_sum = 0.0
 
     for _ in range(eval_samples):
-        _, _, prompt_text, target_text = random_problem(rng, addend_digits)
+        _, _, prompt_text, target_text = random_problem(rng, addend_digits, number_base)
         pred, did_stop = generate_until_eos(model, prompt_text, max_gen_len)
         stopped += int(did_stop)
         if did_stop and pred == target_text:
@@ -336,10 +373,17 @@ def evaluate(
     )
 
 
-def show_samples(model: ManualRotationMatrixNetwork, seed: int, max_gen_len: int, addend_digits: int, count: int = 10) -> None:
+def show_samples(
+    model: ManualRotationMatrixNetwork,
+    seed: int,
+    max_gen_len: int,
+    addend_digits: int,
+    number_base: int,
+    count: int = 10,
+) -> None:
     rng = random.Random(seed)
     for _ in range(count):
-        left_addend, right_addend, prompt_text, target_text = random_problem(rng, addend_digits)
+        left_addend, right_addend, prompt_text, target_text = random_problem(rng, addend_digits, number_base)
         pred, did_stop = generate_until_eos(model, prompt_text, max_gen_len)
         ok = "OK" if (did_stop and pred == target_text) else "XX"
         stop_txt = "eos" if did_stop else "max"
@@ -500,6 +544,7 @@ def train(
     batch_size: int,
     learning_rate: float,
     addend_digits: int,
+    number_base: int,
     seed: int,
     log_every: int,
     eval_every: int,
@@ -515,7 +560,7 @@ def train(
         target_ids: List[Optional[int]] = []
 
         for _ in range(batch_size):
-            _, _, prompt_text, target_text = random_problem(rng, addend_digits)
+            _, _, prompt_text, target_text = random_problem(rng, addend_digits, number_base)
             full_seq = prompt_text + target_text + EOS_TOKEN
             prompt_len = len(prompt_text)
             for prefix_len in range(1, len(full_seq) + 1):
@@ -551,6 +596,7 @@ def train(
                 seed=seed + iter_idx,
                 max_gen_len=max_gen_len,
                 addend_digits=addend_digits,
+                number_base=number_base,
             )
             print(
                 f"  eval exact_match={exact:.3f} teacher_forced_token_acc={tf_acc:.3f} "
@@ -564,6 +610,7 @@ def train(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Dense matrix network with manual rotation updates and fixed query/unembedding")
     p.add_argument("--n", type=int, required=True, help="Square matrix dimension; must be >= vocab size")
+    p.add_argument("--number-base", type=int, default=10, help="Arithmetic base for generated addition problems (2-16)")
     p.add_argument("--token-mat-mode", type=str, default="right", choices=["left", "right", "both"], help="Apply learned token matrices on the left of base, right of base, or both")
     p.add_argument("--base-init-mode", type=str, default="identity", choices=["identity", "full_random", "partial_random"], help="Initialization for the base matrix")
     p.add_argument("--token-init-mode", type=str, default="identity", choices=["identity", "full_random", "partial_random"], help="Initialization for per-token matrices")
@@ -591,6 +638,8 @@ def main() -> None:
         raise ValueError("--context-length-power must be >= 0")
     if args.memory_weight < 0.0:
         raise ValueError("--memory-weight must be >= 0")
+    if not (2 <= args.number_base <= len(DIGIT_SYMBOLS)):
+        raise ValueError(f"--number-base must be in [2, {len(DIGIT_SYMBOLS)}]")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -599,7 +648,10 @@ def main() -> None:
     device = pick_device(args.device)
     print(f"device={device}")
     print(f"iters={args.iters} learning_rate={args.learning_rate}")
-    print(f"base_mode=learned token_mat_mode={args.token_mat_mode} addend_digits={args.addend_digits}")
+    print(
+        f"base_mode=learned token_mat_mode={args.token_mat_mode} "
+        f"addend_digits={args.addend_digits} number_base={args.number_base}"
+    )
     print(
         f"base_init_mode={args.base_init_mode} token_init_mode={args.token_init_mode} "
         f"orthogonalize=one_step_per_update"
@@ -611,6 +663,7 @@ def main() -> None:
         model = ManualRotationMatrixNetwork(
             n=args.n,
             device=device,
+            number_base=args.number_base,
             token_mat_mode=args.token_mat_mode,
             base_init_mode=args.base_init_mode,
             token_init_mode=args.token_init_mode,
@@ -620,6 +673,8 @@ def main() -> None:
         model, loaded_addend_digits = ManualRotationMatrixNetwork.from_checkpoint(args.load_path, device)
         if model.n != args.n:
             print(f"loaded_n={model.n}; overriding --n={args.n}")
+        if model.number_base != args.number_base:
+            print(f"loaded_number_base={model.number_base}; ignoring --number-base={args.number_base}")
         if model.token_mat_mode != args.token_mat_mode:
             print(f"loaded_token_mat_mode={model.token_mat_mode}; ignoring --token-mat-mode={args.token_mat_mode}")
         if model.base_init_mode != args.base_init_mode:
@@ -633,7 +688,7 @@ def main() -> None:
     max_gen_len = addend_digits + 2
     save_path = args.save_path or default_save_path(args, addend_digits)
     print(f"max_gen_len={max_gen_len}")
-    print(f"output_vocab={OUTPUT_VOCAB}")
+    print(f"output_vocab={model.output_vocab}")
     print(f"save_path={save_path}")
 
     model = train(
@@ -642,6 +697,7 @@ def main() -> None:
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         addend_digits=addend_digits,
+        number_base=model.number_base,
         seed=args.seed,
         log_every=args.log_every,
         eval_every=args.eval_every,
@@ -654,7 +710,7 @@ def main() -> None:
     save_checkpoint(model, save_path, addend_digits=addend_digits)
     print(f"saved_checkpoint={save_path}")
     print("\nSample predictions:")
-    show_samples(model, seed=args.seed + 999, max_gen_len=max_gen_len, addend_digits=addend_digits)
+    show_samples(model, seed=args.seed + 999, max_gen_len=max_gen_len, addend_digits=addend_digits, number_base=model.number_base)
 
 
 if __name__ == "__main__":
