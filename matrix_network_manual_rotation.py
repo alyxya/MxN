@@ -3,7 +3,7 @@ import argparse
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 
@@ -15,10 +15,6 @@ DIGIT_SYMBOLS = "0123456789ABCDEF"
 EPS = 1e-12
 Problem = Tuple[int, int, str, str]
 INIT_ORTHOGONALIZE_STEPS = 4
-
-
-def normalize_vector(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
-    return x / (x.norm() + eps)
 
 
 def normalize_columns(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
@@ -176,23 +172,10 @@ class ManualRotationMatrixNetwork:
     def predict_next(self, prefix: str) -> str:
         return self.itos[self.predict_next_id(self.encode(prefix))]
 
-    def token_subspace_target(self, current: torch.Tensor, token_id: int | torch.Tensor) -> torch.Tensor:
-        token_t = torch.as_tensor(token_id, device=self.device, dtype=torch.long)
+    def token_subspace_target(self, current_cols: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+        target = current_cols.clone()
         complement_target_norm = max(1.0 - self.token_subspace_target_norm**2, 0.0) ** 0.5
-        if current.ndim == 1:
-            target = current.clone()
-            rest = current[self.vocab_size :]
-            rest_norm = rest.norm()
-            if float(rest_norm.item()) > EPS:
-                target[self.vocab_size :] = rest * (complement_target_norm / float(rest_norm.item()))
-            else:
-                target[self.vocab_size :] = 0.0
-            target[: self.vocab_size] = 0.0
-            target[int(token_t.item())] = self.token_subspace_target_norm
-            return target
-
-        target = current.clone()
-        rest = current[self.vocab_size :]
+        rest = current_cols[self.vocab_size :]
         rest_norm = rest.norm(dim=0)
         rest_scale = torch.where(
             rest_norm > EPS,
@@ -201,8 +184,8 @@ class ManualRotationMatrixNetwork:
         )
         target[self.vocab_size :] = rest * rest_scale.unsqueeze(0)
         target[: self.vocab_size] = 0.0
-        cols = torch.arange(token_t.numel(), device=self.device)
-        target[token_t, cols] = self.token_subspace_target_norm
+        cols = torch.arange(token_ids.numel(), device=self.device)
+        target[token_ids, cols] = self.token_subspace_target_norm
         return target
 
     def state_dict(self) -> Dict[str, torch.Tensor | str | int]:
@@ -227,8 +210,8 @@ class ManualRotationMatrixNetwork:
         except TypeError:
             ckpt = torch.load(path, map_location=device)
         n = int(ckpt["n"])
-        number_base = int(ckpt.get("number_base", len(ckpt["output_vocab"]) - 1))
-        token_mat_mode = str(ckpt.get("token_mat_mode", "right"))
+        number_base = int(ckpt["number_base"])
+        token_mat_mode = str(ckpt["token_mat_mode"])
         base_randomize = float(ckpt["base_randomize"])
         token_randomize = float(ckpt["token_randomize"])
         model = cls(
@@ -239,12 +222,8 @@ class ManualRotationMatrixNetwork:
             base_randomize=base_randomize,
             token_randomize=token_randomize,
         )
-        if "left_token_mats" in ckpt:
-            model.left_token_mats = ckpt["left_token_mats"].to(device)
-        if "right_token_mats" in ckpt:
-            model.right_token_mats = ckpt["right_token_mats"].to(device)
-        if "token_mats" in ckpt:
-            model.right_token_mats = ckpt["token_mats"].to(device)
+        model.left_token_mats = ckpt["left_token_mats"].to(device)
+        model.right_token_mats = ckpt["right_token_mats"].to(device)
         model.base_mat = ckpt["base_mat"].to(device)
         addend_digits = ckpt.get("addend_digits")
         if addend_digits is not None:
@@ -352,7 +331,7 @@ def show_samples(
 def apply_batch_update(
     model: ManualRotationMatrixNetwork,
     prefixes: Sequence[Sequence[int]],
-    target_ids: Sequence[Optional[int]],
+    target_ids: Sequence[int],
     learning_rate: float,
 ) -> Tuple[float, float]:
     n = model.n
@@ -368,22 +347,10 @@ def apply_batch_update(
 
     base = model.base_matrix()
     for prefix_ids, target_id in zip(prefixes, target_ids):
-        query_cols: List[torch.Tensor] = []
-        target_token_cols: List[torch.Tensor] = []
-        weight_cols: List[torch.Tensor] = []
-
-        if target_id is not None:
-            query_cols.append(model.query.unsqueeze(1))
-            target_token_cols.append(torch.tensor([target_id], device=model.device, dtype=torch.long))
-            weight_cols.append(torch.tensor([1.0], device=model.device, dtype=base.dtype))
-
-        if not query_cols:
-            continue
-
-        query_mat = torch.cat(query_cols, dim=1)
-        weights = torch.cat(weight_cols, dim=0)
-        target_token_ids = torch.cat(target_token_cols, dim=0)
-        total_objective_columns += int(query_mat.shape[1])
+        query_mat = model.query.unsqueeze(1)
+        weights = torch.ones(1, device=model.device, dtype=base.dtype)
+        target_token_ids = torch.tensor([target_id], device=model.device, dtype=torch.long)
+        total_objective_columns += 1
 
         if model.uses_right_token_mats():
             right_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
@@ -410,11 +377,10 @@ def apply_batch_update(
         target_mat = model.token_subspace_target(state_mat, target_token_ids)
         mean_target_subspace_norm += float(subspace_norms.sum().item())
         target_subspace_count += int(subspace_norms.numel())
-        if target_id is not None:
-            state = state_mat[:, 0]
-            correct += int(int(state[: model.output_vocab_size].argmax().item()) == target_id)
-            total += 1
-            mean_target_score += float(state[target_id].item())
+        state = state_mat[:, 0]
+        correct += int(int(state[: model.output_vocab_size].argmax().item()) == target_id)
+        total += 1
+        mean_target_score += float(state[target_id].item())
 
         left_target = target_mat
         if model.uses_left_token_mats():
@@ -476,9 +442,9 @@ def train(
 ) -> ManualRotationMatrixNetwork:
     rng = random.Random(seed)
 
-    def sample_batch() -> Tuple[List[List[int]], List[Optional[int]]]:
+    def sample_batch() -> Tuple[List[List[int]], List[int]]:
         prefixes: List[List[int]] = []
-        target_ids: List[Optional[int]] = []
+        target_ids: List[int] = []
 
         for _ in range(batch_size):
             _, _, prompt_text, target_text = random_problem(rng, addend_digits, number_base)
