@@ -267,7 +267,6 @@ def apply_batch_update(
     learning_rate: float,
     context_length_power: float,
     memory_weight: float,
-    causal_memory: bool,
 ) -> Tuple[float, float]:
     n = model.n
     base_delta = torch.zeros(n, n, device=model.device)
@@ -328,23 +327,17 @@ def apply_batch_update(
             total += 1
             mean_target_score += float(state[target_id].item())
 
-        if causal_memory:
-            # Base sits before the whole prefix, so memory targets for tokens inside the
-            # prefix should not push it to "remember" future tokens. Only next-token
-            # prediction updates the base matrix.
-            if next_col_count > 0:
-                u_base = normalize_columns(state_mat[:, :next_col_count])
-                base_delta.add_(manual_rotation_delta(u_base, target_mat[:, :next_col_count], weights[:next_col_count]))
-        else:
-            u_base = normalize_columns(state_mat)
-            base_delta.add_(manual_rotation_delta(u_base, target_mat, weights))
+        # Base sits before the whole prefix, so memory targets for tokens inside the
+        # prefix should not push it to "remember" future tokens. Only next-token
+        # prediction updates the base matrix.
+        if next_col_count > 0:
+            u_base = normalize_columns(state_mat[:, :next_col_count])
+            base_delta.add_(manual_rotation_delta(u_base, target_mat[:, :next_col_count], weights[:next_col_count]))
 
         left_target = base.transpose(-1, -2) @ target_mat
         for idx, tid in enumerate(prefix_ids):
             x_in = suffix_inputs[idx]
-            if not causal_memory:
-                active_cols = slice(None)
-            elif memory_source_positions is None:
+            if memory_source_positions is None:
                 active_cols = slice(0, next_col_count)
             else:
                 active_memory = memory_source_positions <= idx
@@ -391,7 +384,6 @@ def train(
     max_gen_len: int,
     context_length_power: float,
     memory_weight: float,
-    causal_memory: bool,
 ) -> ManualRotationMatrixNetwork:
     rng = random.Random(seed)
 
@@ -401,10 +393,14 @@ def train(
 
         for _ in range(batch_size):
             _, _, lhs, rhs = random_problem(rng, addend_digits)
-            target_seq = rhs + EOS_TOKEN
-            for i, ch in enumerate(target_seq):
-                prefixes.append(model.encode(lhs + target_seq[:i]))
-                target_ids.append(model.stoi[ch])
+            full_seq = lhs + rhs + EOS_TOKEN
+            lhs_len = len(lhs)
+            for prefix_len in range(1, len(full_seq) + 1):
+                prefixes.append(model.encode(full_seq[:prefix_len]))
+                if prefix_len >= lhs_len and prefix_len < len(full_seq):
+                    target_ids.append(model.stoi[full_seq[prefix_len]])
+                else:
+                    target_ids.append(None)
 
         return prefixes, target_ids
 
@@ -418,7 +414,6 @@ def train(
             learning_rate=learning_rate,
             context_length_power=context_length_power,
             memory_weight=memory_weight,
-            causal_memory=causal_memory,
         )
 
         if iter_idx % log_every == 0 or iter_idx == 1:
@@ -452,8 +447,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
     p.add_argument("--context-length-power", type=float, default=0.0, help="Scale each prediction context by len(prefix)**(-power); 1.0 gives each context a fixed total update budget")
-    p.add_argument("--memory-weight", type=float, default=0.0, help="Total weight of the auxiliary memory objective per prefix, distributed across active memory lags")
-    p.add_argument("--causal-memory", action="store_true", help="Only let memory targets update the remembered token's matrix and later matrices")
+    p.add_argument("--memory-weight", type=float, default=0.0, help="Weight of the auxiliary memory objective for each remembered token")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default=None, help="Optional checkpoint path override")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -479,8 +473,7 @@ def main() -> None:
     print(f"base_mode=learned addend_digits={args.addend_digits}")
     print("init_mode=identity orthogonalize=one_step_per_update")
     print(f"context_length_power={args.context_length_power}")
-    print(f"memory_scope=output_prefixes memory_weight={args.memory_weight}")
-    print(f"causal_memory={args.causal_memory}")
+    print(f"memory_scope=all_prefixes memory_weight={args.memory_weight}")
 
     if args.load_path is None:
         model = ManualRotationMatrixNetwork(
@@ -515,7 +508,6 @@ def main() -> None:
         max_gen_len=max_gen_len,
         context_length_power=args.context_length_power,
         memory_weight=args.memory_weight,
-        causal_memory=args.causal_memory,
     )
 
     save_checkpoint(model, save_path, addend_digits=addend_digits)
