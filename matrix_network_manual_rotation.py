@@ -70,14 +70,13 @@ class ManualRotationMatrixNetwork:
         self.vocab_size = len(self.vocab)
         self.output_vocab_size = len(self.output_vocab)
         self.past_pairs = n // 2
+        self.token_subspace_target_norm = (self.vocab_size / self.n) ** 0.5
         self.stoi: Dict[str, int] = {ch: i for i, ch in enumerate(self.vocab)}
         self.itos: Dict[int, str] = {i: ch for ch, i in self.stoi.items()}
 
         self.query = torch.zeros(n, device=device)
         self.query[0] = 1.0
-        self.unembed = torch.eye(n, device=device)[: self.output_vocab_size]
         self.past_freqs = torch.rand(self.past_pairs, device=device) * TAU
-        self.past_token_freqs = torch.rand(self.vocab_size, self.past_pairs, device=device) * TAU
 
         self.base_mat = torch.eye(n, device=device)
         self.token_mats = torch.eye(n, device=device).expand(self.vocab_size, n, n).clone()
@@ -120,13 +119,34 @@ class ManualRotationMatrixNetwork:
             return self._encode_past_angles(self.past_freqs * lag_t)
         return self._encode_past_angles(self.past_freqs.unsqueeze(1) * lag_t.unsqueeze(0))
 
-    def past_target(self, token_id: int | torch.Tensor, lag: int | torch.Tensor) -> torch.Tensor:
-        lag_t = torch.as_tensor(lag, device=self.device, dtype=self.past_freqs.dtype)
+    def token_subspace_target(self, current: torch.Tensor, token_id: int | torch.Tensor) -> torch.Tensor:
         token_t = torch.as_tensor(token_id, device=self.device, dtype=torch.long)
-        if lag_t.ndim == 0:
-            return self._encode_past_angles(self.past_token_freqs[int(token_t.item())] * lag_t)
-        token_freqs = self.past_token_freqs[token_t].transpose(0, 1)
-        return self._encode_past_angles(token_freqs * lag_t.unsqueeze(0))
+        complement_target_norm = max(1.0 - self.token_subspace_target_norm**2, 0.0) ** 0.5
+        if current.ndim == 1:
+            target = current.clone()
+            rest = current[self.vocab_size :]
+            rest_norm = rest.norm()
+            if float(rest_norm.item()) > EPS:
+                target[self.vocab_size :] = rest * (complement_target_norm / float(rest_norm.item()))
+            else:
+                target[self.vocab_size :] = 0.0
+            target[: self.vocab_size] = 0.0
+            target[int(token_t.item())] = self.token_subspace_target_norm
+            return target
+
+        target = current.clone()
+        rest = current[self.vocab_size :]
+        rest_norm = rest.norm(dim=0)
+        rest_scale = torch.where(
+            rest_norm > EPS,
+            torch.full_like(rest_norm, complement_target_norm) / rest_norm,
+            torch.zeros_like(rest_norm),
+        )
+        target[self.vocab_size :] = rest * rest_scale.unsqueeze(0)
+        target[: self.vocab_size] = 0.0
+        cols = torch.arange(token_t.numel(), device=self.device)
+        target[token_t, cols] = self.token_subspace_target_norm
+        return target
 
     def state_dict(self) -> Dict[str, torch.Tensor | str | int]:
         out: Dict[str, torch.Tensor | str | int] = {
@@ -135,7 +155,6 @@ class ManualRotationMatrixNetwork:
             "output_vocab": self.output_vocab,
             "token_mats": self.token_mats,
             "past_freqs": self.past_freqs,
-            "past_token_freqs": self.past_token_freqs,
             "base_mat": self.base_mat,
         }
         return out
@@ -150,7 +169,6 @@ class ManualRotationMatrixNetwork:
         model = cls(n=n, device=device)
         model.token_mats = ckpt["token_mats"].to(device)
         model.past_freqs = ckpt["past_freqs"].to(device)
-        model.past_token_freqs = ckpt["past_token_freqs"].to(device)
         model.base_mat = ckpt["base_mat"].to(device)
         addend_digits = ckpt.get("addend_digits")
         if addend_digits is not None:
@@ -257,21 +275,20 @@ def apply_batch_update(
     correct = 0
     total = 0
     mean_target_score = 0.0
+    mean_target_subspace_norm = 0.0
+    target_subspace_count = 0
 
     base = model.base_matrix()
-    target_basis = model.unembed
-
     for prefix_ids, target_id in zip(prefixes, target_ids):
         context_scale = float(len(prefix_ids) ** (-context_length_power)) if len(prefix_ids) > 0 else 1.0
 
         query_cols: List[torch.Tensor] = []
-        target_cols: List[torch.Tensor] = []
+        target_token_cols: List[torch.Tensor] = []
         weight_cols: List[torch.Tensor] = []
 
         if target_id is not None:
-            target_vec = target_basis[target_id]
             query_cols.append(model.query.unsqueeze(1))
-            target_cols.append(target_vec.unsqueeze(1))
+            target_token_cols.append(torch.tensor([target_id], device=model.device, dtype=torch.long))
             weight_cols.append(torch.tensor([context_scale], device=model.device, dtype=base.dtype))
 
         if memory_weight > 0.0 and prefix_ids:
@@ -281,7 +298,7 @@ def apply_batch_update(
             memory_source_positions = torch.arange(memory_terms - 1, -1, -1, device=model.device, dtype=torch.long)
             memory_scale = context_scale * memory_weight
             query_cols.append(model.past_query(lags))
-            target_cols.append(model.past_target(token_history, lags))
+            target_token_cols.append(token_history)
             weight_cols.append(torch.full((memory_terms,), memory_scale, device=model.device, dtype=base.dtype))
         else:
             memory_source_positions = None
@@ -290,8 +307,8 @@ def apply_batch_update(
             continue
 
         query_mat = torch.cat(query_cols, dim=1)
-        target_mat = torch.cat(target_cols, dim=1)
         weights = torch.cat(weight_cols, dim=0)
+        target_token_ids = torch.cat(target_token_cols, dim=0)
         next_col_count = 1 if target_id is not None else 0
 
         suffix_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
@@ -301,6 +318,10 @@ def apply_batch_update(
             suffix = model.token_mats[prefix_ids[idx]] @ suffix
 
         state_mat = base @ suffix
+        subspace_norms = state_mat[: model.vocab_size].norm(dim=0)
+        target_mat = model.token_subspace_target(state_mat, target_token_ids)
+        mean_target_subspace_norm += float(subspace_norms.sum().item())
+        target_subspace_count += int(subspace_norms.numel())
         if target_id is not None:
             state = state_mat[:, 0]
             correct += int(int(state[: model.output_vocab_size].argmax().item()) == target_id)
@@ -349,7 +370,11 @@ def apply_batch_update(
         updated = (eye.unsqueeze(0) + learning_rate * (token_delta[active] * objective_scale)) @ model.token_mats[active]
         model.token_mats[active] = orthogonalize_newton_schulz(updated)
 
-    return mean_target_score / max(total, 1), correct / max(total, 1)
+    return (
+        mean_target_score / max(total, 1),
+        correct / max(total, 1),
+        mean_target_subspace_norm / max(target_subspace_count, 1),
+    )
 
 
 def train(
@@ -385,7 +410,7 @@ def train(
 
     for iter_idx in range(1, iters + 1):
         prefixes, target_ids = sample_batch()
-        mean_target_score, token_acc = apply_batch_update(
+        mean_target_score, token_acc, mean_target_subspace_norm = apply_batch_update(
             model,
             prefixes=prefixes,
             target_ids=target_ids,
@@ -397,7 +422,10 @@ def train(
         )
 
         if iter_idx % log_every == 0 or iter_idx == 1:
-            print(f"iter={iter_idx:5d} mean_target_score={mean_target_score:.4f} token_acc={token_acc:.3f}")
+            print(
+                f"iter={iter_idx:5d} mean_target_score={mean_target_score:.4f} "
+                f"token_acc={token_acc:.3f} mean_target_subspace_norm={mean_target_subspace_norm:.4f}"
+            )
 
         if iter_idx % eval_every == 0 or iter_idx == iters:
             exact, tf_acc, stop_rate = evaluate(
