@@ -311,7 +311,6 @@ def apply_batch_update(
     model: ManualRotationMatrixNetwork,
     prefixes: Sequence[Sequence[int]],
     target_ids: Sequence[Optional[int]],
-    objective_count: int,
     learning_rate: float,
     context_length_power: float,
     memory_weight: float,
@@ -322,6 +321,7 @@ def apply_batch_update(
     right_token_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
     correct = 0
     total = 0
+    total_objective_columns = 0
     mean_target_score = 0.0
     mean_target_subspace_norm = 0.0
     target_subspace_count = 0
@@ -358,6 +358,7 @@ def apply_batch_update(
         weights = torch.cat(weight_cols, dim=0)
         target_token_ids = torch.cat(target_token_cols, dim=0)
         next_col_count = 1 if target_id is not None else 0
+        total_objective_columns += int(query_mat.shape[1])
 
         total_col_count = int(query_mat.shape[1])
 
@@ -430,7 +431,7 @@ def apply_batch_update(
                 right_target = model.right_token_mats[tid].transpose(-1, -2) @ right_target
 
     eye = model.eye()
-    objective_scale = 1.0 / float(max(objective_count, 1))
+    objective_scale = 1.0 / float(max(total_objective_columns, 1))
     if total > 0:
         updated = (eye + learning_rate * (base_delta * objective_scale)) @ model.base_mat
         model.base_mat = orthogonalize_newton_schulz(updated)
@@ -492,7 +493,6 @@ def train(
             model,
             prefixes=prefixes,
             target_ids=target_ids,
-            objective_count=len(prefixes),
             learning_rate=learning_rate,
             context_length_power=context_length_power,
             memory_weight=memory_weight,
