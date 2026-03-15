@@ -284,7 +284,6 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
         f"_it{args.iters}"
         f"_bs{args.batch_size}"
         f"_lr{format_float_token(args.learning_rate)}"
-        f"_ctx{format_float_token(args.context_length_power)}"
         f"_seed{args.seed}"
         f"_{timestamp}.pt"
     )
@@ -358,7 +357,6 @@ def apply_batch_update(
     prefixes: Sequence[Sequence[int]],
     target_ids: Sequence[Optional[int]],
     learning_rate: float,
-    context_length_power: float,
 ) -> Tuple[float, float]:
     n = model.n
     base_delta = torch.zeros(n, n, device=model.device)
@@ -373,8 +371,6 @@ def apply_batch_update(
 
     base = model.base_matrix()
     for prefix_ids, target_id in zip(prefixes, target_ids):
-        context_scale = float(len(prefix_ids) ** (-context_length_power)) if len(prefix_ids) > 0 else 1.0
-
         query_cols: List[torch.Tensor] = []
         target_token_cols: List[torch.Tensor] = []
         weight_cols: List[torch.Tensor] = []
@@ -382,7 +378,7 @@ def apply_batch_update(
         if target_id is not None:
             query_cols.append(model.query.unsqueeze(1))
             target_token_cols.append(torch.tensor([target_id], device=model.device, dtype=torch.long))
-            weight_cols.append(torch.tensor([context_scale], device=model.device, dtype=base.dtype))
+            weight_cols.append(torch.tensor([1.0], device=model.device, dtype=base.dtype))
 
         if not query_cols:
             continue
@@ -480,7 +476,6 @@ def train(
     eval_every: int,
     eval_samples: int,
     max_gen_len: int,
-    context_length_power: float,
 ) -> ManualRotationMatrixNetwork:
     rng = random.Random(seed)
 
@@ -505,7 +500,6 @@ def train(
             prefixes=prefixes,
             target_ids=target_ids,
             learning_rate=learning_rate,
-            context_length_power=context_length_power,
         )
 
         if iter_idx % log_every == 0 or iter_idx == 1:
@@ -546,7 +540,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
-    p.add_argument("--context-length-power", type=float, default=0.0, help="Scale each prediction context by len(prefix)**(-power); 1.0 gives each context a fixed total update budget")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default=None, help="Optional checkpoint path override")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -557,8 +550,6 @@ def main() -> None:
     args = parse_args()
     if args.learning_rate <= 0.0:
         raise ValueError("--learning-rate must be > 0")
-    if args.context_length_power < 0.0:
-        raise ValueError("--context-length-power must be >= 0")
     if not (2 <= args.number_base <= len(DIGIT_SYMBOLS)):
         raise ValueError(f"--number-base must be in [2, {len(DIGIT_SYMBOLS)}]")
 
@@ -577,7 +568,6 @@ def main() -> None:
         f"base_init_mode={args.base_init_mode} token_init_mode={args.token_init_mode} "
         f"orthogonalize=one_step_per_update"
     )
-    print(f"context_length_power={args.context_length_power}")
 
     if args.load_path is None:
         model = ManualRotationMatrixNetwork(
@@ -623,7 +613,6 @@ def main() -> None:
         eval_every=args.eval_every,
         eval_samples=args.eval_samples,
         max_gen_len=max_gen_len,
-        context_length_power=args.context_length_power,
     )
 
     save_checkpoint(model, save_path, addend_digits=addend_digits)
