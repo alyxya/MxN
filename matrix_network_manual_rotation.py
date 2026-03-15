@@ -255,7 +255,6 @@ def evaluate(
     model: ManualRotationMatrixNetwork,
     eval_samples: int,
     seed: int,
-    max_gen_len: int,
     addend_digits: int,
     number_base: int,
 ) -> Tuple[float, float, float]:
@@ -267,7 +266,7 @@ def evaluate(
 
     for _ in range(eval_samples):
         _, _, prompt_text, target_text = random_problem(rng, addend_digits, number_base)
-        pred, did_stop = generate_until_eos(model, prompt_text, max_gen_len)
+        pred, did_stop = generate_until_eos(model, prompt_text, len(target_text) + 2)
         stopped += int(did_stop)
         if did_stop and pred == target_text:
             exact += 1
@@ -288,7 +287,6 @@ def evaluate(
 def show_samples(
     model: ManualRotationMatrixNetwork,
     seed: int,
-    max_gen_len: int,
     addend_digits: int,
     number_base: int,
     count: int = 10,
@@ -296,7 +294,7 @@ def show_samples(
     rng = random.Random(seed)
     for _ in range(count):
         left_addend, right_addend, prompt_text, target_text = random_problem(rng, addend_digits, number_base)
-        pred, did_stop = generate_until_eos(model, prompt_text, max_gen_len)
+        pred, did_stop = generate_until_eos(model, prompt_text, len(target_text) + 2)
         ok = "OK" if (did_stop and pred == target_text) else "XX"
         stop_txt = "eos" if did_stop else "max"
         print(f"{prompt_text}{target_text:>4s} | pred={pred:>4s} ({stop_txt}) [{ok}]   ({left_addend}+{right_addend})")
@@ -413,7 +411,6 @@ def train(
     log_every: int,
     eval_every: int,
     eval_samples: int,
-    max_gen_len: int,
 ) -> ManualRotationMatrixNetwork:
     rng = random.Random(seed)
 
@@ -451,7 +448,6 @@ def train(
                 model,
                 eval_samples=eval_samples,
                 seed=seed + iter_idx,
-                max_gen_len=max_gen_len,
                 addend_digits=addend_digits,
                 number_base=number_base,
             )
@@ -529,9 +525,7 @@ def main() -> None:
         if loaded_addend_digits is not None and loaded_addend_digits != args.addend_digits:
             print(f"loaded_addend_digits={loaded_addend_digits}; overriding --addend-digits={args.addend_digits}")
 
-    max_gen_len = addend_digits + 2
     save_path = args.save_path or default_save_path(args, addend_digits)
-    print(f"max_gen_len={max_gen_len}")
     print(f"output_vocab={model.output_vocab}")
     print(f"save_path={save_path}")
 
@@ -546,13 +540,12 @@ def main() -> None:
         log_every=args.log_every,
         eval_every=args.eval_every,
         eval_samples=args.eval_samples,
-        max_gen_len=max_gen_len,
     )
 
     save_checkpoint(model, save_path, addend_digits=addend_digits)
     print(f"saved_checkpoint={save_path}")
     print("\nSample predictions:")
-    show_samples(model, seed=args.seed + 999, max_gen_len=max_gen_len, addend_digits=addend_digits, number_base=model.number_base)
+    show_samples(model, seed=args.seed + 999, addend_digits=addend_digits, number_base=model.number_base)
 
 
 if __name__ == "__main__":
