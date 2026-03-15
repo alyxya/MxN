@@ -422,8 +422,7 @@ def apply_batch_update(
 
         if model.uses_right_token_mats():
             right_target = base.transpose(-1, -2) @ left_target
-            for idx in range(len(prefix_ids) - 1, -1, -1):
-                tid = prefix_ids[idx]
+            for idx, tid in enumerate(prefix_ids):
                 active_cols = active_columns(idx)
                 u = normalize_columns(model.right_token_mats[tid] @ right_inputs[idx][:, active_cols])
                 v = normalize_columns(right_target[:, active_cols])
