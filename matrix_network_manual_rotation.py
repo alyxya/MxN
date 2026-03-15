@@ -14,7 +14,6 @@ EQUALS_TOKEN = "="
 DIGIT_SYMBOLS = "0123456789ABCDEF"
 EPS = 1e-12
 Problem = Tuple[int, int, str, str]
-TAU = 2.0 * torch.pi
 INIT_ORTHOGONALIZE_STEPS = 4
 
 
@@ -133,14 +132,12 @@ class ManualRotationMatrixNetwork:
         self.output_vocab = output_vocab
         self.vocab_size = len(self.vocab)
         self.output_vocab_size = len(self.output_vocab)
-        self.past_pairs = n // 2
         self.token_subspace_target_norm = (self.vocab_size / self.n) ** 0.5
         self.stoi: Dict[str, int] = {ch: i for i, ch in enumerate(self.vocab)}
         self.itos: Dict[int, str] = {i: ch for ch, i in self.stoi.items()}
 
         self.query = torch.zeros(n, device=device)
         self.query[0] = 1.0
-        self.past_freqs = torch.rand(self.past_pairs, device=device) * TAU
 
         self.base_mat = initialize_rotation_like((n, n), device, base_init_mode)
         self.left_token_mats = initialize_rotation_like((self.vocab_size, n, n), device, token_init_mode)
@@ -182,22 +179,6 @@ class ManualRotationMatrixNetwork:
     def predict_next(self, prefix: str) -> str:
         return self.itos[self.predict_next_id(self.encode(prefix))]
 
-    def _encode_past_angles(self, angles: torch.Tensor) -> torch.Tensor:
-        out_shape = (self.n,) + tuple(angles.shape[1:])
-        out = torch.zeros(out_shape, device=self.device)
-        if self.past_pairs == 0:
-            return out
-        scale = 1.0 / (self.past_pairs ** 0.5)
-        out[0 : 2 * self.past_pairs : 2] = torch.sin(angles) * scale
-        out[1 : 2 * self.past_pairs : 2] = torch.cos(angles) * scale
-        return out
-
-    def past_query(self, lag: int | torch.Tensor) -> torch.Tensor:
-        lag_t = torch.as_tensor(lag, device=self.device, dtype=self.past_freqs.dtype)
-        if lag_t.ndim == 0:
-            return self._encode_past_angles(self.past_freqs * lag_t)
-        return self._encode_past_angles(self.past_freqs.unsqueeze(1) * lag_t.unsqueeze(0))
-
     def token_subspace_target(self, current: torch.Tensor, token_id: int | torch.Tensor) -> torch.Tensor:
         token_t = torch.as_tensor(token_id, device=self.device, dtype=torch.long)
         complement_target_norm = max(1.0 - self.token_subspace_target_norm**2, 0.0) ** 0.5
@@ -238,7 +219,6 @@ class ManualRotationMatrixNetwork:
             "token_init_mode": self.token_init_mode,
             "left_token_mats": self.left_token_mats,
             "right_token_mats": self.right_token_mats,
-            "past_freqs": self.past_freqs,
             "base_mat": self.base_mat,
         }
         return out
@@ -268,7 +248,6 @@ class ManualRotationMatrixNetwork:
             model.right_token_mats = ckpt["right_token_mats"].to(device)
         if "token_mats" in ckpt:
             model.right_token_mats = ckpt["token_mats"].to(device)
-        model.past_freqs = ckpt["past_freqs"].to(device)
         model.base_mat = ckpt["base_mat"].to(device)
         addend_digits = ckpt.get("addend_digits")
         if addend_digits is not None:
@@ -306,7 +285,6 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
         f"_bs{args.batch_size}"
         f"_lr{format_float_token(args.learning_rate)}"
         f"_ctx{format_float_token(args.context_length_power)}"
-        f"_mem{format_float_token(args.memory_weight)}"
         f"_seed{args.seed}"
         f"_{timestamp}.pt"
     )
@@ -330,15 +308,12 @@ def evaluate(
     max_gen_len: int,
     addend_digits: int,
     number_base: int,
-) -> Tuple[float, float, float, float, float]:
+) -> Tuple[float, float, float]:
     rng = random.Random(seed)
     exact = 0
     tf_correct = 0
     tf_total = 0
     stopped = 0
-    memory_correct = 0
-    memory_total = 0
-    memory_subspace_norm_sum = 0.0
 
     for _ in range(eval_samples):
         _, _, prompt_text, target_text = random_problem(rng, addend_digits, number_base)
@@ -353,23 +328,10 @@ def evaluate(
             tf_correct += int(pred_id == model.stoi[ch])
             tf_total += 1
 
-        full_seq = prompt_text + target_text + EOS_TOKEN
-        for prefix_len in range(1, len(full_seq) + 1):
-            prefix_ids = model.encode(full_seq[:prefix_len])
-            for lag in range(1, prefix_len + 1):
-                memory_vec = model.prefix_state_from_query(prefix_ids, model.past_query(lag))
-                pred_id = int(memory_vec[: model.vocab_size].argmax().item())
-                target_id = prefix_ids[-lag]
-                memory_correct += int(pred_id == target_id)
-                memory_total += 1
-                memory_subspace_norm_sum += float(memory_vec[: model.vocab_size].norm().item())
-
     return (
         exact / max(eval_samples, 1),
         tf_correct / max(tf_total, 1),
         stopped / max(eval_samples, 1),
-        memory_correct / max(memory_total, 1),
-        memory_subspace_norm_sum / max(memory_total, 1),
     )
 
 
@@ -397,7 +359,6 @@ def apply_batch_update(
     target_ids: Sequence[Optional[int]],
     learning_rate: float,
     context_length_power: float,
-    memory_weight: float,
 ) -> Tuple[float, float]:
     n = model.n
     base_delta = torch.zeros(n, n, device=model.device)
@@ -423,38 +384,13 @@ def apply_batch_update(
             target_token_cols.append(torch.tensor([target_id], device=model.device, dtype=torch.long))
             weight_cols.append(torch.tensor([context_scale], device=model.device, dtype=base.dtype))
 
-        if memory_weight > 0.0 and prefix_ids:
-            memory_terms = len(prefix_ids)
-            lags = torch.arange(1, memory_terms + 1, device=model.device, dtype=base.dtype)
-            token_history = torch.tensor(prefix_ids[::-1], device=model.device, dtype=torch.long)
-            memory_source_positions = torch.arange(memory_terms - 1, -1, -1, device=model.device, dtype=torch.long)
-            memory_scale = context_scale * memory_weight
-            query_cols.append(model.past_query(lags))
-            target_token_cols.append(token_history)
-            weight_cols.append(torch.full((memory_terms,), memory_scale, device=model.device, dtype=base.dtype))
-        else:
-            memory_source_positions = None
-
         if not query_cols:
             continue
 
         query_mat = torch.cat(query_cols, dim=1)
         weights = torch.cat(weight_cols, dim=0)
         target_token_ids = torch.cat(target_token_cols, dim=0)
-        next_col_count = 1 if target_id is not None else 0
         total_objective_columns += int(query_mat.shape[1])
-
-        total_col_count = int(query_mat.shape[1])
-
-        def active_columns(idx: int) -> torch.Tensor:
-            if memory_source_positions is None:
-                return torch.ones(total_col_count, dtype=torch.bool, device=model.device)
-            return torch.cat(
-                [
-                    torch.ones(next_col_count, dtype=torch.bool, device=model.device),
-                    memory_source_positions <= idx,
-                ]
-            )
 
         if model.uses_right_token_mats():
             right_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
@@ -491,27 +427,21 @@ def apply_batch_update(
         if model.uses_left_token_mats():
             for idx in range(len(prefix_ids) - 1, -1, -1):
                 tid = prefix_ids[idx]
-                active_cols = active_columns(idx)
-                u = normalize_columns(model.left_token_mats[tid] @ left_inputs[idx][:, active_cols])
-                v = normalize_columns(left_target[:, active_cols])
-                left_token_delta[tid].add_(manual_rotation_delta(u, v, weights[active_cols]))
+                u = normalize_columns(model.left_token_mats[tid] @ left_inputs[idx])
+                v = normalize_columns(left_target)
+                left_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
                 left_target = model.left_token_mats[tid].transpose(-1, -2) @ left_target
 
-        # Base sits before the whole prefix, so memory targets for tokens inside the
-        # prefix should not push it to "remember" future tokens. Only next-token
-        # prediction updates the base matrix.
-        if next_col_count > 0:
-            u_base = normalize_columns(middle_state[:, :next_col_count])
-            v_base = normalize_columns(left_target[:, :next_col_count])
-            base_delta.add_(manual_rotation_delta(u_base, v_base, weights[:next_col_count]))
+        u_base = normalize_columns(middle_state)
+        v_base = normalize_columns(left_target)
+        base_delta.add_(manual_rotation_delta(u_base, v_base, weights))
 
         if model.uses_right_token_mats():
             right_target = base.transpose(-1, -2) @ left_target
             for idx, tid in enumerate(prefix_ids):
-                active_cols = active_columns(idx)
-                u = normalize_columns(model.right_token_mats[tid] @ right_inputs[idx][:, active_cols])
-                v = normalize_columns(right_target[:, active_cols])
-                right_token_delta[tid].add_(manual_rotation_delta(u, v, weights[active_cols]))
+                u = normalize_columns(model.right_token_mats[tid] @ right_inputs[idx])
+                v = normalize_columns(right_target)
+                right_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
                 right_target = model.right_token_mats[tid].transpose(-1, -2) @ right_target
 
     eye = model.eye()
@@ -551,7 +481,6 @@ def train(
     eval_samples: int,
     max_gen_len: int,
     context_length_power: float,
-    memory_weight: float,
 ) -> ManualRotationMatrixNetwork:
     rng = random.Random(seed)
 
@@ -563,12 +492,9 @@ def train(
             _, _, prompt_text, target_text = random_problem(rng, addend_digits, number_base)
             full_seq = prompt_text + target_text + EOS_TOKEN
             prompt_len = len(prompt_text)
-            for prefix_len in range(1, len(full_seq) + 1):
+            for prefix_len in range(prompt_len, len(full_seq)):
                 prefixes.append(model.encode(full_seq[:prefix_len]))
-                if prefix_len >= prompt_len and prefix_len < len(full_seq):
-                    target_ids.append(model.stoi[full_seq[prefix_len]])
-                else:
-                    target_ids.append(None)
+                target_ids.append(model.stoi[full_seq[prefix_len]])
 
         return prefixes, target_ids
 
@@ -580,7 +506,6 @@ def train(
             target_ids=target_ids,
             learning_rate=learning_rate,
             context_length_power=context_length_power,
-            memory_weight=memory_weight,
         )
 
         if iter_idx % log_every == 0 or iter_idx == 1:
@@ -590,7 +515,7 @@ def train(
             )
 
         if iter_idx % eval_every == 0 or iter_idx == iters:
-            exact, tf_acc, stop_rate, memory_acc, memory_subspace_norm = evaluate(
+            exact, tf_acc, stop_rate = evaluate(
                 model,
                 eval_samples=eval_samples,
                 seed=seed + iter_idx,
@@ -600,8 +525,7 @@ def train(
             )
             print(
                 f"  eval exact_match={exact:.3f} teacher_forced_token_acc={tf_acc:.3f} "
-                f"stop_rate={stop_rate:.3f} memory_token_acc={memory_acc:.3f} "
-                f"memory_subspace_norm={memory_subspace_norm:.3f}"
+                f"stop_rate={stop_rate:.3f}"
             )
 
     return model
@@ -623,7 +547,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
     p.add_argument("--context-length-power", type=float, default=0.0, help="Scale each prediction context by len(prefix)**(-power); 1.0 gives each context a fixed total update budget")
-    p.add_argument("--memory-weight", type=float, default=0.0, help="Weight of the auxiliary memory objective for each remembered token")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default=None, help="Optional checkpoint path override")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -636,8 +559,6 @@ def main() -> None:
         raise ValueError("--learning-rate must be > 0")
     if args.context_length_power < 0.0:
         raise ValueError("--context-length-power must be >= 0")
-    if args.memory_weight < 0.0:
-        raise ValueError("--memory-weight must be >= 0")
     if not (2 <= args.number_base <= len(DIGIT_SYMBOLS)):
         raise ValueError(f"--number-base must be in [2, {len(DIGIT_SYMBOLS)}]")
 
@@ -657,7 +578,6 @@ def main() -> None:
         f"orthogonalize=one_step_per_update"
     )
     print(f"context_length_power={args.context_length_power}")
-    print(f"memory_scope=all_prefixes memory_weight={args.memory_weight}")
 
     if args.load_path is None:
         model = ManualRotationMatrixNetwork(
@@ -704,7 +624,6 @@ def main() -> None:
         eval_samples=args.eval_samples,
         max_gen_len=max_gen_len,
         context_length_power=args.context_length_power,
-        memory_weight=args.memory_weight,
     )
 
     save_checkpoint(model, save_path, addend_digits=addend_digits)
