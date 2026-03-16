@@ -228,7 +228,7 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
     name = (
         f"manual_rotation_n{args.n}"
         f"_d{addend_digits}"
-        f"_radix{args.number_base}"
+        f"_base{args.number_base}"
         f"_mode{args.token_mat_mode}"
         f"_brand{format_float_token(args.base_randomize)}"
         f"_trand{format_float_token(args.token_randomize)}"
