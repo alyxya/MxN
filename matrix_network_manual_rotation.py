@@ -43,6 +43,11 @@ def initialize_rotation_like(shape: Tuple[int, ...], device: torch.device, stren
     return w
 
 
+def random_unit_vectors(shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
+    x = torch.randn(shape, device=device)
+    return normalize_columns(x.transpose(-1, -2)).transpose(-1, -2)
+
+
 def digit_alphabet(number_base: int) -> str:
     if not (2 <= number_base <= len(DIGIT_SYMBOLS)):
         raise ValueError(f"number_base must be in [2, {len(DIGIT_SYMBOLS)}], got {number_base}")
@@ -116,12 +121,11 @@ class ManualRotationMatrixNetwork:
         self.output_vocab = output_vocab
         self.vocab_size = len(self.vocab)
         self.output_vocab_size = len(self.output_vocab)
-        self.token_subspace_target_norm = (self.vocab_size / self.n) ** 0.5
         self.stoi: Dict[str, int] = {ch: i for i, ch in enumerate(self.vocab)}
         self.itos: Dict[int, str] = {i: ch for ch, i in self.stoi.items()}
 
-        self.query = torch.zeros(n, device=device)
-        self.query[0] = 1.0
+        self.query = random_unit_vectors((1, n), device)[0]
+        self.unembed_vectors = random_unit_vectors((self.output_vocab_size, n), device)
 
         self.base_mat = initialize_rotation_like((n, n), device, base_randomize)
         self.left_token_mats = initialize_rotation_like((self.vocab_size, n, n), device, token_randomize)
@@ -152,26 +156,11 @@ class ManualRotationMatrixNetwork:
 
     def predict_next_id(self, token_ids: Sequence[int]) -> int:
         state = self.prefix_state_ids(token_ids)
-        return int(state[: self.output_vocab_size].argmax().item())
+        scores = self.unembed_vectors @ normalize_columns(state.unsqueeze(1))
+        return int(scores[:, 0].argmax().item())
 
     def predict_next(self, prefix: str) -> str:
         return self.itos[self.predict_next_id(self.encode(prefix))]
-
-    def token_subspace_target(self, current_cols: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
-        target = current_cols.clone()
-        complement_target_norm = max(1.0 - self.token_subspace_target_norm**2, 0.0) ** 0.5
-        rest = current_cols[self.vocab_size :]
-        rest_norm = rest.norm(dim=0)
-        rest_scale = torch.where(
-            rest_norm > EPS,
-            torch.full_like(rest_norm, complement_target_norm) / rest_norm,
-            torch.zeros_like(rest_norm),
-        )
-        target[self.vocab_size :] = rest * rest_scale.unsqueeze(0)
-        target[: self.vocab_size] = 0.0
-        cols = torch.arange(token_ids.numel(), device=self.device)
-        target[token_ids, cols] = self.token_subspace_target_norm
-        return target
 
     @classmethod
     def from_checkpoint(cls, path: str, device: torch.device) -> Tuple["ManualRotationMatrixNetwork", int | None]:
@@ -193,6 +182,10 @@ class ManualRotationMatrixNetwork:
         model.left_token_mats = ckpt["left_token_mats"].to(device)
         model.right_token_mats = ckpt["right_token_mats"].to(device)
         model.base_mat = ckpt["base_mat"].to(device)
+        if "query" in ckpt:
+            model.query = ckpt["query"].to(device)
+        if "unembed_vectors" in ckpt:
+            model.unembed_vectors = ckpt["unembed_vectors"].to(device)
         addend_digits = ckpt.get("addend_digits")
         if addend_digits is not None:
             addend_digits = int(addend_digits)
@@ -213,6 +206,8 @@ def save_checkpoint(model: ManualRotationMatrixNetwork, save_path: str, addend_d
             "left_token_mats": model.left_token_mats,
             "right_token_mats": model.right_token_mats,
             "base_mat": model.base_mat,
+            "query": model.query,
+            "unembed_vectors": model.unembed_vectors,
             "addend_digits": addend_digits,
         },
         path,
@@ -311,18 +306,19 @@ def apply_batch_update(
     base_delta = torch.zeros(n, n, device=model.device)
     left_token_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
     right_token_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
+    query_target_sum = torch.zeros(n, device=model.device)
+    query_target_count = 0
+    unembed_target_sum = torch.zeros(model.output_vocab_size, n, device=model.device)
+    unembed_target_count = torch.zeros(model.output_vocab_size, device=model.device)
     correct = 0
     total = 0
     total_objective_columns = 0
     mean_target_score = 0.0
-    mean_target_subspace_norm = 0.0
-    target_subspace_count = 0
 
     base = model.base_mat
     for prefix_ids, target_id in zip(prefixes, target_ids):
         query_mat = model.query.unsqueeze(1)
         weights = torch.ones(1, device=model.device, dtype=base.dtype)
-        target_token_ids = torch.tensor([target_id], device=model.device, dtype=torch.long)
         total_objective_columns += 1
 
         if model.uses_right_token_mats():
@@ -346,14 +342,15 @@ def apply_batch_update(
             left_inputs = []
             state_mat = middle_state
 
-        subspace_norms = state_mat[: model.vocab_size].norm(dim=0)
-        target_mat = model.token_subspace_target(state_mat, target_token_ids)
-        mean_target_subspace_norm += float(subspace_norms.sum().item())
-        target_subspace_count += int(subspace_norms.numel())
+        target_mat = model.unembed_vectors[target_id].unsqueeze(1)
         state = state_mat[:, 0]
-        correct += int(int(state[: model.output_vocab_size].argmax().item()) == target_id)
+        state_normed = normalize_columns(state_mat)[:, 0]
+        scores = model.unembed_vectors @ state_normed
+        correct += int(int(scores.argmax().item()) == target_id)
         total += 1
-        mean_target_score += float(state[target_id].item())
+        mean_target_score += float(scores[target_id].item())
+        unembed_target_sum[target_id].add_(state_normed)
+        unembed_target_count[target_id] += 1.0
 
         left_target = target_mat
         if model.uses_left_token_mats():
@@ -368,13 +365,15 @@ def apply_batch_update(
         v_base = normalize_columns(left_target)
         base_delta.add_(manual_rotation_delta(u_base, v_base, weights))
 
+        query_target = base.transpose(-1, -2) @ left_target
         if model.uses_right_token_mats():
-            right_target = base.transpose(-1, -2) @ left_target
             for idx, tid in enumerate(prefix_ids):
                 u = normalize_columns(model.right_token_mats[tid] @ right_inputs[idx])
-                v = normalize_columns(right_target)
+                v = normalize_columns(query_target)
                 right_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
-                right_target = model.right_token_mats[tid].transpose(-1, -2) @ right_target
+                query_target = model.right_token_mats[tid].transpose(-1, -2) @ query_target
+        query_target_sum.add_(normalize_columns(query_target)[:, 0])
+        query_target_count += 1
 
     eye = torch.eye(model.n, device=model.device)
     objective_scale = 1.0 / float(max(total_objective_columns, 1))
@@ -392,10 +391,21 @@ def apply_batch_update(
         updated = (eye.unsqueeze(0) + learning_rate * (right_token_delta[right_active] * objective_scale)) @ model.right_token_mats[right_active]
         model.right_token_mats[right_active] = orthogonalize_newton_schulz(updated)
 
+    if query_target_count > 0:
+        query_target = normalize_columns(query_target_sum.unsqueeze(1))
+        model.query = normalize_columns(model.query.unsqueeze(1) + learning_rate * (query_target - model.query.unsqueeze(1)))[:, 0]
+
+    unembed_active = unembed_target_count > 0
+    if unembed_active.any():
+        avg_targets = unembed_target_sum[unembed_active] / unembed_target_count[unembed_active].unsqueeze(1)
+        avg_targets = normalize_columns(avg_targets.transpose(0, 1)).transpose(0, 1)
+        current = model.unembed_vectors[unembed_active]
+        updated = current + learning_rate * (avg_targets - current)
+        model.unembed_vectors[unembed_active] = normalize_columns(updated.transpose(0, 1)).transpose(0, 1)
+
     return (
         mean_target_score / max(total, 1),
         correct / max(total, 1),
-        mean_target_subspace_norm / max(target_subspace_count, 1),
     )
 
 
@@ -430,7 +440,7 @@ def train(
 
     for iter_idx in range(1, iters + 1):
         prefixes, target_ids = sample_batch()
-        mean_target_score, token_acc, mean_target_subspace_norm = apply_batch_update(
+        mean_target_score, token_acc = apply_batch_update(
             model,
             prefixes=prefixes,
             target_ids=target_ids,
@@ -440,7 +450,7 @@ def train(
         if iter_idx % log_every == 0 or iter_idx == 1:
             print(
                 f"iter={iter_idx:5d} mean_target_score={mean_target_score:.4f} "
-                f"token_acc={token_acc:.3f} mean_target_subspace_norm={mean_target_subspace_norm:.4f}"
+                f"token_acc={token_acc:.3f}"
             )
 
         if iter_idx % eval_every == 0 or iter_idx == iters:
@@ -460,7 +470,7 @@ def train(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Dense matrix network with manual rotation updates and fixed query/unembedding")
+    p = argparse.ArgumentParser(description="Dense matrix network with manual rotation updates and learned query/unembedding vectors")
     p.add_argument("--n", type=int, required=True, help="Square matrix dimension; must be >= vocab size")
     p.add_argument("--number-base", type=int, default=10, help="Arithmetic base for generated addition problems (2-16)")
     p.add_argument("--token-mat-mode", type=str, default="right", choices=["left", "right", "both"], help="Apply learned token matrices on the left of base, right of base, or both")
