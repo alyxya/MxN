@@ -15,8 +15,8 @@ from matrix_network_manual_rotation import (
     train,
 )
 
-APP_NAME = "mxn-manual-rotation"
-VOLUME_NAME = "mxn-manual-rotation-checkpoints"
+APP_NAME = "mxn-matrix-network"
+VOLUME_NAME = "mxn-matrix-network-checkpoints"
 REMOTE_CHECKPOINT_ROOT = Path("/checkpoints")
 
 image = (
@@ -52,7 +52,7 @@ def _remote_load_path(load_path: str) -> str:
 
 
 def parse_modal_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run matrix_network_manual_rotation.py on Modal")
+    p = argparse.ArgumentParser(description="Run matrix network training on Modal")
     p.add_argument("--n", type=int, required=True, help="Square matrix dimension; must be >= vocab size")
     p.add_argument("--number-base", type=int, default=10, help="Arithmetic base for generated addition problems (2-16)")
     p.add_argument(
@@ -76,7 +76,7 @@ def parse_modal_args() -> argparse.Namespace:
     )
     p.add_argument("--iters", type=int, default=1500, help="Training iterations")
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
-    p.add_argument("--learning-rate", type=float, default=0.01, help="Manual rotation step size")
+    p.add_argument("--learning-rate", type=float, default=0.01, help="Training step size")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
