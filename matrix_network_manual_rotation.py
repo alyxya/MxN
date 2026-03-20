@@ -301,15 +301,17 @@ def apply_batch_update(
     prefixes: Sequence[Sequence[int]],
     target_ids: Sequence[int],
     learning_rate: float,
+    vector_learning_rate: float,
+    negative_scale: float,
 ) -> Tuple[float, float]:
     n = model.n
     base_delta = torch.zeros(n, n, device=model.device)
     left_token_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
     right_token_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
-    query_target_sum = torch.zeros(n, device=model.device)
-    query_target_count = 0
-    unembed_target_sum = torch.zeros(model.output_vocab_size, n, device=model.device)
-    unembed_target_count = torch.zeros(model.output_vocab_size, device=model.device)
+    query_positive_sum = torch.zeros(n, device=model.device)
+    query_negative_sum = torch.zeros(n, device=model.device)
+    unembed_positive_sum = torch.zeros(model.output_vocab_size, n, device=model.device)
+    unembed_negative_sum = torch.zeros(model.output_vocab_size, n, device=model.device)
     correct = 0
     total = 0
     total_objective_columns = 0
@@ -362,18 +364,17 @@ def apply_batch_update(
         correct += int(int(scores.argmax().item()) == target_id)
         total += 1
         mean_target_score += target_score
-        unembed_target_sum[target_id].add_(state_normed)
-        unembed_target_count[target_id] += 1.0
+
+        unembed_positive_sum[target_id].add_(state_normed)
+        query_positive_sum.add_(query_target_from_unembed(model.unembed_vectors[target_id], prefix_ids))
 
         hard_negative_ids = torch.nonzero(
             (scores > target_score) & (torch.arange(model.output_vocab_size, device=model.device) != target_id),
             as_tuple=False,
         ).flatten()
         for wrong_id in hard_negative_ids.tolist():
-            unembed_target_sum[wrong_id].sub_(state_normed)
-            unembed_target_count[wrong_id] += 1.0
-            query_target_sum.sub_(query_target_from_unembed(model.unembed_vectors[wrong_id], prefix_ids))
-            query_target_count += 1
+            unembed_negative_sum[wrong_id].add_(state_normed)
+            query_negative_sum.add_(query_target_from_unembed(model.unembed_vectors[wrong_id], prefix_ids))
 
         left_target = target_mat
         if model.uses_left_token_mats():
@@ -395,8 +396,6 @@ def apply_batch_update(
                 v = normalize_columns(query_target)
                 right_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
                 query_target = model.right_token_mats[tid].transpose(-1, -2) @ query_target
-        query_target_sum.add_(normalize_columns(query_target)[:, 0])
-        query_target_count += 1
 
     eye = torch.eye(model.n, device=model.device)
     objective_scale = 1.0 / float(max(total_objective_columns, 1))
@@ -414,16 +413,19 @@ def apply_batch_update(
         updated = (eye.unsqueeze(0) + learning_rate * (right_token_delta[right_active] * objective_scale)) @ model.right_token_mats[right_active]
         model.right_token_mats[right_active] = orthogonalize_newton_schulz(updated)
 
-    if query_target_count > 0:
-        query_target = normalize_columns(query_target_sum.unsqueeze(1))
-        model.query = normalize_columns(model.query.unsqueeze(1) + learning_rate * (query_target - model.query.unsqueeze(1)))[:, 0]
+    query_net = query_positive_sum - negative_scale * query_negative_sum
+    query_net_norm = float(query_net.norm().item())
+    if query_net_norm > EPS:
+        query_target = query_net / query_net_norm
+        updated_query = model.query + vector_learning_rate * query_target
+        model.query = normalize_columns(updated_query.unsqueeze(1))[:, 0]
 
-    unembed_active = unembed_target_count > 0
+    unembed_net = unembed_positive_sum - negative_scale * unembed_negative_sum
+    unembed_net_norm = unembed_net.norm(dim=1)
+    unembed_active = unembed_net_norm > EPS
     if unembed_active.any():
-        avg_targets = unembed_target_sum[unembed_active] / unembed_target_count[unembed_active].unsqueeze(1)
-        avg_targets = normalize_columns(avg_targets.transpose(0, 1)).transpose(0, 1)
-        current = model.unembed_vectors[unembed_active]
-        updated = current + learning_rate * (avg_targets - current)
+        target_dirs = unembed_net[unembed_active] / unembed_net_norm[unembed_active].unsqueeze(1)
+        updated = model.unembed_vectors[unembed_active] + vector_learning_rate * target_dirs
         model.unembed_vectors[unembed_active] = normalize_columns(updated.transpose(0, 1)).transpose(0, 1)
 
     return (
@@ -438,12 +440,14 @@ def train(
     iters: int,
     batch_size: int,
     learning_rate: float,
+    vector_learning_rate: float,
     addend_digits: int,
     number_base: int,
     seed: int,
     log_every: int,
     eval_every: int,
     eval_samples: int,
+    negative_scale: float,
 ) -> ManualRotationMatrixNetwork:
     rng = random.Random(seed)
 
@@ -468,6 +472,8 @@ def train(
             prefixes=prefixes,
             target_ids=target_ids,
             learning_rate=learning_rate,
+            vector_learning_rate=vector_learning_rate,
+            negative_scale=negative_scale,
         )
 
         if iter_idx % log_every == 0 or iter_idx == 1:
@@ -502,11 +508,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--iters", type=int, default=1500, help="Training iterations")
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
     p.add_argument("--learning-rate", type=float, default=0.01, help="Manual rotation step size")
+    p.add_argument("--vector-learning-rate", type=float, default=0.1, help="Step size for learned query/unembed vector updates")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
+    p.add_argument("--negative-scale", type=float, default=0.1, help="Repulsion weight for wrong learned vectors that outscore the correct one")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default=None, help="Optional checkpoint path override")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -522,7 +530,10 @@ def main() -> None:
 
     device = pick_device(args.device)
     print(f"device={device}")
-    print(f"iters={args.iters} learning_rate={args.learning_rate}")
+    print(
+        f"iters={args.iters} learning_rate={args.learning_rate} "
+        f"vector_learning_rate={args.vector_learning_rate}"
+    )
     print(
         f"token_mat_mode={args.token_mat_mode} "
         f"addend_digits={args.addend_digits} number_base={args.number_base}"
@@ -563,12 +574,14 @@ def main() -> None:
         iters=args.iters,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        vector_learning_rate=args.vector_learning_rate,
         addend_digits=addend_digits,
         number_base=model.number_base,
         seed=args.seed,
         log_every=args.log_every,
         eval_every=args.eval_every,
         eval_samples=args.eval_samples,
+        negative_scale=args.negative_scale,
     )
 
     save_checkpoint(model, save_path, addend_digits=addend_digits)
