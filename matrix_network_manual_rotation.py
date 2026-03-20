@@ -417,7 +417,7 @@ def apply_batch_update(
     query_net_norm = float(query_net.norm().item())
     if query_net_norm > EPS:
         query_target = query_net / query_net_norm
-        updated_query = model.query + vector_learning_rate * query_target
+        updated_query = model.query + vector_learning_rate * (query_target - model.query)
         model.query = normalize_columns(updated_query.unsqueeze(1))[:, 0]
 
     unembed_net = unembed_positive_sum - negative_scale * unembed_negative_sum
@@ -425,7 +425,8 @@ def apply_batch_update(
     unembed_active = unembed_net_norm > EPS
     if unembed_active.any():
         target_dirs = unembed_net[unembed_active] / unembed_net_norm[unembed_active].unsqueeze(1)
-        updated = model.unembed_vectors[unembed_active] + vector_learning_rate * target_dirs
+        current = model.unembed_vectors[unembed_active]
+        updated = current + vector_learning_rate * (target_dirs - current)
         model.unembed_vectors[unembed_active] = normalize_columns(updated.transpose(0, 1)).transpose(0, 1)
 
     return (
