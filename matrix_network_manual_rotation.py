@@ -316,6 +316,18 @@ def apply_batch_update(
     mean_target_score = 0.0
 
     base = model.base_mat
+
+    def query_target_from_unembed(target_vec: torch.Tensor, prefix_ids: Sequence[int]) -> torch.Tensor:
+        target_col = target_vec.unsqueeze(1)
+        if model.uses_left_token_mats():
+            for idx in range(len(prefix_ids) - 1, -1, -1):
+                target_col = model.left_token_mats[prefix_ids[idx]].transpose(-1, -2) @ target_col
+        target_col = base.transpose(-1, -2) @ target_col
+        if model.uses_right_token_mats():
+            for tid in prefix_ids:
+                target_col = model.right_token_mats[tid].transpose(-1, -2) @ target_col
+        return normalize_columns(target_col)[:, 0]
+
     for prefix_ids, target_id in zip(prefixes, target_ids):
         query_mat = model.query.unsqueeze(1)
         weights = torch.ones(1, device=model.device, dtype=base.dtype)
@@ -346,11 +358,22 @@ def apply_batch_update(
         state = state_mat[:, 0]
         state_normed = normalize_columns(state_mat)[:, 0]
         scores = model.unembed_vectors @ state_normed
+        target_score = float(scores[target_id].item())
         correct += int(int(scores.argmax().item()) == target_id)
         total += 1
-        mean_target_score += float(scores[target_id].item())
+        mean_target_score += target_score
         unembed_target_sum[target_id].add_(state_normed)
         unembed_target_count[target_id] += 1.0
+
+        hard_negative_ids = torch.nonzero(
+            (scores > target_score) & (torch.arange(model.output_vocab_size, device=model.device) != target_id),
+            as_tuple=False,
+        ).flatten()
+        for wrong_id in hard_negative_ids.tolist():
+            unembed_target_sum[wrong_id].sub_(state_normed)
+            unembed_target_count[wrong_id] += 1.0
+            query_target_sum.sub_(query_target_from_unembed(model.unembed_vectors[wrong_id], prefix_ids))
+            query_target_count += 1
 
         left_target = target_mat
         if model.uses_left_token_mats():
