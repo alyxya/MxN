@@ -125,7 +125,8 @@ class ManualRotationMatrixNetwork:
         self.itos: Dict[int, str] = {i: ch for ch, i in self.stoi.items()}
 
         self.query = random_unit_vectors((1, n), device)[0]
-        self.unembed_vectors = random_unit_vectors((self.output_vocab_size, n), device)
+        self.past_queries = torch.empty((0, n), device=device)
+        self.unembed_vectors = random_unit_vectors((self.vocab_size, n), device)
 
         self.base_mat = initialize_rotation_like((n, n), device, base_randomize)
         self.left_token_mats = initialize_rotation_like((self.vocab_size, n, n), device, token_randomize)
@@ -139,6 +140,16 @@ class ManualRotationMatrixNetwork:
 
     def encode(self, s: str) -> List[int]:
         return [self.stoi[ch] for ch in s]
+
+    def ensure_past_queries(self, count: int) -> None:
+        current = self.past_queries.shape[0]
+        if count <= current:
+            return
+        extra = random_unit_vectors((count - current, self.n), self.device)
+        if current == 0:
+            self.past_queries = extra
+        else:
+            self.past_queries = torch.cat([self.past_queries, extra], dim=0)
 
     def prefix_state_from_query(self, token_ids: Sequence[int], query: torch.Tensor) -> torch.Tensor:
         v = query
@@ -156,7 +167,7 @@ class ManualRotationMatrixNetwork:
 
     def predict_next_id(self, token_ids: Sequence[int]) -> int:
         state = self.prefix_state_ids(token_ids)
-        scores = self.unembed_vectors @ normalize_columns(state.unsqueeze(1))
+        scores = self.unembed_vectors[: self.output_vocab_size] @ normalize_columns(state.unsqueeze(1))
         return int(scores[:, 0].argmax().item())
 
     def predict_next(self, prefix: str) -> str:
@@ -184,6 +195,8 @@ class ManualRotationMatrixNetwork:
         model.base_mat = ckpt["base_mat"].to(device)
         if "query" in ckpt:
             model.query = ckpt["query"].to(device)
+        if "past_queries" in ckpt:
+            model.past_queries = ckpt["past_queries"].to(device)
         if "unembed_vectors" in ckpt:
             model.unembed_vectors = ckpt["unembed_vectors"].to(device)
         addend_digits = ckpt.get("addend_digits")
@@ -207,6 +220,7 @@ def save_checkpoint(model: ManualRotationMatrixNetwork, save_path: str, addend_d
             "right_token_mats": model.right_token_mats,
             "base_mat": model.base_mat,
             "query": model.query,
+            "past_queries": model.past_queries,
             "unembed_vectors": model.unembed_vectors,
             "addend_digits": addend_digits,
         },
@@ -303,6 +317,7 @@ def apply_batch_update(
     learning_rate: float,
     vector_learning_rate: float,
     negative_scale: float,
+    past_objective_scale: float,
 ) -> Tuple[float, float]:
     n = model.n
     base_delta = torch.zeros(n, n, device=model.device)
@@ -310,11 +325,13 @@ def apply_batch_update(
     right_token_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
     query_positive_sum = torch.zeros(n, device=model.device)
     query_negative_sum = torch.zeros(n, device=model.device)
-    unembed_positive_sum = torch.zeros(model.output_vocab_size, n, device=model.device)
-    unembed_negative_sum = torch.zeros(model.output_vocab_size, n, device=model.device)
+    past_query_positive_sum = torch.zeros_like(model.past_queries)
+    past_query_negative_sum = torch.zeros_like(model.past_queries)
+    unembed_positive_sum = torch.zeros(model.vocab_size, n, device=model.device)
+    unembed_negative_sum = torch.zeros(model.vocab_size, n, device=model.device)
     correct = 0
     total = 0
-    total_objective_columns = 0
+    total_objective_weight = 0.0
     mean_target_score = 0.0
 
     base = model.base_mat
@@ -330,75 +347,118 @@ def apply_batch_update(
                 target_col = model.right_token_mats[tid].transpose(-1, -2) @ target_col
         return normalize_columns(target_col)[:, 0]
 
-    for prefix_ids, target_id in zip(prefixes, target_ids):
-        query_mat = model.query.unsqueeze(1)
-        weights = torch.ones(1, device=model.device, dtype=base.dtype)
-        total_objective_columns += 1
-
-        if model.uses_right_token_mats():
-            right_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
-            right_state = query_mat
-            for idx in range(len(prefix_ids) - 1, -1, -1):
-                right_inputs[idx] = right_state
-                right_state = model.right_token_mats[prefix_ids[idx]] @ right_state
-        else:
-            right_inputs = []
-            right_state = query_mat
-
-        middle_state = base @ right_state
-        if model.uses_left_token_mats():
-            left_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
-            state_mat = middle_state
-            for idx, tid in enumerate(prefix_ids):
-                left_inputs[idx] = state_mat
-                state_mat = model.left_token_mats[tid] @ state_mat
-        else:
-            left_inputs = []
-            state_mat = middle_state
-
-        target_mat = model.unembed_vectors[target_id].unsqueeze(1)
-        state = state_mat[:, 0]
-        state_normed = normalize_columns(state_mat)[:, 0]
-        scores = model.unembed_vectors @ state_normed
+    def accumulate_query_vector_updates(
+        query_index: int | None,
+        prefix_ids: Sequence[int],
+        state_normed: torch.Tensor,
+        scores: torch.Tensor,
+        target_id: int,
+        weight: float,
+    ) -> None:
         target_score = float(scores[target_id].item())
-        correct += int(int(scores.argmax().item()) == target_id)
-        total += 1
-        mean_target_score += target_score
-
-        unembed_positive_sum[target_id].add_(state_normed)
-        query_positive_sum.add_(query_target_from_unembed(model.unembed_vectors[target_id], prefix_ids))
+        unembed_positive_sum[target_id].add_(weight * state_normed)
+        target_query = query_target_from_unembed(model.unembed_vectors[target_id], prefix_ids)
+        if query_index is None:
+            query_positive_sum.add_(weight * target_query)
+        else:
+            past_query_positive_sum[query_index].add_(weight * target_query)
 
         hard_negative_ids = torch.nonzero(
-            (scores > target_score) & (torch.arange(model.output_vocab_size, device=model.device) != target_id),
+            (scores > target_score) & (torch.arange(model.vocab_size, device=model.device) != target_id),
             as_tuple=False,
         ).flatten()
         for wrong_id in hard_negative_ids.tolist():
-            unembed_negative_sum[wrong_id].add_(state_normed)
-            query_negative_sum.add_(query_target_from_unembed(model.unembed_vectors[wrong_id], prefix_ids))
+            unembed_negative_sum[wrong_id].add_(weight * state_normed)
+            wrong_query = query_target_from_unembed(model.unembed_vectors[wrong_id], prefix_ids)
+            if query_index is None:
+                query_negative_sum.add_(weight * wrong_query)
+            else:
+                past_query_negative_sum[query_index].add_(weight * wrong_query)
 
-        left_target = target_mat
-        if model.uses_left_token_mats():
-            for idx in range(len(prefix_ids) - 1, -1, -1):
-                tid = prefix_ids[idx]
-                u = normalize_columns(model.left_token_mats[tid] @ left_inputs[idx])
-                v = normalize_columns(left_target)
-                left_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
-                left_target = model.left_token_mats[tid].transpose(-1, -2) @ left_target
+    for prefix_ids, target_id in zip(prefixes, target_ids):
+        def accumulate_objective(query_vec: torch.Tensor, objective_target_id: int, weight: float, query_index: int | None) -> Tuple[float, bool]:
+            query_mat = query_vec.unsqueeze(1)
+            weights = torch.full((1,), weight, device=model.device, dtype=base.dtype)
 
-        u_base = normalize_columns(middle_state)
-        v_base = normalize_columns(left_target)
-        base_delta.add_(manual_rotation_delta(u_base, v_base, weights))
+            if model.uses_right_token_mats():
+                right_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
+                right_state = query_mat
+                for idx in range(len(prefix_ids) - 1, -1, -1):
+                    right_inputs[idx] = right_state
+                    right_state = model.right_token_mats[prefix_ids[idx]] @ right_state
+            else:
+                right_inputs = []
+                right_state = query_mat
 
-        query_target = base.transpose(-1, -2) @ left_target
-        if model.uses_right_token_mats():
-            for idx, tid in enumerate(prefix_ids):
-                u = normalize_columns(model.right_token_mats[tid] @ right_inputs[idx])
-                v = normalize_columns(query_target)
-                right_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
-                query_target = model.right_token_mats[tid].transpose(-1, -2) @ query_target
+            middle_state = base @ right_state
+            if model.uses_left_token_mats():
+                left_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
+                state_mat = middle_state
+                for idx, tid in enumerate(prefix_ids):
+                    left_inputs[idx] = state_mat
+                    state_mat = model.left_token_mats[tid] @ state_mat
+            else:
+                left_inputs = []
+                state_mat = middle_state
+
+            target_mat = model.unembed_vectors[objective_target_id].unsqueeze(1)
+            state_normed = normalize_columns(state_mat)[:, 0]
+            scores = model.unembed_vectors @ state_normed
+            accumulate_query_vector_updates(query_index, prefix_ids, state_normed, scores, objective_target_id, weight)
+
+            left_target = target_mat
+            if model.uses_left_token_mats():
+                for idx in range(len(prefix_ids) - 1, -1, -1):
+                    tid = prefix_ids[idx]
+                    u = normalize_columns(model.left_token_mats[tid] @ left_inputs[idx])
+                    v = normalize_columns(left_target)
+                    left_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
+                    left_target = model.left_token_mats[tid].transpose(-1, -2) @ left_target
+
+            u_base = normalize_columns(middle_state)
+            v_base = normalize_columns(left_target)
+            base_delta.add_(manual_rotation_delta(u_base, v_base, weights))
+
+            query_target = base.transpose(-1, -2) @ left_target
+            if model.uses_right_token_mats():
+                for idx, tid in enumerate(prefix_ids):
+                    u = normalize_columns(model.right_token_mats[tid] @ right_inputs[idx])
+                    v = normalize_columns(query_target)
+                    right_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
+                    query_target = model.right_token_mats[tid].transpose(-1, -2) @ query_target
+
+            if objective_target_id < model.output_vocab_size:
+                predicted = int(scores[: model.output_vocab_size].argmax().item())
+            else:
+                predicted = int(scores.argmax().item())
+            return float(scores[objective_target_id].item()), predicted == objective_target_id
+
+        if target_id >= 0:
+            score, is_correct = accumulate_objective(model.query, target_id, 1.0, None)
+            total_objective_weight += 1.0
+            mean_target_score += score
+            correct += int(is_correct)
+            total += 1
+
+        for lag in range(1, len(prefix_ids) + 1):
+            query_index = lag - 1
+            model.ensure_past_queries(lag)
+            if past_query_positive_sum.shape[0] < model.past_queries.shape[0]:
+                new_size = model.past_queries.shape[0]
+                past_query_positive_sum = torch.cat(
+                    [past_query_positive_sum, torch.zeros(new_size - past_query_positive_sum.shape[0], n, device=model.device)],
+                    dim=0,
+                )
+                past_query_negative_sum = torch.cat(
+                    [past_query_negative_sum, torch.zeros(new_size - past_query_negative_sum.shape[0], n, device=model.device)],
+                    dim=0,
+                )
+            past_target_id = prefix_ids[-lag]
+            accumulate_objective(model.past_queries[query_index], past_target_id, past_objective_scale, query_index)
+            total_objective_weight += past_objective_scale
 
     eye = torch.eye(model.n, device=model.device)
-    objective_scale = 1.0 / float(max(total_objective_columns, 1))
+    objective_scale = 1.0 / float(max(total_objective_weight, 1.0))
     if total > 0:
         updated = (eye + learning_rate * (base_delta * objective_scale)) @ model.base_mat
         model.base_mat = orthogonalize_newton_schulz(updated)
@@ -419,6 +479,15 @@ def apply_batch_update(
         query_target = query_net / query_net_norm
         updated_query = model.query + vector_learning_rate * (query_target - model.query)
         model.query = normalize_columns(updated_query.unsqueeze(1))[:, 0]
+
+    past_query_net = past_query_positive_sum - negative_scale * past_query_negative_sum
+    past_query_net_norm = past_query_net.norm(dim=1)
+    past_query_active = past_query_net_norm > EPS
+    if past_query_active.any():
+        current = model.past_queries[past_query_active]
+        target_dirs = past_query_net[past_query_active] / past_query_net_norm[past_query_active].unsqueeze(1)
+        updated = current + vector_learning_rate * past_objective_scale * (target_dirs - current)
+        model.past_queries[past_query_active] = normalize_columns(updated.transpose(0, 1)).transpose(0, 1)
 
     unembed_net = unembed_positive_sum - negative_scale * unembed_negative_sum
     unembed_net_norm = unembed_net.norm(dim=1)
@@ -449,6 +518,7 @@ def train(
     eval_every: int,
     eval_samples: int,
     negative_scale: float,
+    past_objective_scale: float,
 ) -> ManualRotationMatrixNetwork:
     rng = random.Random(seed)
 
@@ -460,9 +530,12 @@ def train(
             _, _, prompt_text, target_text = random_problem(rng, addend_digits, number_base)
             full_seq = prompt_text + target_text + EOS_TOKEN
             prompt_len = len(prompt_text)
-            for prefix_len in range(prompt_len, len(full_seq)):
+            for prefix_len in range(1, len(full_seq)):
                 prefixes.append(model.encode(full_seq[:prefix_len]))
-                target_ids.append(model.stoi[full_seq[prefix_len]])
+                if prefix_len >= prompt_len:
+                    target_ids.append(model.stoi[full_seq[prefix_len]])
+                else:
+                    target_ids.append(-1)
 
         return prefixes, target_ids
 
@@ -475,6 +548,7 @@ def train(
             learning_rate=learning_rate,
             vector_learning_rate=vector_learning_rate,
             negative_scale=negative_scale,
+            past_objective_scale=past_objective_scale,
         )
 
         if iter_idx % log_every == 0 or iter_idx == 1:
@@ -516,6 +590,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
     p.add_argument("--negative-scale", type=float, default=0.1, help="Repulsion weight for wrong learned vectors that outscore the correct one")
+    p.add_argument("--past-objective-scale", type=float, default=0.1, help="Scale multiplier for past-token auxiliary objectives")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default=None, help="Optional checkpoint path override")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -583,6 +658,7 @@ def main() -> None:
         eval_every=args.eval_every,
         eval_samples=args.eval_samples,
         negative_scale=args.negative_scale,
+        past_objective_scale=args.past_objective_scale,
     )
 
     save_checkpoint(model, save_path, addend_digits=addend_digits)
