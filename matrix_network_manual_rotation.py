@@ -360,19 +360,19 @@ def apply_batch_update(
         state_normed: torch.Tensor,
         scores: torch.Tensor,
         target_id: int,
-        weight: float,
+        vector_weight: float,
         unembed_bank: torch.Tensor,
         unembed_positive_acc: torch.Tensor,
         unembed_negative_acc: torch.Tensor,
         use_output_slice: bool,
     ) -> None:
         target_score = float(scores[target_id].item())
-        unembed_positive_acc[target_id].add_(weight * state_normed)
+        unembed_positive_acc[target_id].add_(vector_weight * state_normed)
         target_query = query_target_from_unembed(unembed_bank[target_id], prefix_ids)
         if query_index is None:
-            query_positive_sum.add_(weight * target_query)
+            query_positive_sum.add_(vector_weight * target_query)
         else:
-            past_query_positive_sum[query_index].add_(weight * target_query)
+            past_query_positive_sum[query_index].add_(vector_weight * target_query)
 
         candidate_size = model.output_vocab_size if use_output_slice else model.vocab_size
         hard_negative_ids = torch.nonzero(
@@ -380,12 +380,12 @@ def apply_batch_update(
             as_tuple=False,
         ).flatten()
         for wrong_id in hard_negative_ids.tolist():
-            unembed_negative_acc[wrong_id].add_(weight * state_normed)
+            unembed_negative_acc[wrong_id].add_(vector_weight * state_normed)
             wrong_query = query_target_from_unembed(unembed_bank[wrong_id], prefix_ids)
             if query_index is None:
-                query_negative_sum.add_(weight * wrong_query)
+                query_negative_sum.add_(vector_weight * wrong_query)
             else:
-                past_query_negative_sum[query_index].add_(weight * wrong_query)
+                past_query_negative_sum[query_index].add_(vector_weight * wrong_query)
 
     for prefix_ids, target_id in zip(prefixes, target_ids):
         def accumulate_objective(
@@ -393,10 +393,13 @@ def apply_batch_update(
             unembed_bank: torch.Tensor,
             objective_target_id: int,
             matrix_weight: float,
+            vector_weight: float,
             query_index: int | None,
             unembed_positive_acc: torch.Tensor,
             unembed_negative_acc: torch.Tensor,
             use_output_slice: bool,
+            min_update_index: int,
+            allow_base_update: bool,
         ) -> Tuple[float, bool]:
             query_mat = query_vec.unsqueeze(1)
             weights = torch.full((1,), matrix_weight, device=model.device, dtype=base.dtype)
@@ -431,7 +434,7 @@ def apply_batch_update(
                 state_normed,
                 scores,
                 objective_target_id,
-                matrix_weight,
+                vector_weight,
                 unembed_bank,
                 unembed_positive_acc,
                 unembed_negative_acc,
@@ -444,19 +447,22 @@ def apply_batch_update(
                     tid = prefix_ids[idx]
                     u = normalize_columns(model.left_token_mats[tid] @ left_inputs[idx])
                     v = normalize_columns(left_target)
-                    left_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
+                    if idx >= min_update_index:
+                        left_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
                     left_target = model.left_token_mats[tid].transpose(-1, -2) @ left_target
 
-            u_base = normalize_columns(middle_state)
-            v_base = normalize_columns(left_target)
-            base_delta.add_(manual_rotation_delta(u_base, v_base, weights))
+            if allow_base_update:
+                u_base = normalize_columns(middle_state)
+                v_base = normalize_columns(left_target)
+                base_delta.add_(manual_rotation_delta(u_base, v_base, weights))
 
             query_target = base.transpose(-1, -2) @ left_target
             if model.uses_right_token_mats():
                 for idx, tid in enumerate(prefix_ids):
                     u = normalize_columns(model.right_token_mats[tid] @ right_inputs[idx])
                     v = normalize_columns(query_target)
-                    right_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
+                    if idx >= min_update_index:
+                        right_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
                     query_target = model.right_token_mats[tid].transpose(-1, -2) @ query_target
 
             if use_output_slice:
@@ -471,9 +477,12 @@ def apply_batch_update(
                 model.unembed_vectors,
                 target_id,
                 1.0,
+                1.0,
                 None,
                 unembed_positive_sum,
                 unembed_negative_sum,
+                True,
+                0,
                 True,
             )
             total_objective_weight += 1.0
@@ -500,9 +509,12 @@ def apply_batch_update(
                 model.past_unembed_vectors,
                 past_target_id,
                 secondary_matrix_scale,
+                1.0,
                 query_index,
                 past_unembed_positive_sum,
                 past_unembed_negative_sum,
+                False,
+                query_index,
                 False,
             )
             total_objective_weight += secondary_matrix_scale
