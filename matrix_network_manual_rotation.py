@@ -239,6 +239,7 @@ class PrefixOperatorCache:
     left_u_ops: torch.Tensor
     left_all_transpose_op: torch.Tensor
     right_v_prefix_ops: torch.Tensor
+    base_query_target_op: torch.Tensor
     query_target_op: torch.Tensor
 
 
@@ -805,12 +806,14 @@ def apply_batch_update(
             left_u_ops=left_u_buffer[:prefix_len],
             left_all_transpose_op=left_all_transpose_op,
             right_v_prefix_ops=right_v_buffer[:prefix_len],
+            base_query_target_op=base_query_target_op,
             query_target_op=query_target_op,
         )
 
     def accumulate_primary_objectives(
         full_ids: Sequence[int],
         prompt_len: int,
+        prefix_caches: Sequence[PrefixOperatorCache],
         middle_ops_buffer: torch.Tensor,
         final_ops_buffer: torch.Tensor,
         left_total_ops_buffer: torch.Tensor,
@@ -871,7 +874,8 @@ def apply_batch_update(
         base_primary_delta.add_(matrix_rotation_generator(u_base, v_base, 1.0).sum(dim=0))
 
         if model.uses_right_token_mats():
-            base_query_targets = query_target_ops @ target_mats
+            primary_caches = prefix_caches[primary_start:total_prefixes]
+            base_query_targets = torch.stack([cache.base_query_target_op for cache in primary_caches], dim=0) @ target_mats
             max_prefix_len = int(prefix_lens.max().item())
             for idx in range(max_prefix_len):
                 active_start = max(0, idx - prompt_len + 1)
@@ -879,7 +883,11 @@ def apply_batch_update(
                     continue
                 tid = full_ids[idx]
                 v_ops = right_v_buffer[idx].unsqueeze(0).expand(total_count - active_start, -1, -1)
-                u_ops = v_ops @ query_target_ops_buffer[primary_start + active_start : total_prefixes].transpose(-1, -2) @ left_total_ops_buffer[primary_start + active_start : total_prefixes]
+                right_total_ops = torch.stack(
+                    [cache.right_total_op for cache in primary_caches[active_start:]],
+                    dim=0,
+                )
+                u_ops = v_ops @ right_total_ops
                 u = normalize_last_dim((u_ops @ query_mat.expand(total_count - active_start, -1, -1)).squeeze(-1)).unsqueeze(-1)
                 v = normalize_last_dim((v_ops @ base_query_targets[active_start:]).squeeze(-1)).unsqueeze(-1)
                 right_primary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0).sum(dim=0))
@@ -916,7 +924,7 @@ def apply_batch_update(
             past_query_negative_sum.index_add_(0, neg_lag_indices, secondary_query_targets[neg_wrong_ids])
 
         target_mats = model.past_unembed_vectors[target_ids_tensor].transpose(0, 1)
-        base_query_targets = cache.query_target_op @ target_mats
+        base_query_targets = cache.base_query_target_op @ target_mats
 
         if model.uses_left_token_mats():
             for idx in range(prefix_len - 1, -1, -1):
@@ -964,6 +972,7 @@ def apply_batch_update(
         score_sum, correct_count, total_count = accumulate_primary_objectives(
             full_ids,
             prompt_len,
+            prefix_caches,
             middle_ops_buffer,
             final_ops_buffer,
             left_total_ops_buffer,
