@@ -512,9 +512,11 @@ def apply_batch_update(
     update_orthogonalize_steps: int,
 ) -> Tuple[float, float]:
     n = model.n
-    base_delta = torch.zeros(n, n, device=model.device)
-    left_token_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
-    right_token_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
+    base_primary_delta = torch.zeros(n, n, device=model.device)
+    left_primary_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
+    right_primary_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
+    left_secondary_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
+    right_secondary_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
     query_positive_sum = torch.zeros(n, device=model.device)
     query_negative_sum = torch.zeros(n, device=model.device)
     past_query_positive_sum = torch.zeros_like(model.past_queries)
@@ -525,7 +527,8 @@ def apply_batch_update(
     past_unembed_negative_sum = torch.zeros(model.vocab_size, n, device=model.device)
     correct = 0
     total = 0
-    total_objective_weight = 0.0
+    primary_objective_weight = 0.0
+    secondary_objective_weight = 0.0
     mean_target_score = 0.0
 
     base = model.base_mat
@@ -574,105 +577,114 @@ def apply_batch_update(
             else:
                 past_query_negative_sum[query_index].add_(vector_weight * wrong_query)
 
+    def accumulate_objective(
+        *,
+        query_vec: torch.Tensor,
+        unembed_bank: torch.Tensor,
+        objective_target_id: int,
+        matrix_weight: float,
+        vector_weight: float,
+        query_index: int | None,
+        unembed_positive_acc: torch.Tensor,
+        unembed_negative_acc: torch.Tensor,
+        use_output_slice: bool,
+        min_update_index: int,
+        allow_base_update: bool,
+        left_delta_acc: torch.Tensor,
+        right_delta_acc: torch.Tensor,
+        base_delta_acc: torch.Tensor | None,
+        prefix_ids: Sequence[int],
+    ) -> Tuple[float, bool]:
+        query_mat = query_vec.unsqueeze(1)
+        weights = torch.full((1,), matrix_weight, device=model.device, dtype=base.dtype)
+
+        if model.uses_right_token_mats():
+            right_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
+            right_state = query_mat
+            for idx in range(len(prefix_ids) - 1, -1, -1):
+                right_inputs[idx] = right_state
+                right_state = model.right_token_mats[prefix_ids[idx]] @ right_state
+        else:
+            right_inputs = []
+            right_state = query_mat
+
+        middle_state = base @ right_state
+        if model.uses_left_token_mats():
+            left_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
+            state_mat = middle_state
+            for idx, tid in enumerate(prefix_ids):
+                left_inputs[idx] = state_mat
+                state_mat = model.left_token_mats[tid] @ state_mat
+        else:
+            left_inputs = []
+            state_mat = middle_state
+
+        target_mat = unembed_bank[objective_target_id].unsqueeze(1)
+        state_normed = normalize_columns(state_mat)[:, 0]
+        scores = unembed_bank @ state_normed
+        accumulate_query_vector_updates(
+            query_index,
+            prefix_ids,
+            state_normed,
+            scores,
+            objective_target_id,
+            vector_weight,
+            unembed_bank,
+            unembed_positive_acc,
+            unembed_negative_acc,
+            use_output_slice,
+        )
+
+        left_target = target_mat
+        if model.uses_left_token_mats():
+            for idx in range(len(prefix_ids) - 1, -1, -1):
+                tid = prefix_ids[idx]
+                u = normalize_columns(model.left_token_mats[tid] @ left_inputs[idx])
+                v = normalize_columns(left_target)
+                if idx >= min_update_index:
+                    left_delta_acc[tid].add_(matrix_rotation_generator(u, v, weights))
+                left_target = model.left_token_mats[tid].transpose(-1, -2) @ left_target
+
+        if allow_base_update and base_delta_acc is not None:
+            u_base = normalize_columns(middle_state)
+            v_base = normalize_columns(left_target)
+            base_delta_acc.add_(matrix_rotation_generator(u_base, v_base, weights))
+
+        query_target = base.transpose(-1, -2) @ left_target
+        if model.uses_right_token_mats():
+            for idx, tid in enumerate(prefix_ids):
+                u = normalize_columns(model.right_token_mats[tid] @ right_inputs[idx])
+                v = normalize_columns(query_target)
+                if idx >= min_update_index:
+                    right_delta_acc[tid].add_(matrix_rotation_generator(u, v, weights))
+                query_target = model.right_token_mats[tid].transpose(-1, -2) @ query_target
+
+        if use_output_slice:
+            predicted = int(scores[: model.output_vocab_size].argmax().item())
+        else:
+            predicted = int(scores.argmax().item())
+        return float(scores[objective_target_id].item()), predicted == objective_target_id
+
     for prefix_ids, target_id in zip(prefixes, target_ids):
-        def accumulate_objective(
-            query_vec: torch.Tensor,
-            unembed_bank: torch.Tensor,
-            objective_target_id: int,
-            matrix_weight: float,
-            vector_weight: float,
-            query_index: int | None,
-            unembed_positive_acc: torch.Tensor,
-            unembed_negative_acc: torch.Tensor,
-            use_output_slice: bool,
-            min_update_index: int,
-            allow_base_update: bool,
-        ) -> Tuple[float, bool]:
-            query_mat = query_vec.unsqueeze(1)
-            weights = torch.full((1,), matrix_weight, device=model.device, dtype=base.dtype)
-
-            if model.uses_right_token_mats():
-                right_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
-                right_state = query_mat
-                for idx in range(len(prefix_ids) - 1, -1, -1):
-                    right_inputs[idx] = right_state
-                    right_state = model.right_token_mats[prefix_ids[idx]] @ right_state
-            else:
-                right_inputs = []
-                right_state = query_mat
-
-            middle_state = base @ right_state
-            if model.uses_left_token_mats():
-                left_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
-                state_mat = middle_state
-                for idx, tid in enumerate(prefix_ids):
-                    left_inputs[idx] = state_mat
-                    state_mat = model.left_token_mats[tid] @ state_mat
-            else:
-                left_inputs = []
-                state_mat = middle_state
-
-            target_mat = unembed_bank[objective_target_id].unsqueeze(1)
-            state_normed = normalize_columns(state_mat)[:, 0]
-            scores = unembed_bank @ state_normed
-            accumulate_query_vector_updates(
-                query_index,
-                prefix_ids,
-                state_normed,
-                scores,
-                objective_target_id,
-                vector_weight,
-                unembed_bank,
-                unembed_positive_acc,
-                unembed_negative_acc,
-                use_output_slice,
-            )
-
-            left_target = target_mat
-            if model.uses_left_token_mats():
-                for idx in range(len(prefix_ids) - 1, -1, -1):
-                    tid = prefix_ids[idx]
-                    u = normalize_columns(model.left_token_mats[tid] @ left_inputs[idx])
-                    v = normalize_columns(left_target)
-                    if idx >= min_update_index:
-                        left_token_delta[tid].add_(matrix_rotation_generator(u, v, weights))
-                    left_target = model.left_token_mats[tid].transpose(-1, -2) @ left_target
-
-            if allow_base_update:
-                u_base = normalize_columns(middle_state)
-                v_base = normalize_columns(left_target)
-                base_delta.add_(matrix_rotation_generator(u_base, v_base, weights))
-
-            query_target = base.transpose(-1, -2) @ left_target
-            if model.uses_right_token_mats():
-                for idx, tid in enumerate(prefix_ids):
-                    u = normalize_columns(model.right_token_mats[tid] @ right_inputs[idx])
-                    v = normalize_columns(query_target)
-                    if idx >= min_update_index:
-                        right_token_delta[tid].add_(matrix_rotation_generator(u, v, weights))
-                    query_target = model.right_token_mats[tid].transpose(-1, -2) @ query_target
-
-            if use_output_slice:
-                predicted = int(scores[: model.output_vocab_size].argmax().item())
-            else:
-                predicted = int(scores.argmax().item())
-            return float(scores[objective_target_id].item()), predicted == objective_target_id
-
         if target_id >= 0:
             score, is_correct = accumulate_objective(
-                model.query,
-                model.unembed_vectors,
-                target_id,
-                1.0,
-                1.0,
-                None,
-                unembed_positive_sum,
-                unembed_negative_sum,
-                True,
-                0,
-                True,
+                query_vec=model.query,
+                unembed_bank=model.unembed_vectors,
+                objective_target_id=target_id,
+                matrix_weight=1.0,
+                vector_weight=1.0,
+                query_index=None,
+                unembed_positive_acc=unembed_positive_sum,
+                unembed_negative_acc=unembed_negative_sum,
+                use_output_slice=True,
+                min_update_index=0,
+                allow_base_update=True,
+                left_delta_acc=left_primary_delta,
+                right_delta_acc=right_primary_delta,
+                base_delta_acc=base_primary_delta,
+                prefix_ids=prefix_ids,
             )
-            total_objective_weight += 1.0
+            primary_objective_weight += 1.0
             mean_target_score += score
             correct += int(is_correct)
             total += 1
@@ -692,33 +704,35 @@ def apply_batch_update(
                 )
             past_target_id = prefix_ids[-lag]
             accumulate_objective(
-                model.past_queries[query_index],
-                model.past_unembed_vectors,
-                past_target_id,
-                secondary_matrix_scale,
-                1.0,
-                query_index,
-                past_unembed_positive_sum,
-                past_unembed_negative_sum,
-                False,
-                query_index,
-                False,
+                query_vec=model.past_queries[query_index],
+                unembed_bank=model.past_unembed_vectors,
+                objective_target_id=past_target_id,
+                matrix_weight=secondary_matrix_scale,
+                vector_weight=1.0,
+                query_index=query_index,
+                unembed_positive_acc=past_unembed_positive_sum,
+                unembed_negative_acc=past_unembed_negative_sum,
+                use_output_slice=False,
+                min_update_index=query_index,
+                allow_base_update=False,
+                left_delta_acc=left_secondary_delta,
+                right_delta_acc=right_secondary_delta,
+                base_delta_acc=None,
+                prefix_ids=prefix_ids,
             )
-            total_objective_weight += secondary_matrix_scale
+            secondary_objective_weight += secondary_matrix_scale
 
-    objective_scale = 1.0 / float(max(total_objective_weight, 1.0))
+    primary_scale = 1.0 / float(max(primary_objective_weight, 1.0))
+    secondary_scale = 1.0 / float(max(secondary_objective_weight, 1.0))
     optimizer_state.ensure_initialized(model)
     decay = optimizer_state.momentum_decay
+    momentum_inject = 1.0 - decay
 
     assert optimizer_state.base_momentum is not None
     assert optimizer_state.left_token_momentum is not None
     assert optimizer_state.right_token_momentum is not None
-    assert optimizer_state.query_momentum is not None
-    assert optimizer_state.past_query_momentum is not None
-    assert optimizer_state.unembed_momentum is not None
-    assert optimizer_state.past_unembed_momentum is not None
 
-    optimizer_state.base_momentum.mul_(decay).add_(base_delta * objective_scale)
+    optimizer_state.base_momentum.mul_(decay).add_(base_primary_delta * (primary_scale * momentum_inject))
     if float(optimizer_state.base_momentum.abs().amax().item()) > EPS:
         model.base_mat = apply_matrix_rotation(
             model.base_mat,
@@ -727,7 +741,7 @@ def apply_batch_update(
             update_orthogonalize_steps,
         )
 
-    optimizer_state.left_token_momentum.mul_(decay).add_(left_token_delta * objective_scale)
+    optimizer_state.left_token_momentum.mul_(decay).add_(left_primary_delta * (primary_scale * momentum_inject))
     left_hist_active = optimizer_state.left_token_momentum.abs().amax(dim=(1, 2)) > EPS
     if left_hist_active.any():
         model.left_token_mats[left_hist_active] = apply_matrix_rotation(
@@ -737,7 +751,7 @@ def apply_batch_update(
             update_orthogonalize_steps,
         )
 
-    optimizer_state.right_token_momentum.mul_(decay).add_(right_token_delta * objective_scale)
+    optimizer_state.right_token_momentum.mul_(decay).add_(right_primary_delta * (primary_scale * momentum_inject))
     right_hist_active = optimizer_state.right_token_momentum.abs().amax(dim=(1, 2)) > EPS
     if right_hist_active.any():
         model.right_token_mats[right_hist_active] = apply_matrix_rotation(
@@ -747,51 +761,60 @@ def apply_batch_update(
             update_orthogonalize_steps,
         )
 
+    left_secondary_active = left_secondary_delta.abs().amax(dim=(1, 2)) > 0
+    if left_secondary_active.any():
+        model.left_token_mats[left_secondary_active] = apply_matrix_rotation(
+            model.left_token_mats[left_secondary_active],
+            left_secondary_delta[left_secondary_active] * secondary_scale,
+            token_learning_rate,
+            update_orthogonalize_steps,
+        )
+
+    right_secondary_active = right_secondary_delta.abs().amax(dim=(1, 2)) > 0
+    if right_secondary_active.any():
+        model.right_token_mats[right_secondary_active] = apply_matrix_rotation(
+            model.right_token_mats[right_secondary_active],
+            right_secondary_delta[right_secondary_active] * secondary_scale,
+            token_learning_rate,
+            update_orthogonalize_steps,
+        )
+
     query_net = query_positive_sum - negative_scale * query_negative_sum
     query_net_norm = float(query_net.norm().item())
-    query_delta = torch.zeros_like(optimizer_state.query_momentum)
     if query_net_norm > EPS:
         query_target = query_net / query_net_norm
         query_delta = vector_rotation_generators(model.query, query_target)
-    optimizer_state.query_momentum.mul_(decay).add_(query_delta)
-    if float(optimizer_state.query_momentum.abs().amax().item()) > EPS:
-        model.query = apply_vector_rotation(model.query, optimizer_state.query_momentum, primary_query_learning_rate)
+        model.query = apply_vector_rotation(model.query, query_delta, primary_query_learning_rate)
 
     past_query_net = past_query_positive_sum - negative_scale * past_query_negative_sum
     if model.past_queries.shape[0] > 0:
-        past_query_delta = torch.zeros_like(optimizer_state.past_query_momentum[: model.past_queries.shape[0]])
+        past_query_delta = torch.zeros((model.past_queries.shape[0], n, n), device=model.device, dtype=base.dtype)
         past_query_net_norm = past_query_net.norm(dim=1)
         past_query_active = past_query_net_norm > EPS
         if past_query_active.any():
             target_dirs = past_query_net[past_query_active] / past_query_net_norm[past_query_active].unsqueeze(1)
             past_query_delta[past_query_active] = vector_rotation_generators(model.past_queries[past_query_active], target_dirs)
-        optimizer_state.past_query_momentum[: model.past_queries.shape[0]].mul_(decay).add_(past_query_delta)
-        past_hist_active = optimizer_state.past_query_momentum[: model.past_queries.shape[0]].abs().amax(dim=(1, 2)) > EPS
-        if past_hist_active.any():
-            model.past_queries[past_hist_active] = apply_vector_rotation(
-                model.past_queries[past_hist_active],
-                optimizer_state.past_query_momentum[: model.past_queries.shape[0]][past_hist_active],
+            model.past_queries[past_query_active] = apply_vector_rotation(
+                model.past_queries[past_query_active],
+                past_query_delta[past_query_active],
                 secondary_query_learning_rate,
             )
 
     unembed_net = unembed_positive_sum - negative_scale * unembed_negative_sum
-    unembed_delta = torch.zeros_like(optimizer_state.unembed_momentum)
+    unembed_delta = torch.zeros((model.vocab_size, n, n), device=model.device, dtype=base.dtype)
     unembed_net_norm = unembed_net.norm(dim=1)
     unembed_active = unembed_net_norm > EPS
     if unembed_active.any():
         target_dirs = unembed_net[unembed_active] / unembed_net_norm[unembed_active].unsqueeze(1)
         unembed_delta[unembed_active] = vector_rotation_generators(model.unembed_vectors[unembed_active], target_dirs)
-    optimizer_state.unembed_momentum.mul_(decay).add_(unembed_delta)
-    unembed_hist_active = optimizer_state.unembed_momentum.abs().amax(dim=(1, 2)) > EPS
-    if unembed_hist_active.any():
-        model.unembed_vectors[unembed_hist_active] = apply_vector_rotation(
-            model.unembed_vectors[unembed_hist_active],
-            optimizer_state.unembed_momentum[unembed_hist_active],
+        model.unembed_vectors[unembed_active] = apply_vector_rotation(
+            model.unembed_vectors[unembed_active],
+            unembed_delta[unembed_active],
             primary_unembed_learning_rate,
         )
 
     past_unembed_net = past_unembed_positive_sum - negative_scale * past_unembed_negative_sum
-    past_unembed_delta = torch.zeros_like(optimizer_state.past_unembed_momentum)
+    past_unembed_delta = torch.zeros((model.vocab_size, n, n), device=model.device, dtype=base.dtype)
     past_unembed_net_norm = past_unembed_net.norm(dim=1)
     past_unembed_active = past_unembed_net_norm > EPS
     if past_unembed_active.any():
@@ -800,12 +823,9 @@ def apply_batch_update(
             model.past_unembed_vectors[past_unembed_active],
             target_dirs,
         )
-    optimizer_state.past_unembed_momentum.mul_(decay).add_(past_unembed_delta)
-    past_unembed_hist_active = optimizer_state.past_unembed_momentum.abs().amax(dim=(1, 2)) > EPS
-    if past_unembed_hist_active.any():
-        model.past_unembed_vectors[past_unembed_hist_active] = apply_vector_rotation(
-            model.past_unembed_vectors[past_unembed_hist_active],
-            optimizer_state.past_unembed_momentum[past_unembed_hist_active],
+        model.past_unembed_vectors[past_unembed_active] = apply_vector_rotation(
+            model.past_unembed_vectors[past_unembed_active],
+            past_unembed_delta[past_unembed_active],
             secondary_unembed_learning_rate,
         )
 
@@ -911,7 +931,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--primary-unembed-learning-rate", type=float, default=0.001, help="Step size for primary next-token unembedding vectors")
     p.add_argument("--secondary-query-learning-rate", type=float, default=0.001, help="Step size for secondary past-token query vectors")
     p.add_argument("--secondary-unembed-learning-rate", type=float, default=0.001, help="Step size for secondary past-token unembedding vectors")
-    p.add_argument("--momentum-decay", type=float, default=0.99, help="Exponential decay for rotation momentum buffers")
+    p.add_argument("--momentum-decay", type=float, default=0.9, help="EMA decay for primary matrix momentum buffers")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)

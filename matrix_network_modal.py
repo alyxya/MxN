@@ -84,7 +84,7 @@ def parse_modal_args() -> argparse.Namespace:
     p.add_argument("--primary-unembed-learning-rate", type=float, default=0.001, help="Step size for primary next-token unembedding vectors")
     p.add_argument("--secondary-query-learning-rate", type=float, default=0.001, help="Step size for secondary past-token query vectors")
     p.add_argument("--secondary-unembed-learning-rate", type=float, default=0.001, help="Step size for secondary past-token unembedding vectors")
-    p.add_argument("--momentum-decay", type=float, default=0.99, help="Exponential decay for rotation momentum buffers")
+    p.add_argument("--momentum-decay", type=float, default=0.9, help="EMA decay for primary matrix momentum buffers")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
