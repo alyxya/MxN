@@ -738,7 +738,7 @@ def apply_batch_update(
                 query_vec=model.past_queries[query_index],
                 unembed_bank=model.past_unembed_vectors,
                 objective_target_id=past_target_id,
-                matrix_weight=secondary_matrix_scale,
+                matrix_weight=1.0,
                 vector_weight=1.0,
                 query_index=query_index,
                 unembed_positive_acc=past_unembed_positive_sum,
@@ -751,7 +751,7 @@ def apply_batch_update(
                 base_delta_acc=None,
                 prefix_ids=prefix_ids,
             )
-            secondary_objective_weight += secondary_matrix_scale
+            secondary_objective_weight += 1.0
 
     primary_scale = 1.0 / float(max(primary_objective_weight, 1.0))
     secondary_scale = 1.0 / float(max(secondary_objective_weight, 1.0))
@@ -796,7 +796,7 @@ def apply_batch_update(
     if left_secondary_active.any():
         model.left_token_mats[left_secondary_active] = apply_matrix_rotation(
             model.left_token_mats[left_secondary_active],
-            left_secondary_delta[left_secondary_active] * secondary_scale,
+            left_secondary_delta[left_secondary_active] * (secondary_scale * secondary_matrix_scale),
             token_learning_rate,
             update_orthogonalize_steps,
         )
@@ -805,7 +805,7 @@ def apply_batch_update(
     if right_secondary_active.any():
         model.right_token_mats[right_secondary_active] = apply_matrix_rotation(
             model.right_token_mats[right_secondary_active],
-            right_secondary_delta[right_secondary_active] * secondary_scale,
+            right_secondary_delta[right_secondary_active] * (secondary_scale * secondary_matrix_scale),
             token_learning_rate,
             update_orthogonalize_steps,
         )
