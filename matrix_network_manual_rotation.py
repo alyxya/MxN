@@ -691,8 +691,8 @@ def apply_batch_update(
     model: ManualRotationMatrixNetwork,
     optimizer_state: ManualRotationOptimizerState,
     workspace: BatchUpdateWorkspace,
-    prefixes: Sequence[Sequence[int]],
-    target_ids: Sequence[int],
+    sequences: Sequence[Sequence[int]],
+    prompt_lens: Sequence[int],
     token_learning_rate: float,
     base_learning_rate: float,
     primary_query_learning_rate: float,
@@ -704,7 +704,7 @@ def apply_batch_update(
     update_orthogonalize_steps: int,
 ) -> Tuple[float, float]:
     n = model.n
-    max_lag = max((len(prefix_ids) for prefix_ids in prefixes), default=0)
+    max_lag = max((len(full_ids) - 1 for full_ids in sequences), default=0)
     model.ensure_past_queries(max_lag)
     workspace.prepare(model)
     base_primary_delta = workspace.base_primary_delta
@@ -729,17 +729,11 @@ def apply_batch_update(
     base = model.base_mat
     base_t = base.transpose(-1, -2)
     eye = cached_eye(n, model.device, base.dtype)
-    prefix_cache_map: Dict[Tuple[int, ...], PrefixOperatorCache] = {}
 
-    def build_prefix_cache(prefix_ids: Sequence[int]) -> PrefixOperatorCache:
-        prefix_key = tuple(prefix_ids)
-        cached = prefix_cache_map.get(prefix_key)
-        if cached is not None:
-            return cached
-
+    def extend_prefix_cache(parent_cache: PrefixOperatorCache | None, token_id: int) -> PrefixOperatorCache:
+        prefix_key = (token_id,) if parent_cache is None else (*parent_cache.prefix_ids, token_id)
         prefix_len = len(prefix_key)
-        last_tid = prefix_key[-1]
-        parent_cache = build_prefix_cache(prefix_key[:-1]) if prefix_len > 1 else None
+        last_tid = token_id
 
         if model.uses_right_token_mats():
             right_mat = model.right_token_mats[last_tid]
@@ -793,7 +787,7 @@ def apply_batch_update(
         primary_query_targets = normalize_last_dim(model.unembed_vectors @ query_target_op.transpose(-1, -2))
         secondary_query_targets = normalize_last_dim(model.past_unembed_vectors @ query_target_op.transpose(-1, -2))
 
-        cached = PrefixOperatorCache(
+        return PrefixOperatorCache(
             prefix_ids=prefix_key,
             reversed_prefix_ids=torch.tensor(prefix_key[::-1], device=model.device, dtype=torch.long),
             right_total_op=right_total_op,
@@ -810,8 +804,6 @@ def apply_batch_update(
             primary_query_targets=primary_query_targets,
             secondary_query_targets=secondary_query_targets,
         )
-        prefix_cache_map[prefix_key] = cached
-        return cached
 
     def accumulate_query_vector_updates(
         cache: PrefixOperatorCache,
@@ -956,34 +948,37 @@ def apply_batch_update(
                 v = normalize_columns(cache.right_v_prefix_ops[idx] @ base_query_targets[:, :active_end])
                 right_secondary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0))
 
-    for prefix_ids, target_id in zip(prefixes, target_ids):
-        cache = build_prefix_cache(prefix_ids)
-        if target_id >= 0:
-            score, is_correct = accumulate_objective(
-                cache=cache,
-                query_vec=model.query,
-                unembed_bank=model.unembed_vectors,
-                query_target_bank=cache.primary_query_targets,
-                objective_target_id=target_id,
-                matrix_weight=1.0,
-                vector_weight=1.0,
-                query_index=None,
-                unembed_positive_acc=unembed_positive_sum,
-                unembed_negative_acc=unembed_negative_sum,
-                use_output_slice=True,
-                min_update_index=0,
-                allow_base_update=True,
-                left_delta_acc=left_primary_delta,
-                right_delta_acc=right_primary_delta,
-                base_delta_acc=base_primary_delta,
-            )
-            primary_objective_weight += 1.0
-            mean_target_score += score
-            correct += int(is_correct)
-            total += 1
+    for full_ids, prompt_len in zip(sequences, prompt_lens):
+        cache: PrefixOperatorCache | None = None
+        for prefix_len in range(1, len(full_ids)):
+            cache = extend_prefix_cache(cache, full_ids[prefix_len - 1])
+            target_id = full_ids[prefix_len] if prefix_len >= prompt_len else -1
+            if target_id >= 0:
+                score, is_correct = accumulate_objective(
+                    cache=cache,
+                    query_vec=model.query,
+                    unembed_bank=model.unembed_vectors,
+                    query_target_bank=cache.primary_query_targets,
+                    objective_target_id=target_id,
+                    matrix_weight=1.0,
+                    vector_weight=1.0,
+                    query_index=None,
+                    unembed_positive_acc=unembed_positive_sum,
+                    unembed_negative_acc=unembed_negative_sum,
+                    use_output_slice=True,
+                    min_update_index=0,
+                    allow_base_update=True,
+                    left_delta_acc=left_primary_delta,
+                    right_delta_acc=right_primary_delta,
+                    base_delta_acc=base_primary_delta,
+                )
+                primary_objective_weight += 1.0
+                mean_target_score += score
+                correct += int(is_correct)
+                total += 1
 
-        accumulate_secondary_objectives(cache)
-        secondary_objective_weight += float(len(prefix_ids))
+            accumulate_secondary_objectives(cache)
+            secondary_objective_weight += float(prefix_len)
 
     primary_scale = 1.0 / float(max(primary_objective_weight, 1.0))
     secondary_scale = 1.0 / float(max(secondary_objective_weight, 1.0))
@@ -1130,8 +1125,8 @@ def train(
     eos_id = model.stoi[EOS_TOKEN]
 
     def sample_batch() -> Tuple[List[List[int]], List[int]]:
-        prefixes: List[List[int]] = []
-        target_ids: List[int] = []
+        sequences: List[List[int]] = []
+        prompt_lens: List[int] = []
 
         for _ in range(batch_size):
             prompt_ids, target_seq_ids = random_problem_ids(
@@ -1143,25 +1138,19 @@ def train(
                 equals_id=equals_id,
                 eos_id=eos_id,
             )
-            full_ids = prompt_ids + target_seq_ids
-            prompt_len = len(prompt_ids)
-            for prefix_len in range(1, len(full_ids)):
-                prefixes.append(full_ids[:prefix_len])
-                if prefix_len >= prompt_len:
-                    target_ids.append(full_ids[prefix_len])
-                else:
-                    target_ids.append(-1)
+            sequences.append(prompt_ids + target_seq_ids)
+            prompt_lens.append(len(prompt_ids))
 
-        return prefixes, target_ids
+        return sequences, prompt_lens
 
     for iter_idx in range(1, iters + 1):
-        prefixes, target_ids = sample_batch()
+        sequences, prompt_lens = sample_batch()
         mean_target_score, token_acc = apply_batch_update(
             model,
             optimizer_state,
             workspace,
-            prefixes=prefixes,
-            target_ids=target_ids,
+            sequences=sequences,
+            prompt_lens=prompt_lens,
             token_learning_rate=token_learning_rate,
             base_learning_rate=base_learning_rate,
             primary_query_learning_rate=primary_query_learning_rate,
