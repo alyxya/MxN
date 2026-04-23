@@ -514,7 +514,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fixed-train-seed", type=int, default=None, help="Seed used for fixed training set generation (defaults to --seed)")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default="checkpoints/matrix_network.pt", help="Checkpoint path")
-    p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
+    p.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases experiment logging")
     p.add_argument("--wandb-project", type=str, default="matrix-networks", help="W&B project name")
     p.add_argument("--wandb-entity", type=str, default=None, help="W&B entity (team/user)")

@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-samples", type=int, default=300)
     p.add_argument("--fixed-train-size", type=int, default=0)
     p.add_argument("--fixed-train-seed", type=int, default=None)
-    p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
+    p.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--out-dir", type=str, default="checkpoints/base_mode_ablation")
     p.add_argument("--summary-csv", type=str, default=None, help="Defaults to <out-dir>/summary.csv")
     p.add_argument("--dry-run", action="store_true")

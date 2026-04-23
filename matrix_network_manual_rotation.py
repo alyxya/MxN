@@ -922,7 +922,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--update-orthogonalize-steps", type=int, default=1, help="Newton-Schulz orthogonalization steps after each matrix update")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default=None, help="Optional checkpoint path override")
-    p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
+    p.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "mps", "cuda"])
     return p.parse_args()
 
 

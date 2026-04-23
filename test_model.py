@@ -48,7 +48,7 @@ def run_prediction(model, a: int, b: int, addend_digits: int) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Interactive tester for trained matrix-network addition model")
     p.add_argument("--checkpoint", type=str, default="models/dense_identity_n30_d3.pt", help="Path to saved checkpoint")
-    p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
+    p.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--addend-digits", type=int, default=None, help="Override addend width used for prompt formatting")
     p.add_argument("--expr", type=str, default=None, help="Single expression, e.g. '123+456'")
     p.add_argument("--a", type=int, default=None, help="First addend for one-shot run")
