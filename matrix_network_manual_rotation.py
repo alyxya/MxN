@@ -208,6 +208,7 @@ class BatchUpdateWorkspace:
 @dataclass
 class PrefixOperatorCache:
     prefix_ids: Tuple[int, ...]
+    reversed_prefix_ids: torch.Tensor
     right_total_op: torch.Tensor
     right_all_transpose_op: torch.Tensor
     middle_op: torch.Tensor
@@ -257,6 +258,50 @@ def random_problem(rng: random.Random, addend_digits: int, number_base: int) -> 
     )
     target_text = format_in_base(left_addend + right_addend, number_base)
     return left_addend, right_addend, prompt_text, target_text
+
+
+def encode_number_ids(
+    value: int,
+    number_base: int,
+    digit_token_ids: Sequence[int],
+    *,
+    min_digits: int = 1,
+) -> List[int]:
+    if value == 0:
+        out = [digit_token_ids[0]]
+    else:
+        digits: List[int] = []
+        x = value
+        while x > 0:
+            x, rem = divmod(x, number_base)
+            digits.append(digit_token_ids[rem])
+        out = list(reversed(digits))
+    if len(out) < min_digits:
+        out = ([digit_token_ids[0]] * (min_digits - len(out))) + out
+    return out
+
+
+def random_problem_ids(
+    rng: random.Random,
+    *,
+    addend_digits: int,
+    number_base: int,
+    digit_token_ids: Sequence[int],
+    plus_id: int,
+    equals_id: int,
+    eos_id: int,
+) -> Tuple[List[int], List[int]]:
+    max_val = (number_base**addend_digits) - 1
+    left_addend = rng.randint(0, max_val)
+    right_addend = rng.randint(0, max_val)
+    prompt_ids = (
+        encode_number_ids(left_addend, number_base, digit_token_ids, min_digits=addend_digits)
+        + [plus_id]
+        + encode_number_ids(right_addend, number_base, digit_token_ids, min_digits=addend_digits)
+        + [equals_id]
+    )
+    target_ids = encode_number_ids(left_addend + right_addend, number_base, digit_token_ids, min_digits=1) + [eos_id]
+    return prompt_ids, target_ids
 
 
 def pick_device(requested: str) -> torch.device:
@@ -563,16 +608,20 @@ def predict_next_id_from_prefix_operators(
 
 def generate_until_eos(model: ManualRotationMatrixNetwork, prompt_text: str, max_len: int) -> Tuple[str, bool]:
     prefix_ids = model.encode(prompt_text)
-    left_total_op, right_total_op = prefix_operator_pair_from_ids(model, prefix_ids)
-    pred = ""
+    pred_ids, did_stop = generate_ids_until_eos(model, prefix_ids, max_len)
+    return "".join(model.itos[tid] for tid in pred_ids), did_stop
+
+
+def generate_ids_until_eos(model: ManualRotationMatrixNetwork, prompt_ids: Sequence[int], max_len: int) -> Tuple[List[int], bool]:
+    left_total_op, right_total_op = prefix_operator_pair_from_ids(model, prompt_ids)
+    pred_ids: List[int] = []
     for _ in range(max_len):
         next_id = predict_next_id_from_prefix_operators(model, left_total_op, right_total_op)
-        next_ch = model.itos[next_id]
-        if next_ch == EOS_TOKEN:
-            return pred, True
-        pred += next_ch
+        if next_id == model.stoi[EOS_TOKEN]:
+            return pred_ids, True
+        pred_ids.append(next_id)
         left_total_op, right_total_op = advance_prefix_operator_pair(model, left_total_op, right_total_op, next_id)
-    return pred, False
+    return pred_ids, False
 
 
 def evaluate(
@@ -587,21 +636,29 @@ def evaluate(
     tf_correct = 0
     tf_total = 0
     stopped = 0
+    digit_token_ids = [model.stoi[ch] for ch in digit_alphabet(number_base)]
+    plus_id = model.stoi[PLUS_TOKEN]
+    equals_id = model.stoi[EQUALS_TOKEN]
+    eos_id = model.stoi[EOS_TOKEN]
 
     for _ in range(eval_samples):
-        _, _, prompt_text, target_text = random_problem(rng, addend_digits, number_base)
-        pred, did_stop = generate_until_eos(model, prompt_text, len(target_text) + 2)
+        prompt_ids, target_ids = random_problem_ids(
+            rng,
+            addend_digits=addend_digits,
+            number_base=number_base,
+            digit_token_ids=digit_token_ids,
+            plus_id=plus_id,
+            equals_id=equals_id,
+            eos_id=eos_id,
+        )
+        pred_ids, did_stop = generate_ids_until_eos(model, prompt_ids, len(target_ids) + 1)
         stopped += int(did_stop)
-        if did_stop and pred == target_text:
+        if did_stop and pred_ids == target_ids[:-1]:
             exact += 1
 
-        target_seq = target_text + EOS_TOKEN
-        prompt_ids = model.encode(prompt_text)
-        target_ids = model.encode(target_seq)
         left_total_op, right_total_op = prefix_operator_pair_from_ids(model, prompt_ids)
-        for i, ch in enumerate(target_seq):
+        for target_id in target_ids:
             pred_id = predict_next_id_from_prefix_operators(model, left_total_op, right_total_op)
-            target_id = target_ids[i]
             tf_correct += int(pred_id == target_id)
             tf_total += 1
             left_total_op, right_total_op = advance_prefix_operator_pair(model, left_total_op, right_total_op, target_id)
@@ -738,6 +795,7 @@ def apply_batch_update(
 
         cached = PrefixOperatorCache(
             prefix_ids=prefix_key,
+            reversed_prefix_ids=torch.tensor(prefix_key[::-1], device=model.device, dtype=torch.long),
             right_total_op=right_total_op,
             right_all_transpose_op=right_all_transpose_op,
             middle_op=middle_op,
@@ -852,6 +910,52 @@ def apply_batch_update(
             predicted = int(scores.argmax().item())
         return float(scores[objective_target_id].item()), predicted == objective_target_id
 
+    def accumulate_secondary_objectives(cache: PrefixOperatorCache) -> None:
+        prefix_len = len(cache.prefix_ids)
+        if prefix_len == 0:
+            return
+
+        query_bank = model.past_queries[:prefix_len]
+        query_mats = query_bank.transpose(0, 1)
+        middle_states = cache.middle_op @ query_mats
+        state_mats = cache.final_state_op @ query_mats
+        state_normed = normalize_columns(state_mats)
+        scores = model.past_unembed_vectors @ state_normed
+        target_ids_tensor = cache.reversed_prefix_ids
+        lag_indices = torch.arange(prefix_len, device=model.device)
+
+        past_unembed_positive_sum.index_add_(0, target_ids_tensor, state_normed.transpose(0, 1))
+        past_query_positive_sum[:prefix_len].add_(cache.secondary_query_targets[target_ids_tensor])
+
+        target_scores = scores[target_ids_tensor, lag_indices]
+        hard_negative_mask = scores > target_scores.unsqueeze(0)
+        hard_negative_mask[target_ids_tensor, lag_indices] = False
+        neg_pairs = hard_negative_mask.transpose(0, 1).nonzero(as_tuple=False)
+        if neg_pairs.numel() > 0:
+            neg_lag_indices = neg_pairs[:, 0]
+            neg_wrong_ids = neg_pairs[:, 1]
+            neg_states = state_normed.transpose(0, 1)[neg_lag_indices]
+            past_unembed_negative_sum.index_add_(0, neg_wrong_ids, neg_states)
+            past_query_negative_sum.index_add_(0, neg_lag_indices, cache.secondary_query_targets[neg_wrong_ids])
+
+        target_mats = model.past_unembed_vectors[target_ids_tensor].transpose(0, 1)
+        base_query_targets = cache.base_query_target_op @ target_mats
+
+        if model.uses_left_token_mats():
+            for idx in range(prefix_len - 1, -1, -1):
+                tid = cache.prefix_ids[idx]
+                active_end = idx + 1
+                u = normalize_columns(cache.left_u_ops[idx] @ middle_states[:, :active_end])
+                v = normalize_columns(cache.left_target_ops[idx] @ target_mats[:, :active_end])
+                left_secondary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0))
+
+        if model.uses_right_token_mats():
+            for idx, tid in enumerate(cache.prefix_ids):
+                active_end = idx + 1
+                u = normalize_columns(cache.right_u_ops[idx] @ query_mats[:, :active_end])
+                v = normalize_columns(cache.right_v_prefix_ops[idx] @ base_query_targets[:, :active_end])
+                right_secondary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0))
+
     for prefix_ids, target_id in zip(prefixes, target_ids):
         cache = build_prefix_cache(prefix_ids)
         if target_id >= 0:
@@ -878,28 +982,8 @@ def apply_batch_update(
             correct += int(is_correct)
             total += 1
 
-        for lag in range(1, len(prefix_ids) + 1):
-            query_index = lag - 1
-            past_target_id = prefix_ids[-lag]
-            accumulate_objective(
-                cache=cache,
-                query_vec=model.past_queries[query_index],
-                unembed_bank=model.past_unembed_vectors,
-                query_target_bank=cache.secondary_query_targets,
-                objective_target_id=past_target_id,
-                matrix_weight=1.0,
-                vector_weight=1.0,
-                query_index=query_index,
-                unembed_positive_acc=past_unembed_positive_sum,
-                unembed_negative_acc=past_unembed_negative_sum,
-                use_output_slice=False,
-                min_update_index=query_index,
-                allow_base_update=False,
-                left_delta_acc=left_secondary_delta,
-                right_delta_acc=right_secondary_delta,
-                base_delta_acc=None,
-            )
-            secondary_objective_weight += 1.0
+        accumulate_secondary_objectives(cache)
+        secondary_objective_weight += float(len(prefix_ids))
 
     primary_scale = 1.0 / float(max(primary_objective_weight, 1.0))
     secondary_scale = 1.0 / float(max(secondary_objective_weight, 1.0))
@@ -1040,17 +1124,28 @@ def train(
 ) -> Tuple[ManualRotationMatrixNetwork, ManualRotationOptimizerState]:
     rng = random.Random(seed)
     workspace = BatchUpdateWorkspace()
+    digit_token_ids = [model.stoi[ch] for ch in digit_alphabet(number_base)]
+    plus_id = model.stoi[PLUS_TOKEN]
+    equals_id = model.stoi[EQUALS_TOKEN]
+    eos_id = model.stoi[EOS_TOKEN]
 
     def sample_batch() -> Tuple[List[List[int]], List[int]]:
         prefixes: List[List[int]] = []
         target_ids: List[int] = []
 
         for _ in range(batch_size):
-            _, _, prompt_text, target_text = random_problem(rng, addend_digits, number_base)
-            full_seq = prompt_text + target_text + EOS_TOKEN
-            prompt_len = len(prompt_text)
-            full_ids = model.encode(full_seq)
-            for prefix_len in range(1, len(full_seq)):
+            prompt_ids, target_seq_ids = random_problem_ids(
+                rng,
+                addend_digits=addend_digits,
+                number_base=number_base,
+                digit_token_ids=digit_token_ids,
+                plus_id=plus_id,
+                equals_id=equals_id,
+                eos_id=eos_id,
+            )
+            full_ids = prompt_ids + target_seq_ids
+            prompt_len = len(prompt_ids)
+            for prefix_len in range(1, len(full_ids)):
                 prefixes.append(full_ids[:prefix_len])
                 if prefix_len >= prompt_len:
                     target_ids.append(full_ids[prefix_len])
