@@ -4,7 +4,7 @@ import random
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 import torch
 
@@ -17,6 +17,7 @@ EPS = 1e-12
 Problem = Tuple[int, int, str, str]
 INIT_ORTHOGONALIZE_STEPS = 4
 DEFAULT_UPDATE_ORTHOGONALIZE_STEPS = 1
+_EYE_CACHE: Dict[Tuple[int, str, int | None, torch.dtype], torch.Tensor] = {}
 
 
 def normalize_columns(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
@@ -27,10 +28,17 @@ def normalize_last_dim(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
     return x / (x.norm(dim=-1, keepdim=True) + eps)
 
 
-def matrix_rotation_generator(u: torch.Tensor, v: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    weighted_v = v * weights.unsqueeze(0)
-    weighted_u = u * weights.unsqueeze(0)
-    return weighted_v @ u.transpose(-1, -2) - weighted_u @ v.transpose(-1, -2)
+def cached_eye(n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = (n, device.type, device.index, dtype)
+    eye = _EYE_CACHE.get(key)
+    if eye is None:
+        eye = torch.eye(n, device=device, dtype=dtype)
+        _EYE_CACHE[key] = eye
+    return eye
+
+
+def matrix_rotation_generator(u: torch.Tensor, v: torch.Tensor, weight: float) -> torch.Tensor:
+    return (v @ u.transpose(-1, -2) - u @ v.transpose(-1, -2)) * weight
 
 
 def vector_rotation_generators(current: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -53,7 +61,7 @@ def apply_matrix_rotation(
     learning_rate: float,
     orthogonalize_steps_count: int,
 ) -> torch.Tensor:
-    eye = torch.eye(current.shape[-1], device=current.device, dtype=current.dtype)
+    eye = cached_eye(current.shape[-1], current.device, current.dtype)
     if current.ndim == 2:
         updated = (eye + learning_rate * momentum_generator) @ current
     else:
@@ -62,7 +70,7 @@ def apply_matrix_rotation(
 
 
 def apply_vector_rotation(current: torch.Tensor, momentum_generator: torch.Tensor, learning_rate: float) -> torch.Tensor:
-    eye = torch.eye(current.shape[-1], device=current.device, dtype=current.dtype)
+    eye = cached_eye(current.shape[-1], current.device, current.dtype)
     if current.ndim == 1:
         updated = (eye + learning_rate * momentum_generator) @ current
     else:
@@ -72,7 +80,7 @@ def apply_vector_rotation(current: torch.Tensor, momentum_generator: torch.Tenso
 
 def initialize_rotation_like(shape: Tuple[int, ...], device: torch.device, strength: float) -> torch.Tensor:
     n = shape[-1]
-    eye = torch.eye(n, device=device)
+    eye = cached_eye(n, device, torch.float32)
     if len(shape) > 2:
         eye = eye.expand(*shape[:-2], n, n).clone()
     noise = torch.randn(shape, device=device) / (n**0.5)
@@ -97,17 +105,12 @@ class ManualRotationOptimizerState:
     base_momentum: torch.Tensor | None = None
     left_token_momentum: torch.Tensor | None = None
     right_token_momentum: torch.Tensor | None = None
-    query_momentum: torch.Tensor | None = None
-    past_query_momentum: torch.Tensor | None = None
-    unembed_momentum: torch.Tensor | None = None
-    past_unembed_momentum: torch.Tensor | None = None
 
     def ensure_initialized(self, model: "ManualRotationMatrixNetwork") -> None:
         dtype = model.base_mat.dtype
         device = model.device
         n = model.n
         vocab_size = model.vocab_size
-        past_count = model.past_queries.shape[0]
 
         if self.base_momentum is None or self.base_momentum.shape != (n, n):
             self.base_momentum = _zeros_like_shape((n, n), device=device, dtype=dtype)
@@ -115,28 +118,10 @@ class ManualRotationOptimizerState:
             self.left_token_momentum = _zeros_like_shape((vocab_size, n, n), device=device, dtype=dtype)
         if self.right_token_momentum is None or self.right_token_momentum.shape != (vocab_size, n, n):
             self.right_token_momentum = _zeros_like_shape((vocab_size, n, n), device=device, dtype=dtype)
-        if self.query_momentum is None or self.query_momentum.shape != (n, n):
-            self.query_momentum = _zeros_like_shape((n, n), device=device, dtype=dtype)
-        if self.unembed_momentum is None or self.unembed_momentum.shape != (vocab_size, n, n):
-            self.unembed_momentum = _zeros_like_shape((vocab_size, n, n), device=device, dtype=dtype)
-        if self.past_unembed_momentum is None or self.past_unembed_momentum.shape != (vocab_size, n, n):
-            self.past_unembed_momentum = _zeros_like_shape((vocab_size, n, n), device=device, dtype=dtype)
-        if self.past_query_momentum is None:
-            self.past_query_momentum = _zeros_like_shape((past_count, n, n), device=device, dtype=dtype)
-        elif self.past_query_momentum.shape[1:] != (n, n):
-            self.past_query_momentum = _zeros_like_shape((past_count, n, n), device=device, dtype=dtype)
-        elif self.past_query_momentum.shape[0] < past_count:
-            extra = _zeros_like_shape((past_count - self.past_query_momentum.shape[0], n, n), device=device, dtype=dtype)
-            self.past_query_momentum = torch.cat([self.past_query_momentum.to(device=device, dtype=dtype), extra], dim=0)
-        else:
-            self.past_query_momentum = self.past_query_momentum.to(device=device, dtype=dtype)
 
         self.base_momentum = self.base_momentum.to(device=device, dtype=dtype)
         self.left_token_momentum = self.left_token_momentum.to(device=device, dtype=dtype)
         self.right_token_momentum = self.right_token_momentum.to(device=device, dtype=dtype)
-        self.query_momentum = self.query_momentum.to(device=device, dtype=dtype)
-        self.unembed_momentum = self.unembed_momentum.to(device=device, dtype=dtype)
-        self.past_unembed_momentum = self.past_unembed_momentum.to(device=device, dtype=dtype)
 
     def state_dict(self) -> Dict[str, torch.Tensor | float]:
         result: Dict[str, torch.Tensor | float] = {"momentum_decay": float(self.momentum_decay)}
@@ -146,14 +131,6 @@ class ManualRotationOptimizerState:
             result["left_token_momentum"] = self.left_token_momentum
         if self.right_token_momentum is not None:
             result["right_token_momentum"] = self.right_token_momentum
-        if self.query_momentum is not None:
-            result["query_momentum"] = self.query_momentum
-        if self.past_query_momentum is not None:
-            result["past_query_momentum"] = self.past_query_momentum
-        if self.unembed_momentum is not None:
-            result["unembed_momentum"] = self.unembed_momentum
-        if self.past_unembed_momentum is not None:
-            result["past_unembed_momentum"] = self.past_unembed_momentum
         return result
 
     @classmethod
@@ -168,19 +145,79 @@ class ManualRotationOptimizerState:
         if not state_dict:
             return state
         state.momentum_decay = float(state_dict.get("momentum_decay", momentum_decay))
-        for attr in (
-            "base_momentum",
-            "left_token_momentum",
-            "right_token_momentum",
-            "query_momentum",
-            "past_query_momentum",
-            "unembed_momentum",
-            "past_unembed_momentum",
-        ):
+        for attr in ("base_momentum", "left_token_momentum", "right_token_momentum"):
             value = state_dict.get(attr)
             if isinstance(value, torch.Tensor):
                 setattr(state, attr, value.to(device))
         return state
+
+
+@dataclass
+class BatchUpdateWorkspace:
+    base_primary_delta: torch.Tensor | None = None
+    left_primary_delta: torch.Tensor | None = None
+    right_primary_delta: torch.Tensor | None = None
+    left_secondary_delta: torch.Tensor | None = None
+    right_secondary_delta: torch.Tensor | None = None
+    query_positive_sum: torch.Tensor | None = None
+    query_negative_sum: torch.Tensor | None = None
+    past_query_positive_sum: torch.Tensor | None = None
+    past_query_negative_sum: torch.Tensor | None = None
+    unembed_positive_sum: torch.Tensor | None = None
+    unembed_negative_sum: torch.Tensor | None = None
+    past_unembed_positive_sum: torch.Tensor | None = None
+    past_unembed_negative_sum: torch.Tensor | None = None
+    past_query_delta: torch.Tensor | None = None
+    unembed_delta: torch.Tensor | None = None
+    past_unembed_delta: torch.Tensor | None = None
+
+    def prepare(self, model: "ManualRotationMatrixNetwork") -> None:
+        dtype = model.base_mat.dtype
+        device = model.device
+        n = model.n
+        vocab_size = model.vocab_size
+        past_count = model.past_queries.shape[0]
+
+        def ensure_zero(name: str, shape: Tuple[int, ...]) -> torch.Tensor:
+            tensor = getattr(self, name)
+            if tensor is None or tensor.shape != shape or tensor.device != device or tensor.dtype != dtype:
+                tensor = torch.zeros(shape, device=device, dtype=dtype)
+                setattr(self, name, tensor)
+            else:
+                tensor.zero_()
+            return tensor
+
+        ensure_zero("base_primary_delta", (n, n))
+        ensure_zero("left_primary_delta", (vocab_size, n, n))
+        ensure_zero("right_primary_delta", (vocab_size, n, n))
+        ensure_zero("left_secondary_delta", (vocab_size, n, n))
+        ensure_zero("right_secondary_delta", (vocab_size, n, n))
+        ensure_zero("query_positive_sum", (n,))
+        ensure_zero("query_negative_sum", (n,))
+        ensure_zero("past_query_positive_sum", (past_count, n))
+        ensure_zero("past_query_negative_sum", (past_count, n))
+        ensure_zero("unembed_positive_sum", (vocab_size, n))
+        ensure_zero("unembed_negative_sum", (vocab_size, n))
+        ensure_zero("past_unembed_positive_sum", (vocab_size, n))
+        ensure_zero("past_unembed_negative_sum", (vocab_size, n))
+        ensure_zero("past_query_delta", (past_count, n, n))
+        ensure_zero("unembed_delta", (vocab_size, n, n))
+        ensure_zero("past_unembed_delta", (vocab_size, n, n))
+
+
+@dataclass
+class PrefixOperatorCache:
+    prefix_ids: Tuple[int, ...]
+    middle_op: torch.Tensor
+    final_state_op: torch.Tensor
+    left_u_ops: torch.Tensor
+    left_target_ops: torch.Tensor
+    left_all_transpose_op: torch.Tensor
+    right_u_ops: torch.Tensor
+    right_v_prefix_ops: torch.Tensor
+    base_query_target_op: torch.Tensor
+    primary_query_targets: torch.Tensor
+    secondary_query_targets: torch.Tensor
 
 
 def digit_alphabet(number_base: int) -> str:
@@ -363,7 +400,7 @@ def load_training_checkpoint(
     device: torch.device,
     *,
     momentum_decay: float,
-) -> Tuple[ManualRotationMatrixNetwork, int | None, ManualRotationOptimizerState]:
+) -> Tuple[ManualRotationMatrixNetwork, int | None, ManualRotationOptimizerState, int]:
     ckpt = load_checkpoint_dict(path, device)
     model, addend_digits = ManualRotationMatrixNetwork.from_checkpoint_dict(ckpt, device)
     optimizer_state = ManualRotationOptimizerState.from_state_dict(
@@ -372,7 +409,8 @@ def load_training_checkpoint(
         device=device,
     )
     optimizer_state.ensure_initialized(model)
-    return model, addend_digits, optimizer_state
+    completed_iters = int(ckpt.get("completed_iters") or 0)
+    return model, addend_digits, optimizer_state, completed_iters
 
 
 def save_checkpoint(
@@ -382,30 +420,37 @@ def save_checkpoint(
     *,
     optimizer_state: ManualRotationOptimizerState | None = None,
     update_orthogonalize_steps: int = DEFAULT_UPDATE_ORTHOGONALIZE_STEPS,
+    completed_iters: int | None = None,
 ) -> None:
     path = Path(save_path)
     if path.parent:
         path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "n": model.n,
+        "number_base": model.number_base,
+        "vocab": model.vocab,
+        "output_vocab": model.output_vocab,
+        "token_mat_mode": model.token_mat_mode,
+        "left_token_mats": model.left_token_mats,
+        "right_token_mats": model.right_token_mats,
+        "base_mat": model.base_mat,
+        "query": model.query,
+        "past_queries": model.past_queries,
+        "unembed_vectors": model.unembed_vectors,
+        "past_unembed_vectors": model.past_unembed_vectors,
+        "addend_digits": addend_digits,
+        "optimizer_state": None if optimizer_state is None else optimizer_state.state_dict(),
+        "update_orthogonalize_steps": int(update_orthogonalize_steps),
+        "completed_iters": None if completed_iters is None else int(completed_iters),
+    }
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "n": model.n,
-            "number_base": model.number_base,
-            "vocab": model.vocab,
-            "output_vocab": model.output_vocab,
-            "token_mat_mode": model.token_mat_mode,
-            "left_token_mats": model.left_token_mats,
-            "right_token_mats": model.right_token_mats,
-            "base_mat": model.base_mat,
-            "query": model.query,
-            "past_queries": model.past_queries,
-            "unembed_vectors": model.unembed_vectors,
-            "past_unembed_vectors": model.past_unembed_vectors,
-            "addend_digits": addend_digits,
-            "optimizer_state": None if optimizer_state is None else optimizer_state.state_dict(),
-            "update_orthogonalize_steps": int(update_orthogonalize_steps),
+            **payload,
         },
-        path,
+        tmp_path,
     )
+    tmp_path.replace(path)
 
 
 def format_float_token(x: float) -> str:
@@ -432,6 +477,7 @@ def format_run_config(args: argparse.Namespace, *, addend_digits: int) -> str:
         ("negative_scale", args.negative_scale),
         ("secondary_matrix_scale", args.secondary_matrix_scale),
         ("update_orthogonalize_steps", args.update_orthogonalize_steps),
+        ("checkpoint_every", getattr(args, "checkpoint_every", 0)),
         ("seed", args.seed),
         ("device", args.device),
         ("load_path", args.load_path),
@@ -530,6 +576,7 @@ def show_samples(
 def apply_batch_update(
     model: ManualRotationMatrixNetwork,
     optimizer_state: ManualRotationOptimizerState,
+    workspace: BatchUpdateWorkspace,
     prefixes: Sequence[Sequence[int]],
     target_ids: Sequence[int],
     token_learning_rate: float,
@@ -543,19 +590,22 @@ def apply_batch_update(
     update_orthogonalize_steps: int,
 ) -> Tuple[float, float]:
     n = model.n
-    base_primary_delta = torch.zeros(n, n, device=model.device)
-    left_primary_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
-    right_primary_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
-    left_secondary_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
-    right_secondary_delta = torch.zeros(model.vocab_size, n, n, device=model.device)
-    query_positive_sum = torch.zeros(n, device=model.device)
-    query_negative_sum = torch.zeros(n, device=model.device)
-    past_query_positive_sum = torch.zeros_like(model.past_queries)
-    past_query_negative_sum = torch.zeros_like(model.past_queries)
-    unembed_positive_sum = torch.zeros(model.vocab_size, n, device=model.device)
-    unembed_negative_sum = torch.zeros(model.vocab_size, n, device=model.device)
-    past_unembed_positive_sum = torch.zeros(model.vocab_size, n, device=model.device)
-    past_unembed_negative_sum = torch.zeros(model.vocab_size, n, device=model.device)
+    max_lag = max((len(prefix_ids) for prefix_ids in prefixes), default=0)
+    model.ensure_past_queries(max_lag)
+    workspace.prepare(model)
+    base_primary_delta = workspace.base_primary_delta
+    left_primary_delta = workspace.left_primary_delta
+    right_primary_delta = workspace.right_primary_delta
+    left_secondary_delta = workspace.left_secondary_delta
+    right_secondary_delta = workspace.right_secondary_delta
+    query_positive_sum = workspace.query_positive_sum
+    query_negative_sum = workspace.query_negative_sum
+    past_query_positive_sum = workspace.past_query_positive_sum
+    past_query_negative_sum = workspace.past_query_negative_sum
+    unembed_positive_sum = workspace.unembed_positive_sum
+    unembed_negative_sum = workspace.unembed_negative_sum
+    past_unembed_positive_sum = workspace.past_unembed_positive_sum
+    past_unembed_negative_sum = workspace.past_unembed_negative_sum
     correct = 0
     total = 0
     primary_objective_weight = 0.0
@@ -563,55 +613,118 @@ def apply_batch_update(
     mean_target_score = 0.0
 
     base = model.base_mat
+    base_t = base.transpose(-1, -2)
+    eye = cached_eye(n, model.device, base.dtype)
+    prefix_cache_map: Dict[Tuple[int, ...], PrefixOperatorCache] = {}
 
-    def query_target_from_unembed(target_vec: torch.Tensor, prefix_ids: Sequence[int]) -> torch.Tensor:
-        target_col = target_vec.unsqueeze(1)
-        if model.uses_left_token_mats():
-            for idx in range(len(prefix_ids) - 1, -1, -1):
-                target_col = model.left_token_mats[prefix_ids[idx]].transpose(-1, -2) @ target_col
-        target_col = base.transpose(-1, -2) @ target_col
+    def build_prefix_cache(prefix_ids: Sequence[int]) -> PrefixOperatorCache:
+        prefix_key = tuple(prefix_ids)
+        cached = prefix_cache_map.get(prefix_key)
+        if cached is not None:
+            return cached
+
+        prefix_len = len(prefix_key)
         if model.uses_right_token_mats():
-            for tid in prefix_ids:
-                target_col = model.right_token_mats[tid].transpose(-1, -2) @ target_col
-        return normalize_columns(target_col)[:, 0]
+            right_u_ops = torch.empty((prefix_len, n, n), device=model.device, dtype=base.dtype)
+            right_v_prefix_ops = torch.empty((prefix_len, n, n), device=model.device, dtype=base.dtype)
+            suffix_op = eye
+            for idx in range(prefix_len - 1, -1, -1):
+                suffix_op = model.right_token_mats[prefix_key[idx]] @ suffix_op
+                right_u_ops[idx] = suffix_op
+            right_total_op = suffix_op
+            prefix_transpose_op = eye
+            for idx, tid in enumerate(prefix_key):
+                right_v_prefix_ops[idx] = prefix_transpose_op
+                prefix_transpose_op = model.right_token_mats[tid].transpose(-1, -2) @ prefix_transpose_op
+        else:
+            right_u_ops = torch.empty((0, n, n), device=model.device, dtype=base.dtype)
+            right_v_prefix_ops = torch.empty((0, n, n), device=model.device, dtype=base.dtype)
+            right_total_op = eye
+            prefix_transpose_op = eye
+
+        middle_op = base @ right_total_op
+
+        if model.uses_left_token_mats():
+            left_u_ops = torch.empty((prefix_len, n, n), device=model.device, dtype=base.dtype)
+            left_target_ops = torch.empty((prefix_len, n, n), device=model.device, dtype=base.dtype)
+            prefix_op = eye
+            for idx, tid in enumerate(prefix_key):
+                prefix_op = model.left_token_mats[tid] @ prefix_op
+                left_u_ops[idx] = prefix_op
+            left_total_op = prefix_op
+
+            suffix_transpose_op = eye
+            for idx in range(prefix_len - 1, -1, -1):
+                left_target_ops[idx] = suffix_transpose_op
+                suffix_transpose_op = model.left_token_mats[prefix_key[idx]].transpose(-1, -2) @ suffix_transpose_op
+            left_all_transpose_op = suffix_transpose_op
+        else:
+            left_u_ops = torch.empty((0, n, n), device=model.device, dtype=base.dtype)
+            left_target_ops = torch.empty((0, n, n), device=model.device, dtype=base.dtype)
+            left_total_op = eye
+            left_all_transpose_op = eye
+
+        final_state_op = left_total_op @ middle_op
+        base_query_target_op = base_t @ left_all_transpose_op
+        query_target_op = prefix_transpose_op @ base_query_target_op
+        primary_query_targets = normalize_last_dim(model.unembed_vectors @ query_target_op.transpose(-1, -2))
+        secondary_query_targets = normalize_last_dim(model.past_unembed_vectors @ query_target_op.transpose(-1, -2))
+
+        cached = PrefixOperatorCache(
+            prefix_ids=prefix_key,
+            middle_op=middle_op,
+            final_state_op=final_state_op,
+            left_u_ops=left_u_ops,
+            left_target_ops=left_target_ops,
+            left_all_transpose_op=left_all_transpose_op,
+            right_u_ops=right_u_ops,
+            right_v_prefix_ops=right_v_prefix_ops,
+            base_query_target_op=base_query_target_op,
+            primary_query_targets=primary_query_targets,
+            secondary_query_targets=secondary_query_targets,
+        )
+        prefix_cache_map[prefix_key] = cached
+        return cached
 
     def accumulate_query_vector_updates(
+        cache: PrefixOperatorCache,
         query_index: int | None,
-        prefix_ids: Sequence[int],
         state_normed: torch.Tensor,
         scores: torch.Tensor,
         target_id: int,
         vector_weight: float,
-        unembed_bank: torch.Tensor,
+        query_target_bank: torch.Tensor,
         unembed_positive_acc: torch.Tensor,
         unembed_negative_acc: torch.Tensor,
         use_output_slice: bool,
     ) -> None:
         target_score = float(scores[target_id].item())
         unembed_positive_acc[target_id].add_(vector_weight * state_normed)
-        target_query = query_target_from_unembed(unembed_bank[target_id], prefix_ids)
+        target_query = query_target_bank[target_id]
         if query_index is None:
             query_positive_sum.add_(vector_weight * target_query)
         else:
             past_query_positive_sum[query_index].add_(vector_weight * target_query)
 
         candidate_size = model.output_vocab_size if use_output_slice else model.vocab_size
-        hard_negative_ids = torch.nonzero(
-            (scores[:candidate_size] > target_score) & (torch.arange(candidate_size, device=model.device) != target_id),
-            as_tuple=False,
-        ).flatten()
-        for wrong_id in hard_negative_ids.tolist():
-            unembed_negative_acc[wrong_id].add_(vector_weight * state_normed)
-            wrong_query = query_target_from_unembed(unembed_bank[wrong_id], prefix_ids)
+        hard_negative_mask = scores[:candidate_size] > target_score
+        hard_negative_mask[target_id] = False
+        hard_negative_ids = hard_negative_mask.nonzero(as_tuple=False).flatten()
+        if hard_negative_ids.numel() > 0:
+            wrong_state = state_normed.unsqueeze(0).expand(hard_negative_ids.shape[0], -1) * vector_weight
+            unembed_negative_acc.index_add_(0, hard_negative_ids, wrong_state)
+            wrong_queries = query_target_bank[hard_negative_ids].sum(dim=0) * vector_weight
             if query_index is None:
-                query_negative_sum.add_(vector_weight * wrong_query)
+                query_negative_sum.add_(wrong_queries)
             else:
-                past_query_negative_sum[query_index].add_(vector_weight * wrong_query)
+                past_query_negative_sum[query_index].add_(wrong_queries)
 
     def accumulate_objective(
         *,
+        cache: PrefixOperatorCache,
         query_vec: torch.Tensor,
         unembed_bank: torch.Tensor,
+        query_target_bank: torch.Tensor,
         objective_target_id: int,
         matrix_weight: float,
         vector_weight: float,
@@ -624,71 +737,45 @@ def apply_batch_update(
         left_delta_acc: torch.Tensor,
         right_delta_acc: torch.Tensor,
         base_delta_acc: torch.Tensor | None,
-        prefix_ids: Sequence[int],
     ) -> Tuple[float, bool]:
         query_mat = query_vec.unsqueeze(1)
-        weights = torch.full((1,), matrix_weight, device=model.device, dtype=base.dtype)
-
-        if model.uses_right_token_mats():
-            right_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
-            right_state = query_mat
-            for idx in range(len(prefix_ids) - 1, -1, -1):
-                right_inputs[idx] = right_state
-                right_state = model.right_token_mats[prefix_ids[idx]] @ right_state
-        else:
-            right_inputs = []
-            right_state = query_mat
-
-        middle_state = base @ right_state
-        if model.uses_left_token_mats():
-            left_inputs: List[torch.Tensor] = [torch.empty(0, device=model.device) for _ in prefix_ids]
-            state_mat = middle_state
-            for idx, tid in enumerate(prefix_ids):
-                left_inputs[idx] = state_mat
-                state_mat = model.left_token_mats[tid] @ state_mat
-        else:
-            left_inputs = []
-            state_mat = middle_state
-
+        middle_state = cache.middle_op @ query_mat
+        state_mat = cache.final_state_op @ query_mat
         target_mat = unembed_bank[objective_target_id].unsqueeze(1)
         state_normed = normalize_columns(state_mat)[:, 0]
         scores = unembed_bank @ state_normed
         accumulate_query_vector_updates(
+            cache,
             query_index,
-            prefix_ids,
             state_normed,
             scores,
             objective_target_id,
             vector_weight,
-            unembed_bank,
+            query_target_bank,
             unembed_positive_acc,
             unembed_negative_acc,
             use_output_slice,
         )
 
-        left_target = target_mat
         if model.uses_left_token_mats():
-            for idx in range(len(prefix_ids) - 1, -1, -1):
-                tid = prefix_ids[idx]
-                u = normalize_columns(model.left_token_mats[tid] @ left_inputs[idx])
-                v = normalize_columns(left_target)
+            for idx in range(len(cache.prefix_ids) - 1, -1, -1):
+                tid = cache.prefix_ids[idx]
+                u = normalize_columns(cache.left_u_ops[idx] @ middle_state)
+                v = normalize_columns(cache.left_target_ops[idx] @ target_mat)
                 if idx >= min_update_index:
-                    left_delta_acc[tid].add_(matrix_rotation_generator(u, v, weights))
-                left_target = model.left_token_mats[tid].transpose(-1, -2) @ left_target
+                    left_delta_acc[tid].add_(matrix_rotation_generator(u, v, matrix_weight))
 
         if allow_base_update and base_delta_acc is not None:
             u_base = normalize_columns(middle_state)
-            v_base = normalize_columns(left_target)
-            base_delta_acc.add_(matrix_rotation_generator(u_base, v_base, weights))
+            v_base = normalize_columns(cache.left_all_transpose_op @ target_mat)
+            base_delta_acc.add_(matrix_rotation_generator(u_base, v_base, matrix_weight))
 
-        query_target = base.transpose(-1, -2) @ left_target
         if model.uses_right_token_mats():
-            for idx, tid in enumerate(prefix_ids):
-                u = normalize_columns(model.right_token_mats[tid] @ right_inputs[idx])
-                v = normalize_columns(query_target)
+            for idx, tid in enumerate(cache.prefix_ids):
+                u = normalize_columns(cache.right_u_ops[idx] @ query_mat)
+                v = normalize_columns(cache.right_v_prefix_ops[idx] @ (cache.base_query_target_op @ target_mat))
                 if idx >= min_update_index:
-                    right_delta_acc[tid].add_(matrix_rotation_generator(u, v, weights))
-                query_target = model.right_token_mats[tid].transpose(-1, -2) @ query_target
+                    right_delta_acc[tid].add_(matrix_rotation_generator(u, v, matrix_weight))
 
         if use_output_slice:
             predicted = int(scores[: model.output_vocab_size].argmax().item())
@@ -697,10 +784,13 @@ def apply_batch_update(
         return float(scores[objective_target_id].item()), predicted == objective_target_id
 
     for prefix_ids, target_id in zip(prefixes, target_ids):
+        cache = build_prefix_cache(prefix_ids)
         if target_id >= 0:
             score, is_correct = accumulate_objective(
+                cache=cache,
                 query_vec=model.query,
                 unembed_bank=model.unembed_vectors,
+                query_target_bank=cache.primary_query_targets,
                 objective_target_id=target_id,
                 matrix_weight=1.0,
                 vector_weight=1.0,
@@ -713,7 +803,6 @@ def apply_batch_update(
                 left_delta_acc=left_primary_delta,
                 right_delta_acc=right_primary_delta,
                 base_delta_acc=base_primary_delta,
-                prefix_ids=prefix_ids,
             )
             primary_objective_weight += 1.0
             mean_target_score += score
@@ -722,21 +811,12 @@ def apply_batch_update(
 
         for lag in range(1, len(prefix_ids) + 1):
             query_index = lag - 1
-            model.ensure_past_queries(lag)
-            if past_query_positive_sum.shape[0] < model.past_queries.shape[0]:
-                new_size = model.past_queries.shape[0]
-                past_query_positive_sum = torch.cat(
-                    [past_query_positive_sum, torch.zeros(new_size - past_query_positive_sum.shape[0], n, device=model.device)],
-                    dim=0,
-                )
-                past_query_negative_sum = torch.cat(
-                    [past_query_negative_sum, torch.zeros(new_size - past_query_negative_sum.shape[0], n, device=model.device)],
-                    dim=0,
-                )
             past_target_id = prefix_ids[-lag]
             accumulate_objective(
+                cache=cache,
                 query_vec=model.past_queries[query_index],
                 unembed_bank=model.past_unembed_vectors,
+                query_target_bank=cache.secondary_query_targets,
                 objective_target_id=past_target_id,
                 matrix_weight=1.0,
                 vector_weight=1.0,
@@ -749,7 +829,6 @@ def apply_batch_update(
                 left_delta_acc=left_secondary_delta,
                 right_delta_acc=right_secondary_delta,
                 base_delta_acc=None,
-                prefix_ids=prefix_ids,
             )
             secondary_objective_weight += 1.0
 
@@ -819,7 +898,7 @@ def apply_batch_update(
 
     past_query_net = past_query_positive_sum - negative_scale * past_query_negative_sum
     if model.past_queries.shape[0] > 0:
-        past_query_delta = torch.zeros((model.past_queries.shape[0], n, n), device=model.device, dtype=base.dtype)
+        past_query_delta = workspace.past_query_delta
         past_query_net_norm = past_query_net.norm(dim=1)
         past_query_active = past_query_net_norm > EPS
         if past_query_active.any():
@@ -832,7 +911,7 @@ def apply_batch_update(
             )
 
     unembed_net = unembed_positive_sum - negative_scale * unembed_negative_sum
-    unembed_delta = torch.zeros((model.vocab_size, n, n), device=model.device, dtype=base.dtype)
+    unembed_delta = workspace.unembed_delta
     unembed_net_norm = unembed_net.norm(dim=1)
     unembed_active = unembed_net_norm > EPS
     if unembed_active.any():
@@ -845,7 +924,7 @@ def apply_batch_update(
         )
 
     past_unembed_net = past_unembed_positive_sum - negative_scale * past_unembed_negative_sum
-    past_unembed_delta = torch.zeros((model.vocab_size, n, n), device=model.device, dtype=base.dtype)
+    past_unembed_delta = workspace.past_unembed_delta
     past_unembed_net_norm = past_unembed_net.norm(dim=1)
     past_unembed_active = past_unembed_net_norm > EPS
     if past_unembed_active.any():
@@ -887,8 +966,11 @@ def train(
     negative_scale: float,
     secondary_matrix_scale: float,
     update_orthogonalize_steps: int,
+    checkpoint_every: int = 0,
+    checkpoint_callback: Callable[[int, ManualRotationMatrixNetwork, ManualRotationOptimizerState], None] | None = None,
 ) -> Tuple[ManualRotationMatrixNetwork, ManualRotationOptimizerState]:
     rng = random.Random(seed)
+    workspace = BatchUpdateWorkspace()
 
     def sample_batch() -> Tuple[List[List[int]], List[int]]:
         prefixes: List[List[int]] = []
@@ -898,10 +980,11 @@ def train(
             _, _, prompt_text, target_text = random_problem(rng, addend_digits, number_base)
             full_seq = prompt_text + target_text + EOS_TOKEN
             prompt_len = len(prompt_text)
+            full_ids = model.encode(full_seq)
             for prefix_len in range(1, len(full_seq)):
-                prefixes.append(model.encode(full_seq[:prefix_len]))
+                prefixes.append(full_ids[:prefix_len])
                 if prefix_len >= prompt_len:
-                    target_ids.append(model.stoi[full_seq[prefix_len]])
+                    target_ids.append(full_ids[prefix_len])
                 else:
                     target_ids.append(-1)
 
@@ -912,6 +995,7 @@ def train(
         mean_target_score, token_acc = apply_batch_update(
             model,
             optimizer_state,
+            workspace,
             prefixes=prefixes,
             target_ids=target_ids,
             token_learning_rate=token_learning_rate,
@@ -944,6 +1028,9 @@ def train(
                 f"stop_rate={stop_rate:.3f}"
             )
 
+        if checkpoint_callback is not None and checkpoint_every > 0 and iter_idx % checkpoint_every == 0:
+            checkpoint_callback(iter_idx, model, optimizer_state)
+
     return model, optimizer_state
 
 
@@ -971,6 +1058,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--negative-scale", type=float, default=2.0, help="Repulsion weight for wrong learned vectors that outscore the correct one")
     p.add_argument("--secondary-matrix-scale", type=float, default=0.1, help="Scale multiplier for matrix learning from past-token auxiliary objectives")
     p.add_argument("--update-orthogonalize-steps", type=int, default=1, help="Newton-Schulz orthogonalization steps after each matrix update")
+    p.add_argument("--checkpoint-every", type=int, default=0, help="Save latest checkpoint every N iterations; 0 disables periodic saves")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default=None, help="Optional checkpoint path override")
     p.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "mps", "cuda"])
@@ -983,6 +1071,8 @@ def main() -> None:
         raise ValueError("--momentum-decay must be in [0, 1)")
     if args.update_orthogonalize_steps < 0:
         raise ValueError("--update-orthogonalize-steps must be >= 0")
+    if args.checkpoint_every < 0:
+        raise ValueError("--checkpoint-every must be >= 0")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -992,6 +1082,7 @@ def main() -> None:
     print(f"device={device}")
 
     optimizer_state = ManualRotationOptimizerState(momentum_decay=args.momentum_decay)
+    previous_completed_iters = 0
     if args.load_path is None:
         model = ManualRotationMatrixNetwork(
             n=args.n,
@@ -1003,7 +1094,7 @@ def main() -> None:
         )
         addend_digits = args.addend_digits
     else:
-        model, loaded_addend_digits, optimizer_state = load_training_checkpoint(
+        model, loaded_addend_digits, optimizer_state, previous_completed_iters = load_training_checkpoint(
             args.load_path,
             device,
             momentum_decay=args.momentum_decay,
@@ -1023,6 +1114,17 @@ def main() -> None:
     print(f"save_path={save_path}")
     args.save_path = save_path
     print(format_run_config(args, addend_digits=addend_digits))
+
+    def checkpoint_callback(iter_idx: int, checkpoint_model: ManualRotationMatrixNetwork, checkpoint_optimizer: ManualRotationOptimizerState) -> None:
+        save_checkpoint(
+            checkpoint_model,
+            save_path,
+            addend_digits=addend_digits,
+            optimizer_state=checkpoint_optimizer,
+            update_orthogonalize_steps=args.update_orthogonalize_steps,
+            completed_iters=previous_completed_iters + iter_idx,
+        )
+        print(f"checkpoint_iter={iter_idx} save_path={save_path}")
 
     model, optimizer_state = train(
         model=model,
@@ -1044,6 +1146,8 @@ def main() -> None:
         negative_scale=args.negative_scale,
         secondary_matrix_scale=args.secondary_matrix_scale,
         update_orthogonalize_steps=args.update_orthogonalize_steps,
+        checkpoint_every=args.checkpoint_every,
+        checkpoint_callback=checkpoint_callback if args.checkpoint_every > 0 else None,
     )
 
     save_checkpoint(
@@ -1052,6 +1156,7 @@ def main() -> None:
         addend_digits=addend_digits,
         optimizer_state=optimizer_state,
         update_orthogonalize_steps=args.update_orthogonalize_steps,
+        completed_iters=previous_completed_iters + args.iters,
     )
     print(f"saved_checkpoint={save_path}")
     print("\nSample predictions:")
