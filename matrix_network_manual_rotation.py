@@ -208,7 +208,10 @@ class BatchUpdateWorkspace:
 @dataclass
 class PrefixOperatorCache:
     prefix_ids: Tuple[int, ...]
+    right_total_op: torch.Tensor
+    right_all_transpose_op: torch.Tensor
     middle_op: torch.Tensor
+    left_total_op: torch.Tensor
     final_state_op: torch.Tensor
     left_u_ops: torch.Tensor
     left_target_ops: torch.Tensor
@@ -513,13 +516,62 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
     return str(Path("checkpoints") / name)
 
 
+def prefix_operator_pair_from_ids(model: ManualRotationMatrixNetwork, token_ids: Sequence[int]) -> Tuple[torch.Tensor, torch.Tensor]:
+    eye = cached_eye(model.n, model.device, model.base_mat.dtype)
+    right_total_op = eye
+    left_total_op = eye
+    if model.uses_right_token_mats():
+        for tid in token_ids:
+            right_total_op = right_total_op @ model.right_token_mats[tid]
+    if model.uses_left_token_mats():
+        for tid in token_ids:
+            left_total_op = model.left_token_mats[tid] @ left_total_op
+    return left_total_op, right_total_op
+
+
+def advance_prefix_operator_pair(
+    model: ManualRotationMatrixNetwork,
+    left_total_op: torch.Tensor,
+    right_total_op: torch.Tensor,
+    token_id: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if model.uses_right_token_mats():
+        right_total_op = right_total_op @ model.right_token_mats[token_id]
+    if model.uses_left_token_mats():
+        left_total_op = model.left_token_mats[token_id] @ left_total_op
+    return left_total_op, right_total_op
+
+
+def state_from_prefix_operators(
+    model: ManualRotationMatrixNetwork,
+    left_total_op: torch.Tensor,
+    right_total_op: torch.Tensor,
+    query: torch.Tensor,
+) -> torch.Tensor:
+    return left_total_op @ (model.base_mat @ (right_total_op @ query))
+
+
+def predict_next_id_from_prefix_operators(
+    model: ManualRotationMatrixNetwork,
+    left_total_op: torch.Tensor,
+    right_total_op: torch.Tensor,
+) -> int:
+    state = state_from_prefix_operators(model, left_total_op, right_total_op, model.query)
+    scores = model.unembed_vectors[: model.output_vocab_size] @ normalize_columns(state.unsqueeze(1))
+    return int(scores[:, 0].argmax().item())
+
+
 def generate_until_eos(model: ManualRotationMatrixNetwork, prompt_text: str, max_len: int) -> Tuple[str, bool]:
+    prefix_ids = model.encode(prompt_text)
+    left_total_op, right_total_op = prefix_operator_pair_from_ids(model, prefix_ids)
     pred = ""
     for _ in range(max_len):
-        next_ch = model.predict_next(prompt_text + pred)
+        next_id = predict_next_id_from_prefix_operators(model, left_total_op, right_total_op)
+        next_ch = model.itos[next_id]
         if next_ch == EOS_TOKEN:
             return pred, True
         pred += next_ch
+        left_total_op, right_total_op = advance_prefix_operator_pair(model, left_total_op, right_total_op, next_id)
     return pred, False
 
 
@@ -544,10 +596,15 @@ def evaluate(
             exact += 1
 
         target_seq = target_text + EOS_TOKEN
+        prompt_ids = model.encode(prompt_text)
+        target_ids = model.encode(target_seq)
+        left_total_op, right_total_op = prefix_operator_pair_from_ids(model, prompt_ids)
         for i, ch in enumerate(target_seq):
-            pred_id = model.predict_next_id(model.encode(prompt_text + target_seq[:i]))
-            tf_correct += int(pred_id == model.stoi[ch])
+            pred_id = predict_next_id_from_prefix_operators(model, left_total_op, right_total_op)
+            target_id = target_ids[i]
+            tf_correct += int(pred_id == target_id)
             tf_total += 1
+            left_total_op, right_total_op = advance_prefix_operator_pair(model, left_total_op, right_total_op, target_id)
 
     return (
         exact / max(eval_samples, 1),
@@ -624,40 +681,49 @@ def apply_batch_update(
             return cached
 
         prefix_len = len(prefix_key)
+        last_tid = prefix_key[-1]
+        parent_cache = build_prefix_cache(prefix_key[:-1]) if prefix_len > 1 else None
+
         if model.uses_right_token_mats():
-            right_u_ops = torch.empty((prefix_len, n, n), device=model.device, dtype=base.dtype)
-            right_v_prefix_ops = torch.empty((prefix_len, n, n), device=model.device, dtype=base.dtype)
-            suffix_op = eye
-            for idx in range(prefix_len - 1, -1, -1):
-                suffix_op = model.right_token_mats[prefix_key[idx]] @ suffix_op
-                right_u_ops[idx] = suffix_op
-            right_total_op = suffix_op
-            prefix_transpose_op = eye
-            for idx, tid in enumerate(prefix_key):
-                right_v_prefix_ops[idx] = prefix_transpose_op
-                prefix_transpose_op = model.right_token_mats[tid].transpose(-1, -2) @ prefix_transpose_op
+            right_mat = model.right_token_mats[last_tid]
+            right_mat_t = right_mat.transpose(-1, -2)
+            if parent_cache is None:
+                right_total_op = right_mat
+                right_all_transpose_op = right_mat_t
+                right_u_ops = right_total_op.unsqueeze(0)
+                right_v_prefix_ops = eye.unsqueeze(0)
+            else:
+                right_total_op = parent_cache.right_total_op @ right_mat
+                right_all_transpose_op = right_mat_t @ parent_cache.right_all_transpose_op
+                right_u_ops = torch.cat([parent_cache.right_u_ops @ right_mat, right_mat.unsqueeze(0)], dim=0)
+                right_v_prefix_ops = torch.cat(
+                    [parent_cache.right_v_prefix_ops, parent_cache.right_all_transpose_op.unsqueeze(0)],
+                    dim=0,
+                )
         else:
             right_u_ops = torch.empty((0, n, n), device=model.device, dtype=base.dtype)
             right_v_prefix_ops = torch.empty((0, n, n), device=model.device, dtype=base.dtype)
             right_total_op = eye
-            prefix_transpose_op = eye
+            right_all_transpose_op = eye
 
         middle_op = base @ right_total_op
 
         if model.uses_left_token_mats():
-            left_u_ops = torch.empty((prefix_len, n, n), device=model.device, dtype=base.dtype)
-            left_target_ops = torch.empty((prefix_len, n, n), device=model.device, dtype=base.dtype)
-            prefix_op = eye
-            for idx, tid in enumerate(prefix_key):
-                prefix_op = model.left_token_mats[tid] @ prefix_op
-                left_u_ops[idx] = prefix_op
-            left_total_op = prefix_op
-
-            suffix_transpose_op = eye
-            for idx in range(prefix_len - 1, -1, -1):
-                left_target_ops[idx] = suffix_transpose_op
-                suffix_transpose_op = model.left_token_mats[prefix_key[idx]].transpose(-1, -2) @ suffix_transpose_op
-            left_all_transpose_op = suffix_transpose_op
+            left_mat = model.left_token_mats[last_tid]
+            left_mat_t = left_mat.transpose(-1, -2)
+            if parent_cache is None:
+                left_total_op = left_mat
+                left_all_transpose_op = left_mat_t
+                left_u_ops = left_total_op.unsqueeze(0)
+                left_target_ops = eye.unsqueeze(0)
+            else:
+                left_total_op = left_mat @ parent_cache.left_total_op
+                left_all_transpose_op = parent_cache.left_all_transpose_op @ left_mat_t
+                left_u_ops = torch.cat([parent_cache.left_u_ops, left_total_op.unsqueeze(0)], dim=0)
+                left_target_ops = torch.cat(
+                    [parent_cache.left_target_ops @ left_mat_t, eye.unsqueeze(0)],
+                    dim=0,
+                )
         else:
             left_u_ops = torch.empty((0, n, n), device=model.device, dtype=base.dtype)
             left_target_ops = torch.empty((0, n, n), device=model.device, dtype=base.dtype)
@@ -666,13 +732,16 @@ def apply_batch_update(
 
         final_state_op = left_total_op @ middle_op
         base_query_target_op = base_t @ left_all_transpose_op
-        query_target_op = prefix_transpose_op @ base_query_target_op
+        query_target_op = right_all_transpose_op @ base_query_target_op
         primary_query_targets = normalize_last_dim(model.unembed_vectors @ query_target_op.transpose(-1, -2))
         secondary_query_targets = normalize_last_dim(model.past_unembed_vectors @ query_target_op.transpose(-1, -2))
 
         cached = PrefixOperatorCache(
             prefix_ids=prefix_key,
+            right_total_op=right_total_op,
+            right_all_transpose_op=right_all_transpose_op,
             middle_op=middle_op,
+            left_total_op=left_total_op,
             final_state_op=final_state_op,
             left_u_ops=left_u_ops,
             left_target_ops=left_target_ops,
