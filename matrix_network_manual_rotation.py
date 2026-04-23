@@ -215,13 +215,9 @@ class PrefixOperatorCache:
     left_total_op: torch.Tensor
     final_state_op: torch.Tensor
     left_u_ops: torch.Tensor
-    left_target_ops: torch.Tensor
     left_all_transpose_op: torch.Tensor
-    right_u_ops: torch.Tensor
     right_v_prefix_ops: torch.Tensor
-    base_query_target_op: torch.Tensor
-    primary_query_targets: torch.Tensor
-    secondary_query_targets: torch.Tensor
+    query_target_op: torch.Tensor
 
 
 def digit_alphabet(number_base: int) -> str:
@@ -730,9 +726,14 @@ def apply_batch_update(
     base_t = base.transpose(-1, -2)
     eye = cached_eye(n, model.device, base.dtype)
 
-    def extend_prefix_cache(parent_cache: PrefixOperatorCache | None, token_id: int) -> PrefixOperatorCache:
+    def extend_prefix_cache(
+        parent_cache: PrefixOperatorCache | None,
+        token_id: int,
+        prefix_len: int,
+        left_u_buffer: torch.Tensor,
+        right_v_buffer: torch.Tensor,
+    ) -> PrefixOperatorCache:
         prefix_key = (token_id,) if parent_cache is None else (*parent_cache.prefix_ids, token_id)
-        prefix_len = len(prefix_key)
         last_tid = token_id
 
         if model.uses_right_token_mats():
@@ -741,19 +742,12 @@ def apply_batch_update(
             if parent_cache is None:
                 right_total_op = right_mat
                 right_all_transpose_op = right_mat_t
-                right_u_ops = right_total_op.unsqueeze(0)
-                right_v_prefix_ops = eye.unsqueeze(0)
+                right_v_buffer[0] = eye
             else:
                 right_total_op = parent_cache.right_total_op @ right_mat
                 right_all_transpose_op = right_mat_t @ parent_cache.right_all_transpose_op
-                right_u_ops = torch.cat([parent_cache.right_u_ops @ right_mat, right_mat.unsqueeze(0)], dim=0)
-                right_v_prefix_ops = torch.cat(
-                    [parent_cache.right_v_prefix_ops, parent_cache.right_all_transpose_op.unsqueeze(0)],
-                    dim=0,
-                )
+                right_v_buffer[prefix_len - 1] = parent_cache.right_all_transpose_op
         else:
-            right_u_ops = torch.empty((0, n, n), device=model.device, dtype=base.dtype)
-            right_v_prefix_ops = torch.empty((0, n, n), device=model.device, dtype=base.dtype)
             right_total_op = eye
             right_all_transpose_op = eye
 
@@ -765,27 +759,18 @@ def apply_batch_update(
             if parent_cache is None:
                 left_total_op = left_mat
                 left_all_transpose_op = left_mat_t
-                left_u_ops = left_total_op.unsqueeze(0)
-                left_target_ops = eye.unsqueeze(0)
+                left_u_buffer[0] = left_total_op
             else:
                 left_total_op = left_mat @ parent_cache.left_total_op
                 left_all_transpose_op = parent_cache.left_all_transpose_op @ left_mat_t
-                left_u_ops = torch.cat([parent_cache.left_u_ops, left_total_op.unsqueeze(0)], dim=0)
-                left_target_ops = torch.cat(
-                    [parent_cache.left_target_ops @ left_mat_t, eye.unsqueeze(0)],
-                    dim=0,
-                )
+                left_u_buffer[prefix_len - 1] = left_total_op
         else:
-            left_u_ops = torch.empty((0, n, n), device=model.device, dtype=base.dtype)
-            left_target_ops = torch.empty((0, n, n), device=model.device, dtype=base.dtype)
             left_total_op = eye
             left_all_transpose_op = eye
 
         final_state_op = left_total_op @ middle_op
         base_query_target_op = base_t @ left_all_transpose_op
         query_target_op = right_all_transpose_op @ base_query_target_op
-        primary_query_targets = normalize_last_dim(model.unembed_vectors @ query_target_op.transpose(-1, -2))
-        secondary_query_targets = normalize_last_dim(model.past_unembed_vectors @ query_target_op.transpose(-1, -2))
 
         return PrefixOperatorCache(
             prefix_ids=prefix_key,
@@ -795,48 +780,11 @@ def apply_batch_update(
             middle_op=middle_op,
             left_total_op=left_total_op,
             final_state_op=final_state_op,
-            left_u_ops=left_u_ops,
-            left_target_ops=left_target_ops,
+            left_u_ops=left_u_buffer[:prefix_len],
             left_all_transpose_op=left_all_transpose_op,
-            right_u_ops=right_u_ops,
-            right_v_prefix_ops=right_v_prefix_ops,
-            base_query_target_op=base_query_target_op,
-            primary_query_targets=primary_query_targets,
-            secondary_query_targets=secondary_query_targets,
+            right_v_prefix_ops=right_v_buffer[:prefix_len],
+            query_target_op=query_target_op,
         )
-
-    def accumulate_query_vector_updates(
-        cache: PrefixOperatorCache,
-        query_index: int | None,
-        state_normed: torch.Tensor,
-        scores: torch.Tensor,
-        target_id: int,
-        vector_weight: float,
-        query_target_bank: torch.Tensor,
-        unembed_positive_acc: torch.Tensor,
-        unembed_negative_acc: torch.Tensor,
-        use_output_slice: bool,
-    ) -> None:
-        target_score = float(scores[target_id].item())
-        unembed_positive_acc[target_id].add_(vector_weight * state_normed)
-        target_query = query_target_bank[target_id]
-        if query_index is None:
-            query_positive_sum.add_(vector_weight * target_query)
-        else:
-            past_query_positive_sum[query_index].add_(vector_weight * target_query)
-
-        candidate_size = model.output_vocab_size if use_output_slice else model.vocab_size
-        hard_negative_mask = scores[:candidate_size] > target_score
-        hard_negative_mask[target_id] = False
-        hard_negative_ids = hard_negative_mask.nonzero(as_tuple=False).flatten()
-        if hard_negative_ids.numel() > 0:
-            wrong_state = state_normed.unsqueeze(0).expand(hard_negative_ids.shape[0], -1) * vector_weight
-            unembed_negative_acc.index_add_(0, hard_negative_ids, wrong_state)
-            wrong_queries = query_target_bank[hard_negative_ids].sum(dim=0) * vector_weight
-            if query_index is None:
-                query_negative_sum.add_(wrong_queries)
-            else:
-                past_query_negative_sum[query_index].add_(wrong_queries)
 
     def accumulate_primary_objectives(
         caches: Sequence[PrefixOperatorCache],
@@ -853,14 +801,15 @@ def apply_batch_update(
         middle_states = middle_ops @ query_mat
         state_vecs = normalize_last_dim((final_ops @ query_mat).squeeze(-1))
         scores = model.unembed_vectors @ state_vecs.transpose(0, 1)
-        query_positive = torch.stack(
-            [cache.primary_query_targets[target_id] for cache, target_id in zip(caches, objective_target_ids)],
-            dim=0,
+        prefix_indices = torch.arange(len(caches), device=model.device)
+        query_target_ops = torch.stack([cache.query_target_op for cache in caches], dim=0)
+        primary_query_targets = normalize_last_dim(
+            torch.matmul(model.unembed_vectors.unsqueeze(0), query_target_ops.transpose(-1, -2))
         )
+        query_positive = primary_query_targets[prefix_indices, target_ids_tensor]
         query_positive_sum.add_(query_positive.sum(dim=0))
         unembed_positive_sum.index_add_(0, target_ids_tensor, state_vecs)
 
-        prefix_indices = torch.arange(len(caches), device=model.device)
         target_scores = scores[target_ids_tensor, prefix_indices]
         hard_negative_mask = scores[: model.output_vocab_size] > target_scores.unsqueeze(0)
         hard_negative_mask[target_ids_tensor, prefix_indices] = False
@@ -869,8 +818,7 @@ def apply_batch_update(
             neg_prefix_idx = neg_pairs[:, 0]
             neg_wrong_ids = neg_pairs[:, 1]
             unembed_negative_sum.index_add_(0, neg_wrong_ids, state_vecs[neg_prefix_idx])
-            for prefix_idx, wrong_id in neg_pairs.tolist():
-                query_negative_sum.add_(caches[prefix_idx].primary_query_targets[wrong_id])
+            query_negative_sum.add_(primary_query_targets[neg_prefix_idx, neg_wrong_ids].sum(dim=0))
 
         target_mats = model.unembed_vectors[target_ids_tensor].unsqueeze(-1)
 
@@ -883,7 +831,8 @@ def apply_batch_update(
                 active_indices = active.nonzero(as_tuple=False).flatten()
                 tid = caches[int(active_indices[0].item())].prefix_ids[idx]
                 u_ops = torch.stack([caches[int(i.item())].left_u_ops[idx] for i in active_indices], dim=0)
-                v_ops = torch.stack([caches[int(i.item())].left_target_ops[idx] for i in active_indices], dim=0)
+                left_total_t = torch.stack([caches[int(i.item())].left_total_op.transpose(-1, -2) for i in active_indices], dim=0)
+                v_ops = u_ops @ left_total_t
                 u = normalize_last_dim((u_ops @ middle_states[active_indices]).squeeze(-1)).unsqueeze(-1)
                 v = normalize_last_dim((v_ops @ target_mats[active_indices]).squeeze(-1)).unsqueeze(-1)
                 left_primary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0).sum(dim=0))
@@ -894,7 +843,7 @@ def apply_batch_update(
         base_primary_delta.add_(matrix_rotation_generator(u_base, v_base, 1.0).sum(dim=0))
 
         if model.uses_right_token_mats():
-            base_query_targets = torch.stack([cache.base_query_target_op for cache in caches], dim=0) @ target_mats
+            base_query_targets = query_target_ops @ target_mats
             max_prefix_len = int(prefix_lens.max().item())
             for idx in range(max_prefix_len):
                 active = prefix_lens > idx
@@ -902,7 +851,7 @@ def apply_batch_update(
                     continue
                 active_indices = active.nonzero(as_tuple=False).flatten()
                 tid = caches[int(active_indices[0].item())].prefix_ids[idx]
-                u_ops = torch.stack([caches[int(i.item())].right_u_ops[idx] for i in active_indices], dim=0)
+                u_ops = torch.stack([caches[int(i.item())].right_v_prefix_ops[idx] @ caches[int(i.item())].right_total_op for i in active_indices], dim=0)
                 v_ops = torch.stack([caches[int(i.item())].right_v_prefix_ops[idx] for i in active_indices], dim=0)
                 u = normalize_last_dim((u_ops @ query_mat.expand(active_indices.shape[0], -1, -1)).squeeze(-1)).unsqueeze(-1)
                 v = normalize_last_dim((v_ops @ base_query_targets[active_indices]).squeeze(-1)).unsqueeze(-1)
@@ -925,8 +874,9 @@ def apply_batch_update(
         target_ids_tensor = cache.reversed_prefix_ids
         lag_indices = torch.arange(prefix_len, device=model.device)
 
+        secondary_query_targets = normalize_last_dim(model.past_unembed_vectors @ cache.query_target_op.transpose(-1, -2))
         past_unembed_positive_sum.index_add_(0, target_ids_tensor, state_normed.transpose(0, 1))
-        past_query_positive_sum[:prefix_len].add_(cache.secondary_query_targets[target_ids_tensor])
+        past_query_positive_sum[:prefix_len].add_(secondary_query_targets[target_ids_tensor])
 
         target_scores = scores[target_ids_tensor, lag_indices]
         hard_negative_mask = scores > target_scores.unsqueeze(0)
@@ -937,32 +887,42 @@ def apply_batch_update(
             neg_wrong_ids = neg_pairs[:, 1]
             neg_states = state_normed.transpose(0, 1)[neg_lag_indices]
             past_unembed_negative_sum.index_add_(0, neg_wrong_ids, neg_states)
-            past_query_negative_sum.index_add_(0, neg_lag_indices, cache.secondary_query_targets[neg_wrong_ids])
+            past_query_negative_sum.index_add_(0, neg_lag_indices, secondary_query_targets[neg_wrong_ids])
 
         target_mats = model.past_unembed_vectors[target_ids_tensor].transpose(0, 1)
-        base_query_targets = cache.base_query_target_op @ target_mats
+        base_query_targets = cache.query_target_op @ target_mats
 
         if model.uses_left_token_mats():
             for idx in range(prefix_len - 1, -1, -1):
                 tid = cache.prefix_ids[idx]
                 active_end = idx + 1
                 u = normalize_columns(cache.left_u_ops[idx] @ middle_states[:, :active_end])
-                v = normalize_columns(cache.left_target_ops[idx] @ target_mats[:, :active_end])
+                v = normalize_columns((cache.left_u_ops[idx] @ cache.left_total_op.transpose(-1, -2)) @ target_mats[:, :active_end])
                 left_secondary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0))
 
         if model.uses_right_token_mats():
             for idx, tid in enumerate(cache.prefix_ids):
                 active_end = idx + 1
-                u = normalize_columns(cache.right_u_ops[idx] @ query_mats[:, :active_end])
+                u = normalize_columns((cache.right_v_prefix_ops[idx] @ cache.right_total_op) @ query_mats[:, :active_end])
                 v = normalize_columns(cache.right_v_prefix_ops[idx] @ base_query_targets[:, :active_end])
                 right_secondary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0))
 
     for full_ids, prompt_len in zip(sequences, prompt_lens):
+        seq_max_prefix_len = len(full_ids) - 1
+        if model.uses_left_token_mats():
+            left_u_buffer = torch.empty((seq_max_prefix_len, n, n), device=model.device, dtype=base.dtype)
+        else:
+            left_u_buffer = torch.empty((0, n, n), device=model.device, dtype=base.dtype)
+        if model.uses_right_token_mats():
+            right_v_buffer = torch.empty((seq_max_prefix_len, n, n), device=model.device, dtype=base.dtype)
+        else:
+            right_v_buffer = torch.empty((0, n, n), device=model.device, dtype=base.dtype)
+
         cache: PrefixOperatorCache | None = None
         primary_caches: List[PrefixOperatorCache] = []
         primary_targets: List[int] = []
         for prefix_len in range(1, len(full_ids)):
-            cache = extend_prefix_cache(cache, full_ids[prefix_len - 1])
+            cache = extend_prefix_cache(cache, full_ids[prefix_len - 1], prefix_len, left_u_buffer, right_v_buffer)
             target_id = full_ids[prefix_len] if prefix_len >= prompt_len else -1
             if target_id >= 0:
                 primary_caches.append(cache)
