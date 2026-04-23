@@ -838,69 +838,78 @@ def apply_batch_update(
             else:
                 past_query_negative_sum[query_index].add_(wrong_queries)
 
-    def accumulate_objective(
-        *,
-        cache: PrefixOperatorCache,
-        query_vec: torch.Tensor,
-        unembed_bank: torch.Tensor,
-        query_target_bank: torch.Tensor,
-        objective_target_id: int,
-        matrix_weight: float,
-        vector_weight: float,
-        query_index: int | None,
-        unembed_positive_acc: torch.Tensor,
-        unembed_negative_acc: torch.Tensor,
-        use_output_slice: bool,
-        min_update_index: int,
-        allow_base_update: bool,
-        left_delta_acc: torch.Tensor,
-        right_delta_acc: torch.Tensor,
-        base_delta_acc: torch.Tensor | None,
-    ) -> Tuple[float, bool]:
-        query_mat = query_vec.unsqueeze(1)
-        middle_state = cache.middle_op @ query_mat
-        state_mat = cache.final_state_op @ query_mat
-        target_mat = unembed_bank[objective_target_id].unsqueeze(1)
-        state_normed = normalize_columns(state_mat)[:, 0]
-        scores = unembed_bank @ state_normed
-        accumulate_query_vector_updates(
-            cache,
-            query_index,
-            state_normed,
-            scores,
-            objective_target_id,
-            vector_weight,
-            query_target_bank,
-            unembed_positive_acc,
-            unembed_negative_acc,
-            use_output_slice,
+    def accumulate_primary_objectives(
+        caches: Sequence[PrefixOperatorCache],
+        objective_target_ids: Sequence[int],
+    ) -> Tuple[float, int, int]:
+        if not caches:
+            return 0.0, 0, 0
+
+        target_ids_tensor = torch.tensor(objective_target_ids, device=model.device, dtype=torch.long)
+        prefix_lens = torch.tensor([len(cache.prefix_ids) for cache in caches], device=model.device, dtype=torch.long)
+        query_mat = model.query.unsqueeze(1)
+        middle_ops = torch.stack([cache.middle_op for cache in caches], dim=0)
+        final_ops = torch.stack([cache.final_state_op for cache in caches], dim=0)
+        middle_states = middle_ops @ query_mat
+        state_vecs = normalize_last_dim((final_ops @ query_mat).squeeze(-1))
+        scores = model.unembed_vectors @ state_vecs.transpose(0, 1)
+        query_positive = torch.stack(
+            [cache.primary_query_targets[target_id] for cache, target_id in zip(caches, objective_target_ids)],
+            dim=0,
         )
+        query_positive_sum.add_(query_positive.sum(dim=0))
+        unembed_positive_sum.index_add_(0, target_ids_tensor, state_vecs)
+
+        prefix_indices = torch.arange(len(caches), device=model.device)
+        target_scores = scores[target_ids_tensor, prefix_indices]
+        hard_negative_mask = scores[: model.output_vocab_size] > target_scores.unsqueeze(0)
+        hard_negative_mask[target_ids_tensor, prefix_indices] = False
+        neg_pairs = hard_negative_mask.transpose(0, 1).nonzero(as_tuple=False)
+        if neg_pairs.numel() > 0:
+            neg_prefix_idx = neg_pairs[:, 0]
+            neg_wrong_ids = neg_pairs[:, 1]
+            unembed_negative_sum.index_add_(0, neg_wrong_ids, state_vecs[neg_prefix_idx])
+            for prefix_idx, wrong_id in neg_pairs.tolist():
+                query_negative_sum.add_(caches[prefix_idx].primary_query_targets[wrong_id])
+
+        target_mats = model.unembed_vectors[target_ids_tensor].unsqueeze(-1)
 
         if model.uses_left_token_mats():
-            for idx in range(len(cache.prefix_ids) - 1, -1, -1):
-                tid = cache.prefix_ids[idx]
-                u = normalize_columns(cache.left_u_ops[idx] @ middle_state)
-                v = normalize_columns(cache.left_target_ops[idx] @ target_mat)
-                if idx >= min_update_index:
-                    left_delta_acc[tid].add_(matrix_rotation_generator(u, v, matrix_weight))
+            max_prefix_len = int(prefix_lens.max().item())
+            for idx in range(max_prefix_len - 1, -1, -1):
+                active = prefix_lens > idx
+                if not bool(active.any()):
+                    continue
+                active_indices = active.nonzero(as_tuple=False).flatten()
+                tid = caches[int(active_indices[0].item())].prefix_ids[idx]
+                u_ops = torch.stack([caches[int(i.item())].left_u_ops[idx] for i in active_indices], dim=0)
+                v_ops = torch.stack([caches[int(i.item())].left_target_ops[idx] for i in active_indices], dim=0)
+                u = normalize_last_dim((u_ops @ middle_states[active_indices]).squeeze(-1)).unsqueeze(-1)
+                v = normalize_last_dim((v_ops @ target_mats[active_indices]).squeeze(-1)).unsqueeze(-1)
+                left_primary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0).sum(dim=0))
 
-        if allow_base_update and base_delta_acc is not None:
-            u_base = normalize_columns(middle_state)
-            v_base = normalize_columns(cache.left_all_transpose_op @ target_mat)
-            base_delta_acc.add_(matrix_rotation_generator(u_base, v_base, matrix_weight))
+        left_all_ops = torch.stack([cache.left_all_transpose_op for cache in caches], dim=0)
+        u_base = normalize_last_dim(middle_states.squeeze(-1)).unsqueeze(-1)
+        v_base = normalize_last_dim((left_all_ops @ target_mats).squeeze(-1)).unsqueeze(-1)
+        base_primary_delta.add_(matrix_rotation_generator(u_base, v_base, 1.0).sum(dim=0))
 
         if model.uses_right_token_mats():
-            for idx, tid in enumerate(cache.prefix_ids):
-                u = normalize_columns(cache.right_u_ops[idx] @ query_mat)
-                v = normalize_columns(cache.right_v_prefix_ops[idx] @ (cache.base_query_target_op @ target_mat))
-                if idx >= min_update_index:
-                    right_delta_acc[tid].add_(matrix_rotation_generator(u, v, matrix_weight))
+            base_query_targets = torch.stack([cache.base_query_target_op for cache in caches], dim=0) @ target_mats
+            max_prefix_len = int(prefix_lens.max().item())
+            for idx in range(max_prefix_len):
+                active = prefix_lens > idx
+                if not bool(active.any()):
+                    continue
+                active_indices = active.nonzero(as_tuple=False).flatten()
+                tid = caches[int(active_indices[0].item())].prefix_ids[idx]
+                u_ops = torch.stack([caches[int(i.item())].right_u_ops[idx] for i in active_indices], dim=0)
+                v_ops = torch.stack([caches[int(i.item())].right_v_prefix_ops[idx] for i in active_indices], dim=0)
+                u = normalize_last_dim((u_ops @ query_mat.expand(active_indices.shape[0], -1, -1)).squeeze(-1)).unsqueeze(-1)
+                v = normalize_last_dim((v_ops @ base_query_targets[active_indices]).squeeze(-1)).unsqueeze(-1)
+                right_primary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0).sum(dim=0))
 
-        if use_output_slice:
-            predicted = int(scores[: model.output_vocab_size].argmax().item())
-        else:
-            predicted = int(scores.argmax().item())
-        return float(scores[objective_target_id].item()), predicted == objective_target_id
+        correct_count = int((scores[: model.output_vocab_size].argmax(dim=0) == target_ids_tensor).sum().item())
+        return float(target_scores.sum().item()), correct_count, len(caches)
 
     def accumulate_secondary_objectives(cache: PrefixOperatorCache) -> None:
         prefix_len = len(cache.prefix_ids)
@@ -950,35 +959,23 @@ def apply_batch_update(
 
     for full_ids, prompt_len in zip(sequences, prompt_lens):
         cache: PrefixOperatorCache | None = None
+        primary_caches: List[PrefixOperatorCache] = []
+        primary_targets: List[int] = []
         for prefix_len in range(1, len(full_ids)):
             cache = extend_prefix_cache(cache, full_ids[prefix_len - 1])
             target_id = full_ids[prefix_len] if prefix_len >= prompt_len else -1
             if target_id >= 0:
-                score, is_correct = accumulate_objective(
-                    cache=cache,
-                    query_vec=model.query,
-                    unembed_bank=model.unembed_vectors,
-                    query_target_bank=cache.primary_query_targets,
-                    objective_target_id=target_id,
-                    matrix_weight=1.0,
-                    vector_weight=1.0,
-                    query_index=None,
-                    unembed_positive_acc=unembed_positive_sum,
-                    unembed_negative_acc=unembed_negative_sum,
-                    use_output_slice=True,
-                    min_update_index=0,
-                    allow_base_update=True,
-                    left_delta_acc=left_primary_delta,
-                    right_delta_acc=right_primary_delta,
-                    base_delta_acc=base_primary_delta,
-                )
-                primary_objective_weight += 1.0
-                mean_target_score += score
-                correct += int(is_correct)
-                total += 1
+                primary_caches.append(cache)
+                primary_targets.append(target_id)
 
             accumulate_secondary_objectives(cache)
             secondary_objective_weight += float(prefix_len)
+
+        score_sum, correct_count, total_count = accumulate_primary_objectives(primary_caches, primary_targets)
+        primary_objective_weight += float(total_count)
+        mean_target_score += score_sum
+        correct += correct_count
+        total += total_count
 
     primary_scale = 1.0 / float(max(primary_objective_weight, 1.0))
     secondary_scale = 1.0 / float(max(secondary_objective_weight, 1.0))
