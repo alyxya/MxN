@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import random
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 
@@ -15,20 +16,58 @@ DIGIT_SYMBOLS = "0123456789ABCDEF"
 EPS = 1e-12
 Problem = Tuple[int, int, str, str]
 INIT_ORTHOGONALIZE_STEPS = 4
+DEFAULT_UPDATE_ORTHOGONALIZE_STEPS = 1
 
 
 def normalize_columns(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
     return x / (x.norm(dim=0, keepdim=True) + eps)
 
 
-def manual_rotation_delta(u: torch.Tensor, v: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    # A skew-symmetric alternative would use outer(v, u) - outer(u, v), but the
-    # default trainer keeps the simpler outer-diff update here.
-    return ((v - u) * weights.unsqueeze(0)) @ u.transpose(-1, -2)
+def normalize_last_dim(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
+    return x / (x.norm(dim=-1, keepdim=True) + eps)
+
+
+def matrix_rotation_generator(u: torch.Tensor, v: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    weighted_v = v * weights.unsqueeze(0)
+    weighted_u = u * weights.unsqueeze(0)
+    return weighted_v @ u.transpose(-1, -2) - weighted_u @ v.transpose(-1, -2)
+
+
+def vector_rotation_generators(current: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return torch.einsum("...i,...j->...ij", target, current) - torch.einsum("...i,...j->...ij", current, target)
 
 
 def orthogonalize_newton_schulz(w: torch.Tensor) -> torch.Tensor:
     return 1.5 * w - 0.5 * (w @ w.transpose(-1, -2) @ w)
+
+
+def orthogonalize_steps(w: torch.Tensor, steps: int) -> torch.Tensor:
+    for _ in range(max(steps, 0)):
+        w = orthogonalize_newton_schulz(w)
+    return w
+
+
+def apply_matrix_rotation(
+    current: torch.Tensor,
+    momentum_generator: torch.Tensor,
+    learning_rate: float,
+    orthogonalize_steps_count: int,
+) -> torch.Tensor:
+    eye = torch.eye(current.shape[-1], device=current.device, dtype=current.dtype)
+    if current.ndim == 2:
+        updated = (eye + learning_rate * momentum_generator) @ current
+    else:
+        updated = (eye.unsqueeze(0) + learning_rate * momentum_generator) @ current
+    return orthogonalize_steps(updated, orthogonalize_steps_count)
+
+
+def apply_vector_rotation(current: torch.Tensor, momentum_generator: torch.Tensor, learning_rate: float) -> torch.Tensor:
+    eye = torch.eye(current.shape[-1], device=current.device, dtype=current.dtype)
+    if current.ndim == 1:
+        updated = (eye + learning_rate * momentum_generator) @ current
+    else:
+        updated = ((eye.unsqueeze(0) + learning_rate * momentum_generator) @ current.unsqueeze(-1)).squeeze(-1)
+    return normalize_last_dim(updated)
 
 
 def initialize_rotation_like(shape: Tuple[int, ...], device: torch.device, strength: float) -> torch.Tensor:
@@ -45,7 +84,103 @@ def initialize_rotation_like(shape: Tuple[int, ...], device: torch.device, stren
 
 def random_unit_vectors(shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
     x = torch.randn(shape, device=device)
-    return normalize_columns(x.transpose(-1, -2)).transpose(-1, -2)
+    return normalize_last_dim(x)
+
+
+def _zeros_like_shape(shape: Sequence[int], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return torch.zeros(tuple(shape), device=device, dtype=dtype)
+
+
+@dataclass
+class ManualRotationOptimizerState:
+    momentum_decay: float
+    base_momentum: torch.Tensor | None = None
+    left_token_momentum: torch.Tensor | None = None
+    right_token_momentum: torch.Tensor | None = None
+    query_momentum: torch.Tensor | None = None
+    past_query_momentum: torch.Tensor | None = None
+    unembed_momentum: torch.Tensor | None = None
+    past_unembed_momentum: torch.Tensor | None = None
+
+    def ensure_initialized(self, model: "ManualRotationMatrixNetwork") -> None:
+        dtype = model.base_mat.dtype
+        device = model.device
+        n = model.n
+        vocab_size = model.vocab_size
+        past_count = model.past_queries.shape[0]
+
+        if self.base_momentum is None or self.base_momentum.shape != (n, n):
+            self.base_momentum = _zeros_like_shape((n, n), device=device, dtype=dtype)
+        if self.left_token_momentum is None or self.left_token_momentum.shape != (vocab_size, n, n):
+            self.left_token_momentum = _zeros_like_shape((vocab_size, n, n), device=device, dtype=dtype)
+        if self.right_token_momentum is None or self.right_token_momentum.shape != (vocab_size, n, n):
+            self.right_token_momentum = _zeros_like_shape((vocab_size, n, n), device=device, dtype=dtype)
+        if self.query_momentum is None or self.query_momentum.shape != (n, n):
+            self.query_momentum = _zeros_like_shape((n, n), device=device, dtype=dtype)
+        if self.unembed_momentum is None or self.unembed_momentum.shape != (vocab_size, n, n):
+            self.unembed_momentum = _zeros_like_shape((vocab_size, n, n), device=device, dtype=dtype)
+        if self.past_unembed_momentum is None or self.past_unembed_momentum.shape != (vocab_size, n, n):
+            self.past_unembed_momentum = _zeros_like_shape((vocab_size, n, n), device=device, dtype=dtype)
+        if self.past_query_momentum is None:
+            self.past_query_momentum = _zeros_like_shape((past_count, n, n), device=device, dtype=dtype)
+        elif self.past_query_momentum.shape[1:] != (n, n):
+            self.past_query_momentum = _zeros_like_shape((past_count, n, n), device=device, dtype=dtype)
+        elif self.past_query_momentum.shape[0] < past_count:
+            extra = _zeros_like_shape((past_count - self.past_query_momentum.shape[0], n, n), device=device, dtype=dtype)
+            self.past_query_momentum = torch.cat([self.past_query_momentum.to(device=device, dtype=dtype), extra], dim=0)
+        else:
+            self.past_query_momentum = self.past_query_momentum.to(device=device, dtype=dtype)
+
+        self.base_momentum = self.base_momentum.to(device=device, dtype=dtype)
+        self.left_token_momentum = self.left_token_momentum.to(device=device, dtype=dtype)
+        self.right_token_momentum = self.right_token_momentum.to(device=device, dtype=dtype)
+        self.query_momentum = self.query_momentum.to(device=device, dtype=dtype)
+        self.unembed_momentum = self.unembed_momentum.to(device=device, dtype=dtype)
+        self.past_unembed_momentum = self.past_unembed_momentum.to(device=device, dtype=dtype)
+
+    def state_dict(self) -> Dict[str, torch.Tensor | float]:
+        result: Dict[str, torch.Tensor | float] = {"momentum_decay": float(self.momentum_decay)}
+        if self.base_momentum is not None:
+            result["base_momentum"] = self.base_momentum
+        if self.left_token_momentum is not None:
+            result["left_token_momentum"] = self.left_token_momentum
+        if self.right_token_momentum is not None:
+            result["right_token_momentum"] = self.right_token_momentum
+        if self.query_momentum is not None:
+            result["query_momentum"] = self.query_momentum
+        if self.past_query_momentum is not None:
+            result["past_query_momentum"] = self.past_query_momentum
+        if self.unembed_momentum is not None:
+            result["unembed_momentum"] = self.unembed_momentum
+        if self.past_unembed_momentum is not None:
+            result["past_unembed_momentum"] = self.past_unembed_momentum
+        return result
+
+    @classmethod
+    def from_state_dict(
+        cls,
+        state_dict: Dict[str, Any] | None,
+        *,
+        momentum_decay: float,
+        device: torch.device,
+    ) -> "ManualRotationOptimizerState":
+        state = cls(momentum_decay=momentum_decay)
+        if not state_dict:
+            return state
+        state.momentum_decay = float(state_dict.get("momentum_decay", momentum_decay))
+        for attr in (
+            "base_momentum",
+            "left_token_momentum",
+            "right_token_momentum",
+            "query_momentum",
+            "past_query_momentum",
+            "unembed_momentum",
+            "past_unembed_momentum",
+        ):
+            value = state_dict.get(attr)
+            if isinstance(value, torch.Tensor):
+                setattr(state, attr, value.to(device))
+        return state
 
 
 def digit_alphabet(number_base: int) -> str:
@@ -175,11 +310,11 @@ class ManualRotationMatrixNetwork:
         return self.itos[self.predict_next_id(self.encode(prefix))]
 
     @classmethod
-    def from_checkpoint(cls, path: str, device: torch.device) -> Tuple["ManualRotationMatrixNetwork", int | None]:
-        try:
-            ckpt = torch.load(path, map_location=device, weights_only=False)
-        except TypeError:
-            ckpt = torch.load(path, map_location=device)
+    def from_checkpoint_dict(
+        cls,
+        ckpt: Dict[str, Any],
+        device: torch.device,
+    ) -> Tuple["ManualRotationMatrixNetwork", int | None]:
         n = int(ckpt["n"])
         number_base = int(ckpt["number_base"])
         token_mat_mode = str(ckpt["token_mat_mode"])
@@ -207,8 +342,47 @@ class ManualRotationMatrixNetwork:
             addend_digits = int(addend_digits)
         return model, addend_digits
 
+    @classmethod
+    def from_checkpoint(cls, path: str, device: torch.device) -> Tuple["ManualRotationMatrixNetwork", int | None]:
+        ckpt = load_checkpoint_dict(path, device)
+        return cls.from_checkpoint_dict(ckpt, device)
 
-def save_checkpoint(model: ManualRotationMatrixNetwork, save_path: str, addend_digits: int) -> None:
+
+def load_checkpoint_dict(path: str, device: torch.device) -> Dict[str, Any]:
+    try:
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(path, map_location=device)
+    if not isinstance(ckpt, dict):
+        raise ValueError(f"Checkpoint at {path} is not a dict")
+    return ckpt
+
+
+def load_training_checkpoint(
+    path: str,
+    device: torch.device,
+    *,
+    momentum_decay: float,
+) -> Tuple[ManualRotationMatrixNetwork, int | None, ManualRotationOptimizerState]:
+    ckpt = load_checkpoint_dict(path, device)
+    model, addend_digits = ManualRotationMatrixNetwork.from_checkpoint_dict(ckpt, device)
+    optimizer_state = ManualRotationOptimizerState.from_state_dict(
+        ckpt.get("optimizer_state"),
+        momentum_decay=momentum_decay,
+        device=device,
+    )
+    optimizer_state.ensure_initialized(model)
+    return model, addend_digits, optimizer_state
+
+
+def save_checkpoint(
+    model: ManualRotationMatrixNetwork,
+    save_path: str,
+    addend_digits: int,
+    *,
+    optimizer_state: ManualRotationOptimizerState | None = None,
+    update_orthogonalize_steps: int = DEFAULT_UPDATE_ORTHOGONALIZE_STEPS,
+) -> None:
     path = Path(save_path)
     if path.parent:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -227,6 +401,8 @@ def save_checkpoint(model: ManualRotationMatrixNetwork, save_path: str, addend_d
             "unembed_vectors": model.unembed_vectors,
             "past_unembed_vectors": model.past_unembed_vectors,
             "addend_digits": addend_digits,
+            "optimizer_state": None if optimizer_state is None else optimizer_state.state_dict(),
+            "update_orthogonalize_steps": int(update_orthogonalize_steps),
         },
         path,
     )
@@ -247,7 +423,13 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
         f"_trand{format_float_token(args.token_randomize)}"
         f"_it{args.iters}"
         f"_bs{args.batch_size}"
-        f"_lr{format_float_token(args.learning_rate)}"
+        f"_tlr{format_float_token(args.token_learning_rate)}"
+        f"_blr{format_float_token(args.base_learning_rate)}"
+        f"_pqlr{format_float_token(args.primary_query_learning_rate)}"
+        f"_pulr{format_float_token(args.primary_unembed_learning_rate)}"
+        f"_sqlr{format_float_token(args.secondary_query_learning_rate)}"
+        f"_sulr{format_float_token(args.secondary_unembed_learning_rate)}"
+        f"_mom{format_float_token(args.momentum_decay)}"
         f"_seed{args.seed}"
         f"_{timestamp}.pt"
     )
@@ -316,13 +498,18 @@ def show_samples(
 @torch.no_grad()
 def apply_batch_update(
     model: ManualRotationMatrixNetwork,
+    optimizer_state: ManualRotationOptimizerState,
     prefixes: Sequence[Sequence[int]],
     target_ids: Sequence[int],
-    learning_rate: float,
-    vector_learning_rate: float,
-    secondary_vector_learning_rate: float,
+    token_learning_rate: float,
+    base_learning_rate: float,
+    primary_query_learning_rate: float,
+    primary_unembed_learning_rate: float,
+    secondary_query_learning_rate: float,
+    secondary_unembed_learning_rate: float,
     negative_scale: float,
     secondary_matrix_scale: float,
+    update_orthogonalize_steps: int,
 ) -> Tuple[float, float]:
     n = model.n
     base_delta = torch.zeros(n, n, device=model.device)
@@ -448,13 +635,13 @@ def apply_batch_update(
                     u = normalize_columns(model.left_token_mats[tid] @ left_inputs[idx])
                     v = normalize_columns(left_target)
                     if idx >= min_update_index:
-                        left_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
+                        left_token_delta[tid].add_(matrix_rotation_generator(u, v, weights))
                     left_target = model.left_token_mats[tid].transpose(-1, -2) @ left_target
 
             if allow_base_update:
                 u_base = normalize_columns(middle_state)
                 v_base = normalize_columns(left_target)
-                base_delta.add_(manual_rotation_delta(u_base, v_base, weights))
+                base_delta.add_(matrix_rotation_generator(u_base, v_base, weights))
 
             query_target = base.transpose(-1, -2) @ left_target
             if model.uses_right_token_mats():
@@ -462,7 +649,7 @@ def apply_batch_update(
                     u = normalize_columns(model.right_token_mats[tid] @ right_inputs[idx])
                     v = normalize_columns(query_target)
                     if idx >= min_update_index:
-                        right_token_delta[tid].add_(manual_rotation_delta(u, v, weights))
+                        right_token_delta[tid].add_(matrix_rotation_generator(u, v, weights))
                     query_target = model.right_token_mats[tid].transpose(-1, -2) @ query_target
 
             if use_output_slice:
@@ -519,55 +706,108 @@ def apply_batch_update(
             )
             total_objective_weight += secondary_matrix_scale
 
-    eye = torch.eye(model.n, device=model.device)
     objective_scale = 1.0 / float(max(total_objective_weight, 1.0))
-    if total > 0:
-        updated = (eye + learning_rate * (base_delta * objective_scale)) @ model.base_mat
-        model.base_mat = orthogonalize_newton_schulz(updated)
+    optimizer_state.ensure_initialized(model)
+    decay = optimizer_state.momentum_decay
 
-    left_active = left_token_delta.abs().amax(dim=(1, 2)) > 0
-    if left_active.any():
-        updated = (eye.unsqueeze(0) + learning_rate * (left_token_delta[left_active] * objective_scale)) @ model.left_token_mats[left_active]
-        model.left_token_mats[left_active] = orthogonalize_newton_schulz(updated)
+    assert optimizer_state.base_momentum is not None
+    assert optimizer_state.left_token_momentum is not None
+    assert optimizer_state.right_token_momentum is not None
+    assert optimizer_state.query_momentum is not None
+    assert optimizer_state.past_query_momentum is not None
+    assert optimizer_state.unembed_momentum is not None
+    assert optimizer_state.past_unembed_momentum is not None
 
-    right_active = right_token_delta.abs().amax(dim=(1, 2)) > 0
-    if right_active.any():
-        updated = (eye.unsqueeze(0) + learning_rate * (right_token_delta[right_active] * objective_scale)) @ model.right_token_mats[right_active]
-        model.right_token_mats[right_active] = orthogonalize_newton_schulz(updated)
+    optimizer_state.base_momentum.mul_(decay).add_(base_delta * objective_scale)
+    if float(optimizer_state.base_momentum.abs().amax().item()) > EPS:
+        model.base_mat = apply_matrix_rotation(
+            model.base_mat,
+            optimizer_state.base_momentum,
+            base_learning_rate,
+            update_orthogonalize_steps,
+        )
+
+    optimizer_state.left_token_momentum.mul_(decay).add_(left_token_delta * objective_scale)
+    left_hist_active = optimizer_state.left_token_momentum.abs().amax(dim=(1, 2)) > EPS
+    if left_hist_active.any():
+        model.left_token_mats[left_hist_active] = apply_matrix_rotation(
+            model.left_token_mats[left_hist_active],
+            optimizer_state.left_token_momentum[left_hist_active],
+            token_learning_rate,
+            update_orthogonalize_steps,
+        )
+
+    optimizer_state.right_token_momentum.mul_(decay).add_(right_token_delta * objective_scale)
+    right_hist_active = optimizer_state.right_token_momentum.abs().amax(dim=(1, 2)) > EPS
+    if right_hist_active.any():
+        model.right_token_mats[right_hist_active] = apply_matrix_rotation(
+            model.right_token_mats[right_hist_active],
+            optimizer_state.right_token_momentum[right_hist_active],
+            token_learning_rate,
+            update_orthogonalize_steps,
+        )
 
     query_net = query_positive_sum - negative_scale * query_negative_sum
     query_net_norm = float(query_net.norm().item())
+    query_delta = torch.zeros_like(optimizer_state.query_momentum)
     if query_net_norm > EPS:
         query_target = query_net / query_net_norm
-        updated_query = model.query + vector_learning_rate * (query_target - model.query)
-        model.query = normalize_columns(updated_query.unsqueeze(1))[:, 0]
+        query_delta = vector_rotation_generators(model.query, query_target)
+    optimizer_state.query_momentum.mul_(decay).add_(query_delta)
+    if float(optimizer_state.query_momentum.abs().amax().item()) > EPS:
+        model.query = apply_vector_rotation(model.query, optimizer_state.query_momentum, primary_query_learning_rate)
 
     past_query_net = past_query_positive_sum - negative_scale * past_query_negative_sum
-    past_query_net_norm = past_query_net.norm(dim=1)
-    past_query_active = past_query_net_norm > EPS
-    if past_query_active.any():
-        current = model.past_queries[past_query_active]
-        target_dirs = past_query_net[past_query_active] / past_query_net_norm[past_query_active].unsqueeze(1)
-        updated = current + secondary_vector_learning_rate * (target_dirs - current)
-        model.past_queries[past_query_active] = normalize_columns(updated.transpose(0, 1)).transpose(0, 1)
+    if model.past_queries.shape[0] > 0:
+        past_query_delta = torch.zeros_like(optimizer_state.past_query_momentum[: model.past_queries.shape[0]])
+        past_query_net_norm = past_query_net.norm(dim=1)
+        past_query_active = past_query_net_norm > EPS
+        if past_query_active.any():
+            target_dirs = past_query_net[past_query_active] / past_query_net_norm[past_query_active].unsqueeze(1)
+            past_query_delta[past_query_active] = vector_rotation_generators(model.past_queries[past_query_active], target_dirs)
+        optimizer_state.past_query_momentum[: model.past_queries.shape[0]].mul_(decay).add_(past_query_delta)
+        past_hist_active = optimizer_state.past_query_momentum[: model.past_queries.shape[0]].abs().amax(dim=(1, 2)) > EPS
+        if past_hist_active.any():
+            model.past_queries[past_hist_active] = apply_vector_rotation(
+                model.past_queries[past_hist_active],
+                optimizer_state.past_query_momentum[: model.past_queries.shape[0]][past_hist_active],
+                secondary_query_learning_rate,
+            )
 
     unembed_net = unembed_positive_sum - negative_scale * unembed_negative_sum
+    unembed_delta = torch.zeros_like(optimizer_state.unembed_momentum)
     unembed_net_norm = unembed_net.norm(dim=1)
     unembed_active = unembed_net_norm > EPS
     if unembed_active.any():
         target_dirs = unembed_net[unembed_active] / unembed_net_norm[unembed_active].unsqueeze(1)
-        current = model.unembed_vectors[unembed_active]
-        updated = current + vector_learning_rate * (target_dirs - current)
-        model.unembed_vectors[unembed_active] = normalize_columns(updated.transpose(0, 1)).transpose(0, 1)
+        unembed_delta[unembed_active] = vector_rotation_generators(model.unembed_vectors[unembed_active], target_dirs)
+    optimizer_state.unembed_momentum.mul_(decay).add_(unembed_delta)
+    unembed_hist_active = optimizer_state.unembed_momentum.abs().amax(dim=(1, 2)) > EPS
+    if unembed_hist_active.any():
+        model.unembed_vectors[unembed_hist_active] = apply_vector_rotation(
+            model.unembed_vectors[unembed_hist_active],
+            optimizer_state.unembed_momentum[unembed_hist_active],
+            primary_unembed_learning_rate,
+        )
 
     past_unembed_net = past_unembed_positive_sum - negative_scale * past_unembed_negative_sum
+    past_unembed_delta = torch.zeros_like(optimizer_state.past_unembed_momentum)
     past_unembed_net_norm = past_unembed_net.norm(dim=1)
     past_unembed_active = past_unembed_net_norm > EPS
     if past_unembed_active.any():
         target_dirs = past_unembed_net[past_unembed_active] / past_unembed_net_norm[past_unembed_active].unsqueeze(1)
-        current = model.past_unembed_vectors[past_unembed_active]
-        updated = current + secondary_vector_learning_rate * (target_dirs - current)
-        model.past_unembed_vectors[past_unembed_active] = normalize_columns(updated.transpose(0, 1)).transpose(0, 1)
+        past_unembed_delta[past_unembed_active] = vector_rotation_generators(
+            model.past_unembed_vectors[past_unembed_active],
+            target_dirs,
+        )
+    optimizer_state.past_unembed_momentum.mul_(decay).add_(past_unembed_delta)
+    past_unembed_hist_active = optimizer_state.past_unembed_momentum.abs().amax(dim=(1, 2)) > EPS
+    if past_unembed_hist_active.any():
+        model.past_unembed_vectors[past_unembed_hist_active] = apply_vector_rotation(
+            model.past_unembed_vectors[past_unembed_hist_active],
+            optimizer_state.past_unembed_momentum[past_unembed_hist_active],
+            secondary_unembed_learning_rate,
+        )
 
     return (
         mean_target_score / max(total, 1),
@@ -578,11 +818,15 @@ def apply_batch_update(
 def train(
     *,
     model: ManualRotationMatrixNetwork,
+    optimizer_state: ManualRotationOptimizerState,
     iters: int,
     batch_size: int,
-    learning_rate: float,
-    vector_learning_rate: float,
-    secondary_vector_learning_rate: float,
+    token_learning_rate: float,
+    base_learning_rate: float,
+    primary_query_learning_rate: float,
+    primary_unembed_learning_rate: float,
+    secondary_query_learning_rate: float,
+    secondary_unembed_learning_rate: float,
     addend_digits: int,
     number_base: int,
     seed: int,
@@ -591,7 +835,8 @@ def train(
     eval_samples: int,
     negative_scale: float,
     secondary_matrix_scale: float,
-) -> ManualRotationMatrixNetwork:
+    update_orthogonalize_steps: int,
+) -> Tuple[ManualRotationMatrixNetwork, ManualRotationOptimizerState]:
     rng = random.Random(seed)
 
     def sample_batch() -> Tuple[List[List[int]], List[int]]:
@@ -615,13 +860,18 @@ def train(
         prefixes, target_ids = sample_batch()
         mean_target_score, token_acc = apply_batch_update(
             model,
+            optimizer_state,
             prefixes=prefixes,
             target_ids=target_ids,
-            learning_rate=learning_rate,
-            vector_learning_rate=vector_learning_rate,
-            secondary_vector_learning_rate=secondary_vector_learning_rate,
+            token_learning_rate=token_learning_rate,
+            base_learning_rate=base_learning_rate,
+            primary_query_learning_rate=primary_query_learning_rate,
+            primary_unembed_learning_rate=primary_unembed_learning_rate,
+            secondary_query_learning_rate=secondary_query_learning_rate,
+            secondary_unembed_learning_rate=secondary_unembed_learning_rate,
             negative_scale=negative_scale,
             secondary_matrix_scale=secondary_matrix_scale,
+            update_orthogonalize_steps=update_orthogonalize_steps,
         )
 
         if iter_idx % log_every == 0 or iter_idx == 1:
@@ -643,21 +893,25 @@ def train(
                 f"stop_rate={stop_rate:.3f}"
             )
 
-    return model
+    return model, optimizer_state
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Dense matrix network with manual rotation updates and learned query/unembedding vectors")
-    p.add_argument("--n", type=int, required=True, help="Square matrix dimension; must be >= vocab size")
+    p.add_argument("--n", type=int, default=32, help="Square matrix dimension; must be >= vocab size")
     p.add_argument("--number-base", type=int, default=10, help="Arithmetic base for generated addition problems (2-16)")
     p.add_argument("--token-mat-mode", type=str, default="right", choices=["left", "right", "both"], help="Apply learned token matrices on the left of base, right of base, or both")
-    p.add_argument("--base-randomize", type=float, default=1.0, help="Base init randomization strength; 0 gives identity, 1 matches the old partial-random init")
-    p.add_argument("--token-randomize", type=float, default=1.0, help="Token-matrix init randomization strength; 0 gives identity, 1 matches the old partial-random init")
-    p.add_argument("--iters", type=int, default=1500, help="Training iterations")
+    p.add_argument("--base-randomize", type=float, default=0.0, help="Base init randomization strength; 0 gives identity")
+    p.add_argument("--token-randomize", type=float, default=0.0, help="Token-matrix init randomization strength; 0 gives identity")
+    p.add_argument("--iters", type=int, default=5000, help="Training iterations")
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
-    p.add_argument("--learning-rate", type=float, default=0.01, help="Manual rotation step size")
-    p.add_argument("--vector-learning-rate", type=float, default=0.1, help="Step size for primary learned query/unembed vector updates")
-    p.add_argument("--secondary-vector-learning-rate", type=float, default=0.5, help="Step size for learned past-query and past-unembed vector updates")
+    p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token embedding matrices")
+    p.add_argument("--base-learning-rate", type=float, default=0.5, help="Step size for the base matrix")
+    p.add_argument("--primary-query-learning-rate", type=float, default=0.1, help="Step size for the primary next-token query vector")
+    p.add_argument("--primary-unembed-learning-rate", type=float, default=0.1, help="Step size for primary next-token unembedding vectors")
+    p.add_argument("--secondary-query-learning-rate", type=float, default=0.03, help="Step size for secondary past-token query vectors")
+    p.add_argument("--secondary-unembed-learning-rate", type=float, default=0.03, help="Step size for secondary past-token unembedding vectors")
+    p.add_argument("--momentum-decay", type=float, default=0.99, help="Exponential decay for rotation momentum buffers")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
@@ -665,6 +919,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-samples", type=int, default=300)
     p.add_argument("--negative-scale", type=float, default=0.1, help="Repulsion weight for wrong learned vectors that outscore the correct one")
     p.add_argument("--secondary-matrix-scale", type=float, default=0.1, help="Scale multiplier for matrix learning from past-token auxiliary objectives")
+    p.add_argument("--update-orthogonalize-steps", type=int, default=1, help="Newton-Schulz orthogonalization steps after each matrix update")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
     p.add_argument("--save-path", type=str, default=None, help="Optional checkpoint path override")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -673,6 +928,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if not (0.0 <= args.momentum_decay < 1.0):
+        raise ValueError("--momentum-decay must be in [0, 1)")
+    if args.update_orthogonalize_steps < 0:
+        raise ValueError("--update-orthogonalize-steps must be >= 0")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -681,9 +940,12 @@ def main() -> None:
     device = pick_device(args.device)
     print(f"device={device}")
     print(
-        f"iters={args.iters} learning_rate={args.learning_rate} "
-        f"vector_learning_rate={args.vector_learning_rate} "
-        f"secondary_vector_learning_rate={args.secondary_vector_learning_rate}"
+        f"iters={args.iters} token_learning_rate={args.token_learning_rate} "
+        f"base_learning_rate={args.base_learning_rate} "
+        f"primary_query_learning_rate={args.primary_query_learning_rate} "
+        f"primary_unembed_learning_rate={args.primary_unembed_learning_rate} "
+        f"secondary_query_learning_rate={args.secondary_query_learning_rate} "
+        f"secondary_unembed_learning_rate={args.secondary_unembed_learning_rate}"
     )
     print(
         f"token_mat_mode={args.token_mat_mode} "
@@ -691,9 +953,11 @@ def main() -> None:
     )
     print(
         f"base_randomize={args.base_randomize} token_randomize={args.token_randomize} "
-        f"orthogonalize=one_step_per_update"
+        f"momentum_decay={args.momentum_decay} "
+        f"update_orthogonalize_steps={args.update_orthogonalize_steps}"
     )
 
+    optimizer_state = ManualRotationOptimizerState(momentum_decay=args.momentum_decay)
     if args.load_path is None:
         model = ManualRotationMatrixNetwork(
             n=args.n,
@@ -705,7 +969,11 @@ def main() -> None:
         )
         addend_digits = args.addend_digits
     else:
-        model, loaded_addend_digits = ManualRotationMatrixNetwork.from_checkpoint(args.load_path, device)
+        model, loaded_addend_digits, optimizer_state = load_training_checkpoint(
+            args.load_path,
+            device,
+            momentum_decay=args.momentum_decay,
+        )
         if model.n != args.n:
             print(f"loaded_n={model.n}; overriding --n={args.n}")
         if model.number_base != args.number_base:
@@ -720,13 +988,17 @@ def main() -> None:
     print(f"output_vocab={model.output_vocab}")
     print(f"save_path={save_path}")
 
-    model = train(
+    model, optimizer_state = train(
         model=model,
+        optimizer_state=optimizer_state,
         iters=args.iters,
         batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        vector_learning_rate=args.vector_learning_rate,
-        secondary_vector_learning_rate=args.secondary_vector_learning_rate,
+        token_learning_rate=args.token_learning_rate,
+        base_learning_rate=args.base_learning_rate,
+        primary_query_learning_rate=args.primary_query_learning_rate,
+        primary_unembed_learning_rate=args.primary_unembed_learning_rate,
+        secondary_query_learning_rate=args.secondary_query_learning_rate,
+        secondary_unembed_learning_rate=args.secondary_unembed_learning_rate,
         addend_digits=addend_digits,
         number_base=model.number_base,
         seed=args.seed,
@@ -735,9 +1007,16 @@ def main() -> None:
         eval_samples=args.eval_samples,
         negative_scale=args.negative_scale,
         secondary_matrix_scale=args.secondary_matrix_scale,
+        update_orthogonalize_steps=args.update_orthogonalize_steps,
     )
 
-    save_checkpoint(model, save_path, addend_digits=addend_digits)
+    save_checkpoint(
+        model,
+        save_path,
+        addend_digits=addend_digits,
+        optimizer_state=optimizer_state,
+        update_orthogonalize_steps=args.update_orthogonalize_steps,
+    )
     print(f"saved_checkpoint={save_path}")
     print("\nSample predictions:")
     show_samples(model, seed=args.seed + 999, addend_digits=addend_digits, number_base=model.number_base)

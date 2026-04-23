@@ -9,10 +9,12 @@ import torch
 from matrix_network_manual_rotation import (
     ManualRotationMatrixNetwork,
     default_save_path,
+    load_training_checkpoint,
     pick_device,
     save_checkpoint,
     show_samples,
     train,
+    ManualRotationOptimizerState,
 )
 
 APP_NAME = "mxn-matrix-network"
@@ -53,7 +55,7 @@ def _remote_load_path(load_path: str) -> str:
 
 def parse_modal_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run matrix network training on Modal")
-    p.add_argument("--n", type=int, required=True, help="Square matrix dimension; must be >= vocab size")
+    p.add_argument("--n", type=int, default=32, help="Square matrix dimension; must be >= vocab size")
     p.add_argument("--number-base", type=int, default=10, help="Arithmetic base for generated addition problems (2-16)")
     p.add_argument(
         "--token-mat-mode",
@@ -65,23 +67,32 @@ def parse_modal_args() -> argparse.Namespace:
     p.add_argument(
         "--base-randomize",
         type=float,
-        default=1.0,
-        help="Base init randomization strength; 0 gives identity, 1 matches the old partial-random init",
+        default=0.0,
+        help="Base init randomization strength; 0 gives identity",
     )
     p.add_argument(
         "--token-randomize",
         type=float,
-        default=1.0,
-        help="Token-matrix init randomization strength; 0 gives identity, 1 matches the old partial-random init",
+        default=0.0,
+        help="Token-matrix init randomization strength; 0 gives identity",
     )
-    p.add_argument("--iters", type=int, default=1500, help="Training iterations")
+    p.add_argument("--iters", type=int, default=5000, help="Training iterations")
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
-    p.add_argument("--learning-rate", type=float, default=0.01, help="Training step size")
+    p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token embedding matrices")
+    p.add_argument("--base-learning-rate", type=float, default=0.5, help="Step size for the base matrix")
+    p.add_argument("--primary-query-learning-rate", type=float, default=0.1, help="Step size for the primary next-token query vector")
+    p.add_argument("--primary-unembed-learning-rate", type=float, default=0.1, help="Step size for primary next-token unembedding vectors")
+    p.add_argument("--secondary-query-learning-rate", type=float, default=0.03, help="Step size for secondary past-token query vectors")
+    p.add_argument("--secondary-unembed-learning-rate", type=float, default=0.03, help="Step size for secondary past-token unembedding vectors")
+    p.add_argument("--momentum-decay", type=float, default=0.99, help="Exponential decay for rotation momentum buffers")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
+    p.add_argument("--negative-scale", type=float, default=0.1, help="Repulsion weight for wrong learned vectors that outscore the correct one")
+    p.add_argument("--secondary-matrix-scale", type=float, default=0.1, help="Scale multiplier for matrix learning from past-token auxiliary objectives")
+    p.add_argument("--update-orthogonalize-steps", type=int, default=1, help="Newton-Schulz orthogonalization steps after each matrix update")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint path relative to Modal volume")
     p.add_argument("--save-path", type=str, default=None, help="Optional checkpoint path relative to Modal volume")
     p.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "cuda"], help="Remote device choice")
@@ -93,22 +104,35 @@ def parse_modal_args() -> argparse.Namespace:
 
 def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
     args = argparse.Namespace(**args_dict)
+    if not (0.0 <= args.momentum_decay < 1.0):
+        raise ValueError("--momentum-decay must be in [0, 1)")
+    if args.update_orthogonalize_steps < 0:
+        raise ValueError("--update-orthogonalize-steps must be >= 0")
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
     device = pick_device(args.device)
     print(f"device={device}")
-    print(f"iters={args.iters} learning_rate={args.learning_rate}")
+    print(
+        f"iters={args.iters} token_learning_rate={args.token_learning_rate} "
+        f"base_learning_rate={args.base_learning_rate} "
+        f"primary_query_learning_rate={args.primary_query_learning_rate} "
+        f"primary_unembed_learning_rate={args.primary_unembed_learning_rate} "
+        f"secondary_query_learning_rate={args.secondary_query_learning_rate} "
+        f"secondary_unembed_learning_rate={args.secondary_unembed_learning_rate}"
+    )
     print(
         f"token_mat_mode={args.token_mat_mode} "
         f"addend_digits={args.addend_digits} number_base={args.number_base}"
     )
     print(
         f"base_randomize={args.base_randomize} token_randomize={args.token_randomize} "
-        f"orthogonalize=one_step_per_update"
+        f"momentum_decay={args.momentum_decay} "
+        f"update_orthogonalize_steps={args.update_orthogonalize_steps}"
     )
 
+    optimizer_state = ManualRotationOptimizerState(momentum_decay=args.momentum_decay)
     if args.load_path is None:
         model = ManualRotationMatrixNetwork(
             n=args.n,
@@ -120,7 +144,11 @@ def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
         )
         addend_digits = args.addend_digits
     else:
-        model, loaded_addend_digits = ManualRotationMatrixNetwork.from_checkpoint(_remote_load_path(args.load_path), device)
+        model, loaded_addend_digits, optimizer_state = load_training_checkpoint(
+            _remote_load_path(args.load_path),
+            device,
+            momentum_decay=args.momentum_decay,
+        )
         if model.n != args.n:
             print(f"loaded_n={model.n}; overriding --n={args.n}")
         if model.number_base != args.number_base:
@@ -136,20 +164,35 @@ def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
     print(f"output_vocab={model.output_vocab}")
     print(f"save_path={save_path}")
 
-    model = train(
+    model, optimizer_state = train(
         model=model,
+        optimizer_state=optimizer_state,
         iters=args.iters,
         batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
+        token_learning_rate=args.token_learning_rate,
+        base_learning_rate=args.base_learning_rate,
+        primary_query_learning_rate=args.primary_query_learning_rate,
+        primary_unembed_learning_rate=args.primary_unembed_learning_rate,
+        secondary_query_learning_rate=args.secondary_query_learning_rate,
+        secondary_unembed_learning_rate=args.secondary_unembed_learning_rate,
         addend_digits=addend_digits,
         number_base=model.number_base,
         seed=args.seed,
         log_every=args.log_every,
         eval_every=args.eval_every,
         eval_samples=args.eval_samples,
+        negative_scale=args.negative_scale,
+        secondary_matrix_scale=args.secondary_matrix_scale,
+        update_orthogonalize_steps=args.update_orthogonalize_steps,
     )
 
-    save_checkpoint(model, save_path, addend_digits=addend_digits)
+    save_checkpoint(
+        model,
+        save_path,
+        addend_digits=addend_digits,
+        optimizer_state=optimizer_state,
+        update_orthogonalize_steps=args.update_orthogonalize_steps,
+    )
     volume.commit()
     print(f"saved_checkpoint={save_path}")
     print("\nSample predictions:")
