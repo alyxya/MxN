@@ -9,6 +9,7 @@ import torch
 from matrix_network_manual_rotation import (
     ManualRotationMatrixNetwork,
     default_save_path,
+    format_run_config,
     load_training_checkpoint,
     pick_device,
     save_checkpoint,
@@ -114,23 +115,6 @@ def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
 
     device = pick_device(args.device)
     print(f"device={device}")
-    print(
-        f"iters={args.iters} token_learning_rate={args.token_learning_rate} "
-        f"base_learning_rate={args.base_learning_rate} "
-        f"primary_query_learning_rate={args.primary_query_learning_rate} "
-        f"primary_unembed_learning_rate={args.primary_unembed_learning_rate} "
-        f"secondary_query_learning_rate={args.secondary_query_learning_rate} "
-        f"secondary_unembed_learning_rate={args.secondary_unembed_learning_rate}"
-    )
-    print(
-        f"token_mat_mode={args.token_mat_mode} "
-        f"addend_digits={args.addend_digits} number_base={args.number_base}"
-    )
-    print(
-        f"base_randomize={args.base_randomize} token_randomize={args.token_randomize} "
-        f"momentum_decay={args.momentum_decay} "
-        f"update_orthogonalize_steps={args.update_orthogonalize_steps}"
-    )
 
     optimizer_state = ManualRotationOptimizerState(momentum_decay=args.momentum_decay)
     if args.load_path is None:
@@ -163,6 +147,8 @@ def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
     save_path = _remote_checkpoint_path(args.save_path or default_path)
     print(f"output_vocab={model.output_vocab}")
     print(f"save_path={save_path}")
+    args.save_path = save_path
+    print(format_run_config(args, addend_digits=addend_digits))
 
     model, optimizer_state = train(
         model=model,

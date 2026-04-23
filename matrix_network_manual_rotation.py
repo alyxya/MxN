@@ -412,6 +412,34 @@ def format_float_token(x: float) -> str:
     return format(x, ".6g").replace("-", "m").replace(".", "p")
 
 
+def format_run_config(args: argparse.Namespace, *, addend_digits: int) -> str:
+    items = [
+        ("n", args.n),
+        ("number_base", args.number_base),
+        ("addend_digits", addend_digits),
+        ("token_mat_mode", args.token_mat_mode),
+        ("base_randomize", args.base_randomize),
+        ("token_randomize", args.token_randomize),
+        ("iters", args.iters),
+        ("batch_size", args.batch_size),
+        ("token_learning_rate", args.token_learning_rate),
+        ("base_learning_rate", args.base_learning_rate),
+        ("primary_query_learning_rate", args.primary_query_learning_rate),
+        ("primary_unembed_learning_rate", args.primary_unembed_learning_rate),
+        ("secondary_query_learning_rate", args.secondary_query_learning_rate),
+        ("secondary_unembed_learning_rate", args.secondary_unembed_learning_rate),
+        ("momentum_decay", args.momentum_decay),
+        ("negative_scale", args.negative_scale),
+        ("secondary_matrix_scale", args.secondary_matrix_scale),
+        ("update_orthogonalize_steps", args.update_orthogonalize_steps),
+        ("seed", args.seed),
+        ("device", args.device),
+        ("load_path", args.load_path),
+        ("save_path", args.save_path),
+    ]
+    return "\n".join(f"{k}={v}" for k, v in items)
+
+
 def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     name = (
@@ -430,6 +458,9 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
         f"_sqlr{format_float_token(args.secondary_query_learning_rate)}"
         f"_sulr{format_float_token(args.secondary_unembed_learning_rate)}"
         f"_mom{format_float_token(args.momentum_decay)}"
+        f"_neg{format_float_token(args.negative_scale)}"
+        f"_sms{format_float_token(args.secondary_matrix_scale)}"
+        f"_orth{args.update_orthogonalize_steps}"
         f"_seed{args.seed}"
         f"_{timestamp}.pt"
     )
@@ -959,23 +990,6 @@ def main() -> None:
 
     device = pick_device(args.device)
     print(f"device={device}")
-    print(
-        f"iters={args.iters} token_learning_rate={args.token_learning_rate} "
-        f"base_learning_rate={args.base_learning_rate} "
-        f"primary_query_learning_rate={args.primary_query_learning_rate} "
-        f"primary_unembed_learning_rate={args.primary_unembed_learning_rate} "
-        f"secondary_query_learning_rate={args.secondary_query_learning_rate} "
-        f"secondary_unembed_learning_rate={args.secondary_unembed_learning_rate}"
-    )
-    print(
-        f"token_mat_mode={args.token_mat_mode} "
-        f"addend_digits={args.addend_digits} number_base={args.number_base}"
-    )
-    print(
-        f"base_randomize={args.base_randomize} token_randomize={args.token_randomize} "
-        f"momentum_decay={args.momentum_decay} "
-        f"update_orthogonalize_steps={args.update_orthogonalize_steps}"
-    )
 
     optimizer_state = ManualRotationOptimizerState(momentum_decay=args.momentum_decay)
     if args.load_path is None:
@@ -1007,6 +1021,8 @@ def main() -> None:
     save_path = args.save_path or default_save_path(args, addend_digits)
     print(f"output_vocab={model.output_vocab}")
     print(f"save_path={save_path}")
+    args.save_path = save_path
+    print(format_run_config(args, addend_digits=addend_digits))
 
     model, optimizer_state = train(
         model=model,
