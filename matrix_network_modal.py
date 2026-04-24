@@ -65,6 +65,8 @@ def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("--checkpoint-every must be >= 0")
     if args.primary_target_randomize < 0:
         raise ValueError("--primary-target-randomize must be >= 0")
+    if args.secondary_matrix_period < 1:
+        raise ValueError("--secondary-matrix-period must be >= 1")
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -139,6 +141,7 @@ def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
         eval_every=args.eval_every,
         eval_samples=args.eval_samples,
         secondary_matrix_scale=args.secondary_matrix_scale,
+        secondary_matrix_period=args.secondary_matrix_period,
         update_orthogonalize_steps=args.update_orthogonalize_steps,
         checkpoint_every=args.checkpoint_every,
         checkpoint_callback=checkpoint_callback if args.checkpoint_every > 0 else None,
@@ -175,7 +178,17 @@ def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
     gpu=None,
     timeout=24 * 60 * 60,
 )
-def train_remote(args_dict: dict[str, Any]) -> dict[str, Any]:
+def train_remote_cpu(args_dict: dict[str, Any]) -> dict[str, Any]:
+    return _train_impl(args_dict)
+
+
+@app.function(
+    image=image,
+    volumes={str(REMOTE_CHECKPOINT_ROOT): volume},
+    gpu="T4",
+    timeout=24 * 60 * 60,
+)
+def train_remote_t4(args_dict: dict[str, Any]) -> dict[str, Any]:
     return _train_impl(args_dict)
 
 
@@ -251,13 +264,13 @@ def main(
     eval_every: int = 250,
     eval_samples: int = 300,
     secondary_matrix_scale: float = 0.0,
+    secondary_matrix_period: int = 1,
     update_orthogonalize_steps: int = 1,
     checkpoint_every: int = 250,
     load_path: str = "",
     save_path: str = "",
     device: str = "auto",
     gpu: str = "T4",
-    timeout: int = 24 * 60 * 60,
     prefix: str = "",
     remote_path: str = "",
     local_path: str = "",
@@ -307,6 +320,7 @@ def main(
         "eval_every": eval_every,
         "eval_samples": eval_samples,
         "secondary_matrix_scale": secondary_matrix_scale,
+        "secondary_matrix_period": secondary_matrix_period,
         "update_orthogonalize_steps": update_orthogonalize_steps,
         "checkpoint_every": checkpoint_every,
         "load_path": load_path or None,
@@ -314,11 +328,13 @@ def main(
         "device": device,
     }
 
-    remote_fn = train_remote
-    if gpu.lower() in {"", "none", "cpu"}:
-        gpu = None
-    if gpu is not None or timeout != 24 * 60 * 60:
-        remote_fn = train_remote.with_options(gpu=gpu, timeout=timeout)
+    gpu_key = gpu.lower()
+    if gpu_key in {"", "none", "cpu"}:
+        remote_fn = train_remote_cpu
+    elif gpu_key == "t4":
+        remote_fn = train_remote_t4
+    else:
+        raise ValueError(f"unsupported --gpu {gpu!r}; supported values are 'none' and 'T4'")
 
     result = remote_fn.remote(args_dict)
     print("\nModal run result:")

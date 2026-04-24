@@ -540,6 +540,7 @@ def format_run_config(args: argparse.Namespace, *, addend_digits: int) -> str:
         ("primary_target_randomize", args.primary_target_randomize),
         ("momentum_decay", args.momentum_decay),
         ("secondary_matrix_scale", args.secondary_matrix_scale),
+        ("secondary_matrix_period", args.secondary_matrix_period),
         ("update_orthogonalize_steps", args.update_orthogonalize_steps),
         ("checkpoint_every", getattr(args, "checkpoint_every", 0)),
         ("seed", args.seed),
@@ -566,6 +567,7 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
         f"_ptr{format_float_token(args.primary_target_randomize)}"
         f"_mom{format_float_token(args.momentum_decay)}"
         f"_sms{format_float_token(args.secondary_matrix_scale)}"
+        f"_smp{args.secondary_matrix_period}"
         f"_orth{args.update_orthogonalize_steps}"
         f"_seed{args.seed}"
         f"_{timestamp}.pt"
@@ -773,6 +775,7 @@ def apply_batch_update(
     base_learning_rate: float,
     primary_target_randomize: float,
     secondary_matrix_scale: float,
+    use_secondary_objective: bool,
     update_orthogonalize_steps: int,
 ) -> Tuple[float, float]:
     n = model.n
@@ -1006,7 +1009,7 @@ def apply_batch_update(
             final_ops_buffer[prefix_len - 1] = cache.final_state_op
             left_total_ops_buffer[prefix_len - 1] = cache.left_total_op
 
-        if secondary_matrix_scale != 0.0:
+        if use_secondary_objective:
             for prefix_len, cache in enumerate(prefix_caches, start=1):
                 secondary_objective_weight += float(accumulate_secondary_objectives(cache))
 
@@ -1102,6 +1105,7 @@ def train(
     eval_every: int,
     eval_samples: int,
     secondary_matrix_scale: float,
+    secondary_matrix_period: int,
     update_orthogonalize_steps: int,
     checkpoint_every: int = 0,
     checkpoint_callback: Callable[[int, ManualRotationMatrixNetwork, ManualRotationOptimizerState], None] | None = None,
@@ -1134,6 +1138,7 @@ def train(
 
     for iter_idx in range(1, iters + 1):
         sequences, prompt_lens = sample_batch()
+        use_secondary_objective = secondary_matrix_scale != 0.0 and iter_idx % secondary_matrix_period == 0
         mean_target_score, token_acc = apply_batch_update(
             model,
             optimizer_state,
@@ -1144,6 +1149,7 @@ def train(
             base_learning_rate=base_learning_rate,
             primary_target_randomize=primary_target_randomize,
             secondary_matrix_scale=secondary_matrix_scale,
+            use_secondary_objective=use_secondary_objective,
             update_orthogonalize_steps=update_orthogonalize_steps,
         )
 
@@ -1200,6 +1206,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
     p.add_argument("--secondary-matrix-scale", type=float, default=0.0, help="Scale multiplier for matrix learning from past-token auxiliary objectives; 0 disables it")
+    p.add_argument("--secondary-matrix-period", type=int, default=1, help="Run secondary matrix objective every N training iterations when enabled")
     p.add_argument("--update-orthogonalize-steps", type=int, default=1, help="Newton-Schulz orthogonalization steps after each matrix update")
     p.add_argument("--checkpoint-every", type=int, default=0, help="Save latest checkpoint every N iterations; 0 disables periodic saves")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
@@ -1218,6 +1225,8 @@ def main() -> None:
         raise ValueError("--checkpoint-every must be >= 0")
     if args.primary_target_randomize < 0:
         raise ValueError("--primary-target-randomize must be >= 0")
+    if args.secondary_matrix_period < 1:
+        raise ValueError("--secondary-matrix-period must be >= 1")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -1290,6 +1299,7 @@ def main() -> None:
         eval_every=args.eval_every,
         eval_samples=args.eval_samples,
         secondary_matrix_scale=args.secondary_matrix_scale,
+        secondary_matrix_period=args.secondary_matrix_period,
         update_orthogonalize_steps=args.update_orthogonalize_steps,
         checkpoint_every=args.checkpoint_every,
         checkpoint_callback=checkpoint_callback if args.checkpoint_every > 0 else None,

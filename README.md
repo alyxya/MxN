@@ -165,6 +165,7 @@ modal run matrix_network_modal.py \
   --addend-digits 10 \
   --batch-size 32 \
   --primary-target-randomize 0.1 \
+  --secondary-matrix-scale 0 \
   --checkpoint-every 0 \
   --eval-every 100 \
   --eval-samples 50 \
@@ -181,6 +182,7 @@ modal run matrix_network_modal.py \
   --addend-digits 10 \
   --batch-size 32 \
   --primary-target-randomize 0.1 \
+  --secondary-matrix-scale 0 \
   --checkpoint-every 0 \
   --eval-every 100 \
   --eval-samples 50 \
@@ -197,6 +199,22 @@ modal run matrix_network_modal.py \
   --addend-digits 10 \
   --batch-size 32 \
   --primary-target-randomize 0.1 \
+  --secondary-matrix-scale 0 \
+  --gpu T4 \
+  --device cuda
+```
+
+Run sparse secondary-objective updates every 20 iterations:
+
+```bash
+modal run matrix_network_modal.py \
+  --iters 20000 \
+  --n 64 \
+  --addend-digits 10 \
+  --batch-size 32 \
+  --primary-target-randomize 0.1 \
+  --secondary-matrix-scale 0.01 \
+  --secondary-matrix-period 20 \
   --gpu T4 \
   --device cuda
 ```
