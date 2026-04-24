@@ -520,12 +520,7 @@ def format_run_config(args: argparse.Namespace, *, addend_digits: int) -> str:
         ("batch_size", args.batch_size),
         ("token_learning_rate", args.token_learning_rate),
         ("base_learning_rate", args.base_learning_rate),
-        ("primary_query_learning_rate", args.primary_query_learning_rate),
-        ("primary_unembed_learning_rate", args.primary_unembed_learning_rate),
-        ("secondary_query_learning_rate", args.secondary_query_learning_rate),
-        ("secondary_unembed_learning_rate", args.secondary_unembed_learning_rate),
         ("momentum_decay", args.momentum_decay),
-        ("negative_scale", args.negative_scale),
         ("secondary_matrix_scale", args.secondary_matrix_scale),
         ("update_orthogonalize_steps", args.update_orthogonalize_steps),
         ("checkpoint_every", getattr(args, "checkpoint_every", 0)),
@@ -550,12 +545,7 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
         f"_bs{args.batch_size}"
         f"_tlr{format_float_token(args.token_learning_rate)}"
         f"_blr{format_float_token(args.base_learning_rate)}"
-        f"_pqlr{format_float_token(args.primary_query_learning_rate)}"
-        f"_pulr{format_float_token(args.primary_unembed_learning_rate)}"
-        f"_sqlr{format_float_token(args.secondary_query_learning_rate)}"
-        f"_sulr{format_float_token(args.secondary_unembed_learning_rate)}"
         f"_mom{format_float_token(args.momentum_decay)}"
-        f"_neg{format_float_token(args.negative_scale)}"
         f"_sms{format_float_token(args.secondary_matrix_scale)}"
         f"_orth{args.update_orthogonalize_steps}"
         f"_seed{args.seed}"
@@ -770,11 +760,6 @@ def apply_batch_update(
     prompt_lens: Sequence[int],
     token_learning_rate: float,
     base_learning_rate: float,
-    primary_query_learning_rate: float,
-    primary_unembed_learning_rate: float,
-    secondary_query_learning_rate: float,
-    secondary_unembed_learning_rate: float,
-    negative_scale: float,
     secondary_matrix_scale: float,
     update_orthogonalize_steps: int,
 ) -> Tuple[float, float]:
@@ -792,13 +777,6 @@ def apply_batch_update(
     primary_objective_weight = 0.0
     secondary_objective_weight = 0.0
     mean_target_score = 0.0
-    _ = (
-        primary_query_learning_rate,
-        primary_unembed_learning_rate,
-        secondary_query_learning_rate,
-        secondary_unembed_learning_rate,
-        negative_scale,
-    )
 
     base = model.base_mat
     base_t = base.transpose(-1, -2)
@@ -1097,17 +1075,12 @@ def train(
     batch_size: int,
     token_learning_rate: float,
     base_learning_rate: float,
-    primary_query_learning_rate: float,
-    primary_unembed_learning_rate: float,
-    secondary_query_learning_rate: float,
-    secondary_unembed_learning_rate: float,
     addend_digits: int,
     number_base: int,
     seed: int,
     log_every: int,
     eval_every: int,
     eval_samples: int,
-    negative_scale: float,
     secondary_matrix_scale: float,
     update_orthogonalize_steps: int,
     checkpoint_every: int = 0,
@@ -1149,11 +1122,6 @@ def train(
             prompt_lens=prompt_lens,
             token_learning_rate=token_learning_rate,
             base_learning_rate=base_learning_rate,
-            primary_query_learning_rate=primary_query_learning_rate,
-            primary_unembed_learning_rate=primary_unembed_learning_rate,
-            secondary_query_learning_rate=secondary_query_learning_rate,
-            secondary_unembed_learning_rate=secondary_unembed_learning_rate,
-            negative_scale=negative_scale,
             secondary_matrix_scale=secondary_matrix_scale,
             update_orthogonalize_steps=update_orthogonalize_steps,
         )
@@ -1195,7 +1163,7 @@ def train(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Dense matrix network with manual rotation updates and learned query/unembedding vectors")
+    p = argparse.ArgumentParser(description="Dense matrix network with manual rotation updates and static query/unembedding vectors")
     p.add_argument("--n", type=int, default=32, help="Square matrix dimension; must be >= vocab size")
     p.add_argument("--number-base", type=int, default=10, help="Arithmetic base for generated addition problems (2-16)")
     p.add_argument("--token-mat-mode", type=str, default="right", choices=["left", "right", "both"], help="Apply learned token matrices on the left of base, right of base, or both")
@@ -1205,17 +1173,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
     p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token embedding matrices")
     p.add_argument("--base-learning-rate", type=float, default=0.1, help="Step size for the base matrix")
-    p.add_argument("--primary-query-learning-rate", type=float, default=0.001, help="Unused compatibility flag; primary query vector is static")
-    p.add_argument("--primary-unembed-learning-rate", type=float, default=0.001, help="Unused compatibility flag; primary unembedding vectors are static")
-    p.add_argument("--secondary-query-learning-rate", type=float, default=0.1, help="Unused compatibility flag; secondary query vectors are static")
-    p.add_argument("--secondary-unembed-learning-rate", type=float, default=0.1, help="Unused compatibility flag; secondary unembedding vectors are static")
     p.add_argument("--momentum-decay", type=float, default=0.9, help="EMA decay for primary matrix momentum buffers")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
-    p.add_argument("--negative-scale", type=float, default=2.0, help="Unused compatibility flag; vectors are static and wrong predictions only gate matrix updates")
     p.add_argument("--secondary-matrix-scale", type=float, default=0.1, help="Scale multiplier for matrix learning from past-token auxiliary objectives")
     p.add_argument("--update-orthogonalize-steps", type=int, default=1, help="Newton-Schulz orthogonalization steps after each matrix update")
     p.add_argument("--checkpoint-every", type=int, default=0, help="Save latest checkpoint every N iterations; 0 disables periodic saves")
@@ -1293,17 +1256,12 @@ def main() -> None:
         batch_size=args.batch_size,
         token_learning_rate=args.token_learning_rate,
         base_learning_rate=args.base_learning_rate,
-        primary_query_learning_rate=args.primary_query_learning_rate,
-        primary_unembed_learning_rate=args.primary_unembed_learning_rate,
-        secondary_query_learning_rate=args.secondary_query_learning_rate,
-        secondary_unembed_learning_rate=args.secondary_unembed_learning_rate,
         addend_digits=addend_digits,
         number_base=model.number_base,
         seed=args.seed,
         log_every=args.log_every,
         eval_every=args.eval_every,
         eval_samples=args.eval_samples,
-        negative_scale=args.negative_scale,
         secondary_matrix_scale=args.secondary_matrix_scale,
         update_orthogonalize_steps=args.update_orthogonalize_steps,
         checkpoint_every=args.checkpoint_every,
