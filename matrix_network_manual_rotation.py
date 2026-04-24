@@ -9,6 +9,9 @@ from typing import Any, Callable, Dict, List, Sequence, Tuple
 import torch
 
 
+TAU = 2.0 * torch.pi
+
+
 EOS_TOKEN = "~"
 PLUS_TOKEN = "+"
 EQUALS_TOKEN = "="
@@ -41,10 +44,6 @@ def matrix_rotation_generator(u: torch.Tensor, v: torch.Tensor, weight: float) -
     return (v @ u.transpose(-1, -2) - u @ v.transpose(-1, -2)) * weight
 
 
-def vector_rotation_generators(current: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    return torch.einsum("...i,...j->...ij", target, current) - torch.einsum("...i,...j->...ij", current, target)
-
-
 def orthogonalize_newton_schulz(w: torch.Tensor) -> torch.Tensor:
     return 1.5 * w - 0.5 * (w @ w.transpose(-1, -2) @ w)
 
@@ -69,15 +68,6 @@ def apply_matrix_rotation(
     return orthogonalize_steps(updated, orthogonalize_steps_count)
 
 
-def apply_vector_rotation(current: torch.Tensor, momentum_generator: torch.Tensor, learning_rate: float) -> torch.Tensor:
-    eye = cached_eye(current.shape[-1], current.device, current.dtype)
-    if current.ndim == 1:
-        updated = (eye + learning_rate * momentum_generator) @ current
-    else:
-        updated = ((eye.unsqueeze(0) + learning_rate * momentum_generator) @ current.unsqueeze(-1)).squeeze(-1)
-    return normalize_last_dim(updated)
-
-
 def initialize_rotation_like(shape: Tuple[int, ...], device: torch.device, strength: float) -> torch.Tensor:
     n = shape[-1]
     eye = cached_eye(n, device, torch.float32)
@@ -90,9 +80,18 @@ def initialize_rotation_like(shape: Tuple[int, ...], device: torch.device, stren
     return w
 
 
-def random_unit_vectors(shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
-    x = torch.randn(shape, device=device)
-    return normalize_last_dim(x)
+def one_hot_vectors(count: int, dim: int, device: torch.device) -> torch.Tensor:
+    vectors = torch.zeros((count, dim), device=device)
+    vectors[:, :count] = cached_eye(count, device, vectors.dtype)
+    return vectors
+
+
+def random_sinusoidal_vectors(shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
+    dim = shape[-1]
+    t = torch.arange(dim, device=device, dtype=torch.float32)
+    frequencies = torch.rand((*shape[:-1], 1), device=device) * TAU
+    phases = torch.rand((*shape[:-1], 1), device=device) * TAU
+    return normalize_last_dim(torch.sin(frequencies * t + phases))
 
 
 def _zeros_like_shape(shape: Sequence[int], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -159,21 +158,9 @@ class BatchUpdateWorkspace:
     right_primary_delta: torch.Tensor | None = None
     left_secondary_delta: torch.Tensor | None = None
     right_secondary_delta: torch.Tensor | None = None
-    query_positive_sum: torch.Tensor | None = None
-    query_negative_sum: torch.Tensor | None = None
-    past_query_positive_sum: torch.Tensor | None = None
-    past_query_negative_sum: torch.Tensor | None = None
-    unembed_positive_sum: torch.Tensor | None = None
-    unembed_negative_sum: torch.Tensor | None = None
-    past_unembed_positive_sum: torch.Tensor | None = None
-    past_unembed_negative_sum: torch.Tensor | None = None
-    past_query_delta: torch.Tensor | None = None
-    unembed_delta: torch.Tensor | None = None
-    past_unembed_delta: torch.Tensor | None = None
     seq_middle_ops: torch.Tensor | None = None
     seq_final_ops: torch.Tensor | None = None
     seq_left_total_ops: torch.Tensor | None = None
-    seq_query_target_ops: torch.Tensor | None = None
     seq_left_u_ops: torch.Tensor | None = None
     seq_right_v_ops: torch.Tensor | None = None
 
@@ -182,7 +169,6 @@ class BatchUpdateWorkspace:
         device = model.device
         n = model.n
         vocab_size = model.vocab_size
-        past_count = model.past_queries.shape[0]
 
         def ensure_zero(name: str, shape: Tuple[int, ...]) -> torch.Tensor:
             tensor = getattr(self, name)
@@ -198,17 +184,6 @@ class BatchUpdateWorkspace:
         ensure_zero("right_primary_delta", (vocab_size, n, n))
         ensure_zero("left_secondary_delta", (vocab_size, n, n))
         ensure_zero("right_secondary_delta", (vocab_size, n, n))
-        ensure_zero("query_positive_sum", (n,))
-        ensure_zero("query_negative_sum", (n,))
-        ensure_zero("past_query_positive_sum", (past_count, n))
-        ensure_zero("past_query_negative_sum", (past_count, n))
-        ensure_zero("unembed_positive_sum", (vocab_size, n))
-        ensure_zero("unembed_negative_sum", (vocab_size, n))
-        ensure_zero("past_unembed_positive_sum", (vocab_size, n))
-        ensure_zero("past_unembed_negative_sum", (vocab_size, n))
-        ensure_zero("past_query_delta", (past_count, n, n))
-        ensure_zero("unembed_delta", (vocab_size, n, n))
-        ensure_zero("past_unembed_delta", (vocab_size, n, n))
 
     def ensure_sequence_buffers(self, *, max_prefix_len: int, n: int, device: torch.device, dtype: torch.dtype) -> None:
         def ensure(name: str) -> torch.Tensor:
@@ -222,7 +197,6 @@ class BatchUpdateWorkspace:
         ensure("seq_middle_ops")
         ensure("seq_final_ops")
         ensure("seq_left_total_ops")
-        ensure("seq_query_target_ops")
         ensure("seq_left_u_ops")
         ensure("seq_right_v_ops")
 
@@ -363,10 +337,10 @@ class ManualRotationMatrixNetwork:
         self.stoi: Dict[str, int] = {ch: i for i, ch in enumerate(self.vocab)}
         self.itos: Dict[int, str] = {i: ch for ch, i in self.stoi.items()}
 
-        self.query = random_unit_vectors((1, n), device)[0]
+        self.query = one_hot_vectors(1, n, device)[0]
         self.past_queries = torch.empty((0, n), device=device)
-        self.unembed_vectors = random_unit_vectors((self.vocab_size, n), device)
-        self.past_unembed_vectors = random_unit_vectors((self.vocab_size, n), device)
+        self.unembed_vectors = one_hot_vectors(self.vocab_size, n, device)
+        self.past_unembed_vectors = torch.empty((0, self.vocab_size, n), device=device)
 
         self.base_mat = initialize_rotation_like((n, n), device, base_randomize)
         self.left_token_mats = initialize_rotation_like((self.vocab_size, n, n), device, token_randomize)
@@ -383,13 +357,20 @@ class ManualRotationMatrixNetwork:
 
     def ensure_past_queries(self, count: int) -> None:
         current = self.past_queries.shape[0]
-        if count <= current:
+        if count <= current and self.past_unembed_vectors.shape[:2] == (current, self.vocab_size):
             return
-        extra = random_unit_vectors((count - current, self.n), self.device)
+        if self.past_unembed_vectors.shape[:2] != (current, self.vocab_size):
+            current = 0
+            self.past_queries = torch.empty((0, self.n), device=self.device)
+            self.past_unembed_vectors = torch.empty((0, self.vocab_size, self.n), device=self.device)
+        extra_queries = random_sinusoidal_vectors((count - current, self.n), self.device)
+        extra_unembeds = random_sinusoidal_vectors((count - current, self.vocab_size, self.n), self.device)
         if current == 0:
-            self.past_queries = extra
+            self.past_queries = extra_queries
+            self.past_unembed_vectors = extra_unembeds
         else:
-            self.past_queries = torch.cat([self.past_queries, extra], dim=0)
+            self.past_queries = torch.cat([self.past_queries, extra_queries], dim=0)
+            self.past_unembed_vectors = torch.cat([self.past_unembed_vectors, extra_unembeds], dim=0)
 
     def prefix_state_from_query(self, token_ids: Sequence[int], query: torch.Tensor) -> torch.Tensor:
         v = query
@@ -433,14 +414,17 @@ class ManualRotationMatrixNetwork:
         model.left_token_mats = ckpt["left_token_mats"].to(device)
         model.right_token_mats = ckpt["right_token_mats"].to(device)
         model.base_mat = ckpt["base_mat"].to(device)
-        if "query" in ckpt:
-            model.query = ckpt["query"].to(device)
         if "past_queries" in ckpt:
             model.past_queries = ckpt["past_queries"].to(device)
-        if "unembed_vectors" in ckpt:
-            model.unembed_vectors = ckpt["unembed_vectors"].to(device)
         if "past_unembed_vectors" in ckpt:
-            model.past_unembed_vectors = ckpt["past_unembed_vectors"].to(device)
+            past_unembed_vectors = ckpt["past_unembed_vectors"].to(device)
+            if past_unembed_vectors.ndim == 3:
+                model.past_unembed_vectors = past_unembed_vectors
+        model.query = one_hot_vectors(1, n, device)[0]
+        model.unembed_vectors = one_hot_vectors(model.vocab_size, n, device)
+        if model.past_unembed_vectors.shape[:2] != (model.past_queries.shape[0], model.vocab_size):
+            model.past_queries = torch.empty((0, n), device=device)
+            model.past_unembed_vectors = torch.empty((0, model.vocab_size, n), device=device)
         addend_digits = ckpt.get("addend_digits")
         if addend_digits is not None:
             addend_digits = int(addend_digits)
@@ -648,9 +632,9 @@ def subspace_summary(vectors: torch.Tensor) -> Dict[str, float]:
         raise ValueError(f"expected 2D tensor for subspace summary, got shape={tuple(vectors.shape)}")
     sample_count, dim = vectors.shape
     if sample_count == 0:
-        return {"rank_eps": 0.0, "rank_99": 0.0, "pr": 0.0, "erank": 0.0}
+        return {"rank_eps": 0.0, "rank_99": 0.0, "pr": 0.0, "erank": 0.0, "dim": float(dim), "samples": 0.0}
     if sample_count == 1:
-        return {"rank_eps": 1.0, "rank_99": 1.0, "pr": 1.0, "erank": 1.0}
+        return {"rank_eps": 1.0, "rank_99": 1.0, "pr": 1.0, "erank": 1.0, "dim": float(dim), "samples": 1.0}
 
     centered = vectors - vectors.mean(dim=0, keepdim=True)
     svals = torch.linalg.svdvals(centered)
@@ -744,7 +728,7 @@ def evaluate(
     query_summary = subspace_summary(model.query.unsqueeze(0).detach().cpu())
     past_query_summary = subspace_summary(model.past_queries.detach().cpu())
     unembed_summary = subspace_summary(model.unembed_vectors.detach().cpu())
-    past_unembed_summary = subspace_summary(model.past_unembed_vectors.detach().cpu())
+    past_unembed_summary = subspace_summary(model.past_unembed_vectors.detach().cpu().reshape(-1, model.n))
 
     return (
         exact / max(eval_samples, 1),
@@ -803,19 +787,18 @@ def apply_batch_update(
     right_primary_delta = workspace.right_primary_delta
     left_secondary_delta = workspace.left_secondary_delta
     right_secondary_delta = workspace.right_secondary_delta
-    query_positive_sum = workspace.query_positive_sum
-    query_negative_sum = workspace.query_negative_sum
-    past_query_positive_sum = workspace.past_query_positive_sum
-    past_query_negative_sum = workspace.past_query_negative_sum
-    unembed_positive_sum = workspace.unembed_positive_sum
-    unembed_negative_sum = workspace.unembed_negative_sum
-    past_unembed_positive_sum = workspace.past_unembed_positive_sum
-    past_unembed_negative_sum = workspace.past_unembed_negative_sum
     correct = 0
     total = 0
     primary_objective_weight = 0.0
     secondary_objective_weight = 0.0
     mean_target_score = 0.0
+    _ = (
+        primary_query_learning_rate,
+        primary_unembed_learning_rate,
+        secondary_query_learning_rate,
+        secondary_unembed_learning_rate,
+        negative_scale,
+    )
 
     base = model.base_mat
     base_t = base.transpose(-1, -2)
@@ -889,13 +872,12 @@ def apply_batch_update(
         middle_ops_buffer: torch.Tensor,
         final_ops_buffer: torch.Tensor,
         left_total_ops_buffer: torch.Tensor,
-        query_target_ops_buffer: torch.Tensor,
-    ) -> Tuple[float, int, int]:
+    ) -> Tuple[float, int, int, int]:
         total_prefixes = len(full_ids) - 1
         primary_start = prompt_len - 1
         total_count = total_prefixes - primary_start
         if total_count <= 0:
-            return 0.0, 0, 0
+            return 0.0, 0, 0, 0
 
         target_ids_tensor = torch.tensor(full_ids[prompt_len:], device=model.device, dtype=torch.long)
         prefix_lens = torch.arange(prompt_len, len(full_ids), device=model.device, dtype=torch.long)
@@ -906,23 +888,13 @@ def apply_batch_update(
         state_vecs = normalize_last_dim((final_ops @ query_mat).squeeze(-1))
         scores = model.unembed_vectors @ state_vecs.transpose(0, 1)
         prefix_indices = torch.arange(total_count, device=model.device)
-        query_target_ops = query_target_ops_buffer[primary_start:total_prefixes]
-        primary_query_targets = normalize_last_dim(
-            torch.matmul(model.unembed_vectors.unsqueeze(0), query_target_ops.transpose(-1, -2))
-        )
-        query_positive = primary_query_targets[prefix_indices, target_ids_tensor]
-        query_positive_sum.add_(query_positive.sum(dim=0))
-        unembed_positive_sum.index_add_(0, target_ids_tensor, state_vecs)
-
         target_scores = scores[target_ids_tensor, prefix_indices]
-        hard_negative_mask = scores[: model.output_vocab_size] > target_scores.unsqueeze(0)
-        hard_negative_mask[target_ids_tensor, prefix_indices] = False
-        neg_pairs = hard_negative_mask.transpose(0, 1).nonzero(as_tuple=False)
-        if neg_pairs.numel() > 0:
-            neg_prefix_idx = neg_pairs[:, 0]
-            neg_wrong_ids = neg_pairs[:, 1]
-            unembed_negative_sum.index_add_(0, neg_wrong_ids, state_vecs[neg_prefix_idx])
-            query_negative_sum.add_(primary_query_targets[neg_prefix_idx, neg_wrong_ids].sum(dim=0))
+        predicted_ids = scores[: model.output_vocab_size].argmax(dim=0)
+        mistaken_prefix_mask = predicted_ids != target_ids_tensor
+        mistake_count = int(mistaken_prefix_mask.sum().item())
+        correct_count = total_count - mistake_count
+        if mistake_count == 0:
+            return float(target_scores.sum().item()), correct_count, total_count, 0
 
         target_mats = model.unembed_vectors[target_ids_tensor].unsqueeze(-1)
 
@@ -932,17 +904,20 @@ def apply_batch_update(
                 active_start = max(0, idx - prompt_len + 1)
                 if active_start >= total_count:
                     continue
+                active_mask = mistaken_prefix_mask[active_start:]
+                if not active_mask.any():
+                    continue
                 tid = full_ids[idx]
-                u_ops = left_u_buffer[idx].unsqueeze(0).expand(total_count - active_start, -1, -1)
-                left_total_t = left_total_ops_buffer[primary_start + active_start : total_prefixes].transpose(-1, -2)
+                u_ops = left_u_buffer[idx].unsqueeze(0).expand(total_count - active_start, -1, -1)[active_mask]
+                left_total_t = left_total_ops_buffer[primary_start + active_start : total_prefixes].transpose(-1, -2)[active_mask]
                 v_ops = u_ops @ left_total_t
-                u = normalize_last_dim((u_ops @ middle_states[active_start:]).squeeze(-1)).unsqueeze(-1)
-                v = normalize_last_dim((v_ops @ target_mats[active_start:]).squeeze(-1)).unsqueeze(-1)
+                u = normalize_last_dim((u_ops @ middle_states[active_start:][active_mask]).squeeze(-1)).unsqueeze(-1)
+                v = normalize_last_dim((v_ops @ target_mats[active_start:][active_mask]).squeeze(-1)).unsqueeze(-1)
                 left_primary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0).sum(dim=0))
 
-        left_all_ops = left_total_ops_buffer[primary_start:total_prefixes].transpose(-1, -2)
-        u_base = normalize_last_dim(middle_states.squeeze(-1)).unsqueeze(-1)
-        v_base = normalize_last_dim((left_all_ops @ target_mats).squeeze(-1)).unsqueeze(-1)
+        left_all_ops = left_total_ops_buffer[primary_start:total_prefixes].transpose(-1, -2)[mistaken_prefix_mask]
+        u_base = normalize_last_dim(middle_states[mistaken_prefix_mask].squeeze(-1)).unsqueeze(-1)
+        v_base = normalize_last_dim((left_all_ops @ target_mats[mistaken_prefix_mask]).squeeze(-1)).unsqueeze(-1)
         base_primary_delta.add_(matrix_rotation_generator(u_base, v_base, 1.0).sum(dim=0))
 
         if model.uses_right_token_mats():
@@ -953,65 +928,69 @@ def apply_batch_update(
                 active_start = max(0, idx - prompt_len + 1)
                 if active_start >= total_count:
                     continue
+                active_mask = mistaken_prefix_mask[active_start:]
+                if not active_mask.any():
+                    continue
                 tid = full_ids[idx]
-                v_ops = right_v_buffer[idx].unsqueeze(0).expand(total_count - active_start, -1, -1)
+                v_ops = right_v_buffer[idx].unsqueeze(0).expand(total_count - active_start, -1, -1)[active_mask]
                 right_total_ops = torch.stack(
                     [cache.right_total_op for cache in primary_caches[active_start:]],
                     dim=0,
-                )
+                )[active_mask]
                 u_ops = v_ops @ right_total_ops
-                u = normalize_last_dim((u_ops @ query_mat.expand(total_count - active_start, -1, -1)).squeeze(-1)).unsqueeze(-1)
-                v = normalize_last_dim((v_ops @ base_query_targets[active_start:]).squeeze(-1)).unsqueeze(-1)
+                active_count = int(active_mask.sum().item())
+                u = normalize_last_dim((u_ops @ query_mat.unsqueeze(0).expand(active_count, -1, -1)).squeeze(-1)).unsqueeze(-1)
+                v = normalize_last_dim((v_ops @ base_query_targets[active_start:][active_mask]).squeeze(-1)).unsqueeze(-1)
                 right_primary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0).sum(dim=0))
 
-        correct_count = int((scores[: model.output_vocab_size].argmax(dim=0) == target_ids_tensor).sum().item())
-        return float(target_scores.sum().item()), correct_count, total_count
+        return float(target_scores.sum().item()), correct_count, total_count, mistake_count
 
-    def accumulate_secondary_objectives(cache: PrefixOperatorCache, secondary_query_targets: torch.Tensor) -> None:
+    def accumulate_secondary_objectives(cache: PrefixOperatorCache) -> int:
         prefix_len = len(cache.prefix_ids)
         if prefix_len == 0:
-            return
+            return 0
 
         query_bank = model.past_queries[:prefix_len]
         query_mats = query_bank.transpose(0, 1)
         middle_states = cache.middle_op @ query_mats
         state_mats = cache.final_state_op @ query_mats
         state_normed = normalize_columns(state_mats)
-        scores = model.past_unembed_vectors @ state_normed
+        past_unembed_bank = model.past_unembed_vectors[:prefix_len]
+        scores = torch.einsum("lvn,nl->vl", past_unembed_bank, state_normed)
         target_ids_tensor = cache.reversed_prefix_ids
         lag_indices = torch.arange(prefix_len, device=model.device)
 
-        past_unembed_positive_sum.index_add_(0, target_ids_tensor, state_normed.transpose(0, 1))
-        past_query_positive_sum[:prefix_len].add_(secondary_query_targets[target_ids_tensor])
-
         target_scores = scores[target_ids_tensor, lag_indices]
-        hard_negative_mask = scores > target_scores.unsqueeze(0)
-        hard_negative_mask[target_ids_tensor, lag_indices] = False
-        neg_pairs = hard_negative_mask.transpose(0, 1).nonzero(as_tuple=False)
-        if neg_pairs.numel() > 0:
-            neg_lag_indices = neg_pairs[:, 0]
-            neg_wrong_ids = neg_pairs[:, 1]
-            neg_states = state_normed.transpose(0, 1)[neg_lag_indices]
-            past_unembed_negative_sum.index_add_(0, neg_wrong_ids, neg_states)
-            past_query_negative_sum.index_add_(0, neg_lag_indices, secondary_query_targets[neg_wrong_ids])
+        predicted_ids = scores.argmax(dim=0)
+        mistaken_lag_mask = predicted_ids != target_ids_tensor
+        mistake_count = int(mistaken_lag_mask.sum().item())
+        if mistake_count == 0:
+            return 0
 
-        target_mats = model.past_unembed_vectors[target_ids_tensor].transpose(0, 1)
+        target_mats = past_unembed_bank[lag_indices, target_ids_tensor].transpose(0, 1)
         base_query_targets = cache.base_query_target_op @ target_mats
 
         if model.uses_left_token_mats():
             for idx in range(prefix_len - 1, -1, -1):
                 tid = cache.prefix_ids[idx]
                 active_end = idx + 1
-                u = normalize_columns(cache.left_u_ops[idx] @ middle_states[:, :active_end])
-                v = normalize_columns((cache.left_u_ops[idx] @ cache.left_total_op.transpose(-1, -2)) @ target_mats[:, :active_end])
+                active_mask = mistaken_lag_mask[:active_end]
+                if not active_mask.any():
+                    continue
+                u = normalize_columns(cache.left_u_ops[idx] @ middle_states[:, :active_end][:, active_mask])
+                v = normalize_columns((cache.left_u_ops[idx] @ cache.left_total_op.transpose(-1, -2)) @ target_mats[:, :active_end][:, active_mask])
                 left_secondary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0))
 
         if model.uses_right_token_mats():
             for idx, tid in enumerate(cache.prefix_ids):
                 active_end = idx + 1
-                u = normalize_columns((cache.right_v_prefix_ops[idx] @ cache.right_total_op) @ query_mats[:, :active_end])
-                v = normalize_columns(cache.right_v_prefix_ops[idx] @ base_query_targets[:, :active_end])
+                active_mask = mistaken_lag_mask[:active_end]
+                if not active_mask.any():
+                    continue
+                u = normalize_columns((cache.right_v_prefix_ops[idx] @ cache.right_total_op) @ query_mats[:, :active_end][:, active_mask])
+                v = normalize_columns(cache.right_v_prefix_ops[idx] @ base_query_targets[:, :active_end][:, active_mask])
                 right_secondary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0))
+        return mistake_count
 
     for full_ids, prompt_len in zip(sequences, prompt_lens):
         seq_max_prefix_len = len(full_ids) - 1
@@ -1019,7 +998,6 @@ def apply_batch_update(
         middle_ops_buffer = workspace.seq_middle_ops[:seq_max_prefix_len]
         final_ops_buffer = workspace.seq_final_ops[:seq_max_prefix_len]
         left_total_ops_buffer = workspace.seq_left_total_ops[:seq_max_prefix_len]
-        query_target_ops_buffer = workspace.seq_query_target_ops[:seq_max_prefix_len]
         left_u_buffer = workspace.seq_left_u_ops[:seq_max_prefix_len] if model.uses_left_token_mats() else workspace.seq_left_u_ops[:0]
         right_v_buffer = workspace.seq_right_v_ops[:seq_max_prefix_len] if model.uses_right_token_mats() else workspace.seq_right_v_ops[:0]
 
@@ -1031,26 +1009,19 @@ def apply_batch_update(
             middle_ops_buffer[prefix_len - 1] = cache.middle_op
             final_ops_buffer[prefix_len - 1] = cache.final_state_op
             left_total_ops_buffer[prefix_len - 1] = cache.left_total_op
-            query_target_ops_buffer[prefix_len - 1] = cache.query_target_op
 
-        secondary_query_targets_buffer = normalize_last_dim(
-            torch.matmul(model.past_unembed_vectors.unsqueeze(0), query_target_ops_buffer.transpose(-1, -2))
-        )
         for prefix_len, cache in enumerate(prefix_caches, start=1):
-            prefix_query_targets = secondary_query_targets_buffer[prefix_len - 1]
-            accumulate_secondary_objectives(cache, prefix_query_targets)
-            secondary_objective_weight += float(prefix_len)
+            secondary_objective_weight += float(accumulate_secondary_objectives(cache))
 
-        score_sum, correct_count, total_count = accumulate_primary_objectives(
+        score_sum, correct_count, total_count, primary_mistake_count = accumulate_primary_objectives(
             full_ids,
             prompt_len,
             prefix_caches,
             middle_ops_buffer,
             final_ops_buffer,
             left_total_ops_buffer,
-            query_target_ops_buffer,
         )
-        primary_objective_weight += float(total_count)
+        primary_objective_weight += float(primary_mistake_count)
         mean_target_score += score_sum
         correct += correct_count
         total += total_count
@@ -1110,56 +1081,6 @@ def apply_batch_update(
             right_secondary_delta[right_secondary_active] * (secondary_scale * secondary_matrix_scale),
             token_learning_rate,
             update_orthogonalize_steps,
-        )
-
-    query_net = query_positive_sum - negative_scale * query_negative_sum
-    query_net_norm = float(query_net.norm().item())
-    if query_net_norm > EPS:
-        query_target = query_net / query_net_norm
-        query_delta = vector_rotation_generators(model.query, query_target)
-        model.query = apply_vector_rotation(model.query, query_delta, primary_query_learning_rate)
-
-    past_query_net = past_query_positive_sum - negative_scale * past_query_negative_sum
-    if model.past_queries.shape[0] > 0:
-        past_query_delta = workspace.past_query_delta
-        past_query_net_norm = past_query_net.norm(dim=1)
-        past_query_active = past_query_net_norm > EPS
-        if past_query_active.any():
-            target_dirs = past_query_net[past_query_active] / past_query_net_norm[past_query_active].unsqueeze(1)
-            past_query_delta[past_query_active] = vector_rotation_generators(model.past_queries[past_query_active], target_dirs)
-            model.past_queries[past_query_active] = apply_vector_rotation(
-                model.past_queries[past_query_active],
-                past_query_delta[past_query_active],
-                secondary_query_learning_rate,
-            )
-
-    unembed_net = unembed_positive_sum - negative_scale * unembed_negative_sum
-    unembed_delta = workspace.unembed_delta
-    unembed_net_norm = unembed_net.norm(dim=1)
-    unembed_active = unembed_net_norm > EPS
-    if unembed_active.any():
-        target_dirs = unembed_net[unembed_active] / unembed_net_norm[unembed_active].unsqueeze(1)
-        unembed_delta[unembed_active] = vector_rotation_generators(model.unembed_vectors[unembed_active], target_dirs)
-        model.unembed_vectors[unembed_active] = apply_vector_rotation(
-            model.unembed_vectors[unembed_active],
-            unembed_delta[unembed_active],
-            primary_unembed_learning_rate,
-        )
-
-    past_unembed_net = past_unembed_positive_sum - negative_scale * past_unembed_negative_sum
-    past_unembed_delta = workspace.past_unembed_delta
-    past_unembed_net_norm = past_unembed_net.norm(dim=1)
-    past_unembed_active = past_unembed_net_norm > EPS
-    if past_unembed_active.any():
-        target_dirs = past_unembed_net[past_unembed_active] / past_unembed_net_norm[past_unembed_active].unsqueeze(1)
-        past_unembed_delta[past_unembed_active] = vector_rotation_generators(
-            model.past_unembed_vectors[past_unembed_active],
-            target_dirs,
-        )
-        model.past_unembed_vectors[past_unembed_active] = apply_vector_rotation(
-            model.past_unembed_vectors[past_unembed_active],
-            past_unembed_delta[past_unembed_active],
-            secondary_unembed_learning_rate,
         )
 
     return (
@@ -1284,17 +1205,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
     p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token embedding matrices")
     p.add_argument("--base-learning-rate", type=float, default=0.1, help="Step size for the base matrix")
-    p.add_argument("--primary-query-learning-rate", type=float, default=0.001, help="Step size for the primary next-token query vector")
-    p.add_argument("--primary-unembed-learning-rate", type=float, default=0.001, help="Step size for primary next-token unembedding vectors")
-    p.add_argument("--secondary-query-learning-rate", type=float, default=0.1, help="Step size for secondary past-token query vectors")
-    p.add_argument("--secondary-unembed-learning-rate", type=float, default=0.1, help="Step size for secondary past-token unembedding vectors")
+    p.add_argument("--primary-query-learning-rate", type=float, default=0.001, help="Unused compatibility flag; primary query vector is static")
+    p.add_argument("--primary-unembed-learning-rate", type=float, default=0.001, help="Unused compatibility flag; primary unembedding vectors are static")
+    p.add_argument("--secondary-query-learning-rate", type=float, default=0.1, help="Unused compatibility flag; secondary query vectors are static")
+    p.add_argument("--secondary-unembed-learning-rate", type=float, default=0.1, help="Unused compatibility flag; secondary unembedding vectors are static")
     p.add_argument("--momentum-decay", type=float, default=0.9, help="EMA decay for primary matrix momentum buffers")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
-    p.add_argument("--negative-scale", type=float, default=2.0, help="Repulsion weight for wrong learned vectors that outscore the correct one")
+    p.add_argument("--negative-scale", type=float, default=2.0, help="Unused compatibility flag; vectors are static and wrong predictions only gate matrix updates")
     p.add_argument("--secondary-matrix-scale", type=float, default=0.1, help="Scale multiplier for matrix learning from past-token auxiliary objectives")
     p.add_argument("--update-orthogonalize-steps", type=int, default=1, help="Newton-Schulz orthogonalization steps after each matrix update")
     p.add_argument("--checkpoint-every", type=int, default=0, help="Save latest checkpoint every N iterations; 0 disables periodic saves")
