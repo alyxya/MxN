@@ -152,6 +152,55 @@ python matrix_network_manual_rotation.py \
   --save-path checkpoints/manual_rotation_dense_n30_d3_memw01.pt
 ```
 
+## Modal Manual-Rotation Runs
+
+The Modal wrapper mirrors `matrix_network_manual_rotation.py`, stores checkpoints in the `mxn-matrix-network-checkpoints` volume, and prints `elapsed_seconds` plus `iters_per_second` at the end of each run.
+
+Short CPU benchmark:
+
+```bash
+modal run matrix_network_modal.py \
+  --iters 300 \
+  --n 64 \
+  --addend-digits 10 \
+  --batch-size 32 \
+  --primary-target-randomize 0.1 \
+  --checkpoint-every 0 \
+  --eval-every 100 \
+  --eval-samples 50 \
+  --gpu none \
+  --device cpu
+```
+
+Short T4 benchmark:
+
+```bash
+modal run matrix_network_modal.py \
+  --iters 300 \
+  --n 64 \
+  --addend-digits 10 \
+  --batch-size 32 \
+  --primary-target-randomize 0.1 \
+  --checkpoint-every 0 \
+  --eval-every 100 \
+  --eval-samples 50 \
+  --gpu T4 \
+  --device cuda
+```
+
+Longer T4 run:
+
+```bash
+modal run matrix_network_modal.py \
+  --iters 20000 \
+  --n 64 \
+  --addend-digits 10 \
+  --batch-size 32 \
+  --primary-target-randomize 0.1 \
+  --gpu T4 \
+  --device cuda
+```
+
 ## Continue Training
 
 Resume from any checkpoint. The architecture is taken from the checkpoint itself.
