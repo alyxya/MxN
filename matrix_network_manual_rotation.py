@@ -1222,6 +1222,10 @@ def main() -> None:
         addend_digits = int(loaded_addend_digits or args.addend_digits)
         if loaded_addend_digits is not None and loaded_addend_digits != args.addend_digits:
             print(f"loaded_addend_digits={loaded_addend_digits}; overriding --addend-digits={args.addend_digits}")
+        args.n = model.n
+        args.number_base = model.number_base
+        args.token_mat_mode = model.token_mat_mode
+        args.addend_digits = addend_digits
 
     save_path = args.save_path or default_save_path(args, addend_digits)
     print(f"output_vocab={model.output_vocab}")
