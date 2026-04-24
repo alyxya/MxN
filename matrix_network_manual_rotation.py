@@ -980,8 +980,9 @@ def apply_batch_update(
             final_ops_buffer[prefix_len - 1] = cache.final_state_op
             left_total_ops_buffer[prefix_len - 1] = cache.left_total_op
 
-        for prefix_len, cache in enumerate(prefix_caches, start=1):
-            secondary_objective_weight += float(accumulate_secondary_objectives(cache))
+        if secondary_matrix_scale != 0.0:
+            for prefix_len, cache in enumerate(prefix_caches, start=1):
+                secondary_objective_weight += float(accumulate_secondary_objectives(cache))
 
         score_sum, correct_count, total_count, primary_mistake_count = accumulate_primary_objectives(
             full_ids,
