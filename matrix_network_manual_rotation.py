@@ -643,13 +643,61 @@ def generate_ids_until_eos(model: ManualRotationMatrixNetwork, prompt_ids: Seque
     return pred_ids, False
 
 
+def subspace_summary(vectors: torch.Tensor) -> Dict[str, float]:
+    if vectors.ndim != 2:
+        raise ValueError(f"expected 2D tensor for subspace summary, got shape={tuple(vectors.shape)}")
+    sample_count, dim = vectors.shape
+    if sample_count == 0:
+        return {"rank_eps": 0.0, "rank_99": 0.0, "pr": 0.0, "erank": 0.0}
+    if sample_count == 1:
+        return {"rank_eps": 1.0, "rank_99": 1.0, "pr": 1.0, "erank": 1.0}
+
+    centered = vectors - vectors.mean(dim=0, keepdim=True)
+    svals = torch.linalg.svdvals(centered)
+    energy = svals.square()
+    total_energy = float(energy.sum().item())
+    if total_energy <= EPS:
+        return {"rank_eps": 0.0, "rank_99": 0.0, "pr": 0.0, "erank": 0.0}
+
+    max_energy = float(energy.max().item())
+    rank_eps = int((energy > (max_energy * 1e-6)).sum().item())
+    normalized = energy / total_energy
+    cdf = torch.cumsum(normalized, dim=0)
+    rank_99 = int(torch.searchsorted(cdf, torch.tensor(0.99, device=cdf.device)).item()) + 1
+    pr = float((energy.sum().square() / energy.square().sum().clamp_min(EPS)).item())
+    entropy = -(normalized * normalized.clamp_min(EPS).log()).sum()
+    erank = float(entropy.exp().item())
+    return {
+        "rank_eps": float(rank_eps),
+        "rank_99": float(rank_99),
+        "pr": pr,
+        "erank": erank,
+        "dim": float(dim),
+        "samples": float(sample_count),
+    }
+
+
+def format_subspace_summary(label: str, summary: Dict[str, float]) -> str:
+    dim = int(summary.get("dim", 0.0))
+    samples = int(summary.get("samples", 0.0))
+    rank_eps = summary["rank_eps"]
+    rank_99 = summary["rank_99"]
+    pr = summary["pr"]
+    erank = summary["erank"]
+    return (
+        f"{label}[samples={samples} dim={dim} "
+        f"rank_eps={rank_eps:.0f} rank99={rank_99:.0f} "
+        f"pr={pr:.1f} erank={erank:.1f}]"
+    )
+
+
 def evaluate(
     model: ManualRotationMatrixNetwork,
     eval_samples: int,
     seed: int,
     addend_digits: int,
     number_base: int,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, Dict[str, Dict[str, float]]]:
     rng = random.Random(seed)
     exact = 0
     tf_correct = 0
@@ -659,6 +707,8 @@ def evaluate(
     plus_id = model.stoi[PLUS_TOKEN]
     equals_id = model.stoi[EQUALS_TOKEN]
     eos_id = model.stoi[EOS_TOKEN]
+    primary_states: List[torch.Tensor] = []
+    primary_query_targets: List[torch.Tensor] = []
 
     for _ in range(eval_samples):
         prompt_ids, target_ids = random_problem_ids(
@@ -677,15 +727,37 @@ def evaluate(
 
         left_total_op, right_total_op = prefix_operator_pair_from_ids(model, prompt_ids)
         for target_id in target_ids:
+            state = state_from_prefix_operators(model, left_total_op, right_total_op, model.query)
+            state_normed = normalize_columns(state.unsqueeze(1))[:, 0]
+            primary_states.append(state_normed.detach().cpu())
+            query_target = normalize_columns(
+                (right_total_op.transpose(-1, -2) @ model.base_mat.transpose(-1, -2) @ left_total_op.transpose(-1, -2) @ model.unembed_vectors[target_id].unsqueeze(1))
+            )[:, 0]
+            primary_query_targets.append(query_target.detach().cpu())
             pred_id = predict_next_id_from_prefix_operators(model, left_total_op, right_total_op)
             tf_correct += int(pred_id == target_id)
             tf_total += 1
             left_total_op, right_total_op = advance_prefix_operator_pair(model, left_total_op, right_total_op, target_id)
 
+    primary_state_summary = subspace_summary(torch.stack(primary_states, dim=0))
+    primary_query_summary = subspace_summary(torch.stack(primary_query_targets, dim=0))
+    query_summary = subspace_summary(model.query.unsqueeze(0).detach().cpu())
+    past_query_summary = subspace_summary(model.past_queries.detach().cpu())
+    unembed_summary = subspace_summary(model.unembed_vectors.detach().cpu())
+    past_unembed_summary = subspace_summary(model.past_unembed_vectors.detach().cpu())
+
     return (
         exact / max(eval_samples, 1),
         tf_correct / max(tf_total, 1),
         stopped / max(eval_samples, 1),
+        {
+            "state": primary_state_summary,
+            "query_target": primary_query_summary,
+            "query": query_summary,
+            "past_query": past_query_summary,
+            "unembed": unembed_summary,
+            "past_unembed": past_unembed_summary,
+        },
     )
 
 
@@ -1172,7 +1244,7 @@ def train(
             )
 
         if iter_idx % eval_every == 0 or iter_idx == iters:
-            exact, tf_acc, stop_rate = evaluate(
+            exact, tf_acc, stop_rate, subspace_stats = evaluate(
                 model,
                 eval_samples=eval_samples,
                 seed=seed + iter_idx,
@@ -1182,6 +1254,17 @@ def train(
             print(
                 f"  eval exact_match={exact:.3f} teacher_forced_token_acc={tf_acc:.3f} "
                 f"stop_rate={stop_rate:.3f}"
+            )
+            print(
+                "  "
+                + " ".join(
+                    [
+                        format_subspace_summary("state", subspace_stats["state"]),
+                        format_subspace_summary("target", subspace_stats["query_target"]),
+                        format_subspace_summary("past_q", subspace_stats["past_query"]),
+                        format_subspace_summary("unembed", subspace_stats["unembed"]),
+                    ]
+                )
             )
 
         if checkpoint_callback is not None and checkpoint_every > 0 and iter_idx % checkpoint_every == 0:
