@@ -86,6 +86,23 @@ def one_hot_vectors(count: int, dim: int, device: torch.device) -> torch.Tensor:
     return vectors
 
 
+def randomized_one_hot_targets(
+    token_ids: torch.Tensor,
+    *,
+    vocab_size: int,
+    dim: int,
+    device: torch.device,
+    strength: float,
+) -> torch.Tensor:
+    if vocab_size > dim:
+        raise ValueError(f"vocab_size must be <= dim for one-hot targets, got vocab_size={vocab_size} dim={dim}")
+    targets = torch.zeros((token_ids.shape[0], dim), device=device)
+    targets.scatter_(1, token_ids.unsqueeze(1), 1.0)
+    if strength > 0:
+        targets.add_(torch.randn_like(targets) * (strength / (dim**0.5)))
+    return normalize_last_dim(targets)
+
+
 def random_sinusoidal_vectors(shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
     dim = shape[-1]
     t = torch.arange(dim, device=device, dtype=torch.float32)
@@ -520,6 +537,7 @@ def format_run_config(args: argparse.Namespace, *, addend_digits: int) -> str:
         ("batch_size", args.batch_size),
         ("token_learning_rate", args.token_learning_rate),
         ("base_learning_rate", args.base_learning_rate),
+        ("primary_target_randomize", args.primary_target_randomize),
         ("momentum_decay", args.momentum_decay),
         ("secondary_matrix_scale", args.secondary_matrix_scale),
         ("update_orthogonalize_steps", args.update_orthogonalize_steps),
@@ -545,6 +563,7 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
         f"_bs{args.batch_size}"
         f"_tlr{format_float_token(args.token_learning_rate)}"
         f"_blr{format_float_token(args.base_learning_rate)}"
+        f"_ptr{format_float_token(args.primary_target_randomize)}"
         f"_mom{format_float_token(args.momentum_decay)}"
         f"_sms{format_float_token(args.secondary_matrix_scale)}"
         f"_orth{args.update_orthogonalize_steps}"
@@ -752,6 +771,7 @@ def apply_batch_update(
     prompt_lens: Sequence[int],
     token_learning_rate: float,
     base_learning_rate: float,
+    primary_target_randomize: float,
     secondary_matrix_scale: float,
     update_orthogonalize_steps: int,
 ) -> Tuple[float, float]:
@@ -866,7 +886,13 @@ def apply_batch_update(
         if mistake_count == 0:
             return float(target_scores.sum().item()), correct_count, total_count, 0
 
-        target_mats = model.unembed_vectors[target_ids_tensor].unsqueeze(-1)
+        target_mats = randomized_one_hot_targets(
+            target_ids_tensor,
+            vocab_size=model.vocab_size,
+            dim=n,
+            device=model.device,
+            strength=primary_target_randomize,
+        ).unsqueeze(-1)
 
         if model.uses_left_token_mats():
             max_prefix_len = int(prefix_lens.max().item())
@@ -1068,6 +1094,7 @@ def train(
     batch_size: int,
     token_learning_rate: float,
     base_learning_rate: float,
+    primary_target_randomize: float,
     addend_digits: int,
     number_base: int,
     seed: int,
@@ -1115,6 +1142,7 @@ def train(
             prompt_lens=prompt_lens,
             token_learning_rate=token_learning_rate,
             base_learning_rate=base_learning_rate,
+            primary_target_randomize=primary_target_randomize,
             secondary_matrix_scale=secondary_matrix_scale,
             update_orthogonalize_steps=update_orthogonalize_steps,
         )
@@ -1164,13 +1192,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
     p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token embedding matrices")
     p.add_argument("--base-learning-rate", type=float, default=0.1, help="Step size for the base matrix")
+    p.add_argument("--primary-target-randomize", type=float, default=1.0, help="Gaussian noise strength added to primary one-hot target directions during training")
     p.add_argument("--momentum-decay", type=float, default=0.9, help="EMA decay for primary matrix momentum buffers")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
-    p.add_argument("--secondary-matrix-scale", type=float, default=0.1, help="Scale multiplier for matrix learning from past-token auxiliary objectives")
+    p.add_argument("--secondary-matrix-scale", type=float, default=0.0, help="Scale multiplier for matrix learning from past-token auxiliary objectives; 0 disables it")
     p.add_argument("--update-orthogonalize-steps", type=int, default=1, help="Newton-Schulz orthogonalization steps after each matrix update")
     p.add_argument("--checkpoint-every", type=int, default=0, help="Save latest checkpoint every N iterations; 0 disables periodic saves")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
@@ -1187,6 +1216,8 @@ def main() -> None:
         raise ValueError("--update-orthogonalize-steps must be >= 0")
     if args.checkpoint_every < 0:
         raise ValueError("--checkpoint-every must be >= 0")
+    if args.primary_target_randomize < 0:
+        raise ValueError("--primary-target-randomize must be >= 0")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -1251,6 +1282,7 @@ def main() -> None:
         batch_size=args.batch_size,
         token_learning_rate=args.token_learning_rate,
         base_learning_rate=args.base_learning_rate,
+        primary_target_randomize=args.primary_target_randomize,
         addend_digits=addend_digits,
         number_base=model.number_base,
         seed=args.seed,
