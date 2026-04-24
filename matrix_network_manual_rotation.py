@@ -715,10 +715,6 @@ def evaluate(
 
     primary_state_summary = subspace_summary(torch.stack(primary_states, dim=0))
     primary_query_summary = subspace_summary(torch.stack(primary_query_targets, dim=0))
-    query_summary = subspace_summary(model.query.unsqueeze(0).detach().cpu())
-    past_query_summary = subspace_summary(model.past_queries.detach().cpu())
-    unembed_summary = subspace_summary(model.unembed_vectors.detach().cpu())
-    past_unembed_summary = subspace_summary(model.past_unembed_vectors.detach().cpu().reshape(-1, model.n))
 
     return (
         exact / max(eval_samples, 1),
@@ -727,10 +723,6 @@ def evaluate(
         {
             "state": primary_state_summary,
             "query_target": primary_query_summary,
-            "query": query_summary,
-            "past_query": past_query_summary,
-            "unembed": unembed_summary,
-            "past_unembed": past_unembed_summary,
         },
     )
 
@@ -1150,8 +1142,6 @@ def train(
                     [
                         format_subspace_summary("state", subspace_stats["state"]),
                         format_subspace_summary("target", subspace_stats["query_target"]),
-                        format_subspace_summary("past_q", subspace_stats["past_query"]),
-                        format_subspace_summary("unembed", subspace_stats["unembed"]),
                     ]
                 )
             )
