@@ -332,8 +332,6 @@ class ManualRotationMatrixNetwork:
         device: torch.device,
         number_base: int,
         token_mat_mode: str,
-        base_randomize: float,
-        token_randomize: float,
     ):
         output_vocab = EOS_TOKEN + digit_alphabet(number_base)
         vocab = output_vocab + PLUS_TOKEN + EQUALS_TOKEN
@@ -345,8 +343,6 @@ class ManualRotationMatrixNetwork:
         self.device = device
         self.number_base = number_base
         self.token_mat_mode = token_mat_mode
-        self.base_randomize = base_randomize
-        self.token_randomize = token_randomize
         self.vocab = vocab
         self.output_vocab = output_vocab
         self.vocab_size = len(self.vocab)
@@ -359,9 +355,9 @@ class ManualRotationMatrixNetwork:
         self.unembed_vectors = one_hot_vectors(self.vocab_size, n, device)
         self.past_unembed_vectors = torch.empty((0, self.vocab_size, n), device=device)
 
-        self.base_mat = initialize_rotation_like((n, n), device, base_randomize)
-        self.left_token_mats = initialize_rotation_like((self.vocab_size, n, n), device, token_randomize)
-        self.right_token_mats = initialize_rotation_like((self.vocab_size, n, n), device, token_randomize)
+        self.base_mat = initialize_rotation_like((n, n), device, 0.0)
+        self.left_token_mats = initialize_rotation_like((self.vocab_size, n, n), device, 0.0)
+        self.right_token_mats = initialize_rotation_like((self.vocab_size, n, n), device, 0.0)
 
     def uses_left_token_mats(self) -> bool:
         return self.token_mat_mode in {"left", "both"}
@@ -425,8 +421,6 @@ class ManualRotationMatrixNetwork:
             device=device,
             number_base=number_base,
             token_mat_mode=token_mat_mode,
-            base_randomize=0.0,
-            token_randomize=0.0,
         )
         model.left_token_mats = ckpt["left_token_mats"].to(device)
         model.right_token_mats = ckpt["right_token_mats"].to(device)
@@ -531,8 +525,6 @@ def format_run_config(args: argparse.Namespace, *, addend_digits: int) -> str:
         ("number_base", args.number_base),
         ("addend_digits", addend_digits),
         ("token_mat_mode", args.token_mat_mode),
-        ("base_randomize", args.base_randomize),
-        ("token_randomize", args.token_randomize),
         ("iters", args.iters),
         ("batch_size", args.batch_size),
         ("token_learning_rate", args.token_learning_rate),
@@ -558,8 +550,6 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
         f"_d{addend_digits}"
         f"_base{args.number_base}"
         f"_mode{args.token_mat_mode}"
-        f"_brand{format_float_token(args.base_randomize)}"
-        f"_trand{format_float_token(args.token_randomize)}"
         f"_it{args.iters}"
         f"_bs{args.batch_size}"
         f"_tlr{format_float_token(args.token_learning_rate)}"
@@ -1192,8 +1182,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n", type=int, default=32, help="Square matrix dimension; must be >= vocab size")
     p.add_argument("--number-base", type=int, default=10, help="Arithmetic base for generated addition problems (2-16)")
     p.add_argument("--token-mat-mode", type=str, default="right", choices=["left", "right", "both"], help="Apply learned token matrices on the left of base, right of base, or both")
-    p.add_argument("--base-randomize", type=float, default=0.0, help="Base init randomization strength; 0 gives identity")
-    p.add_argument("--token-randomize", type=float, default=0.0, help="Token-matrix init randomization strength; 0 gives identity")
     p.add_argument("--iters", type=int, default=5000, help="Training iterations")
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
     p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token embedding matrices")
@@ -1243,8 +1231,6 @@ def main() -> None:
             device=device,
             number_base=args.number_base,
             token_mat_mode=args.token_mat_mode,
-            base_randomize=args.base_randomize,
-            token_randomize=args.token_randomize,
         )
         addend_digits = args.addend_digits
     else:

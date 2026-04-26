@@ -82,8 +82,6 @@ def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
             device=device,
             number_base=args.number_base,
             token_mat_mode=args.token_mat_mode,
-            base_randomize=args.base_randomize,
-            token_randomize=args.token_randomize,
         )
         addend_digits = args.addend_digits
     else:
@@ -250,8 +248,6 @@ def main(
     n: int = 32,
     number_base: int = 10,
     token_mat_mode: str = "right",
-    base_randomize: float = 0.0,
-    token_randomize: float = 0.0,
     iters: int = 5000,
     batch_size: int = 32,
     token_learning_rate: float = 1.0,
@@ -306,8 +302,6 @@ def main(
         "n": n,
         "number_base": number_base,
         "token_mat_mode": token_mat_mode,
-        "base_randomize": base_randomize,
-        "token_randomize": token_randomize,
         "iters": iters,
         "batch_size": batch_size,
         "token_learning_rate": token_learning_rate,
