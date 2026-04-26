@@ -65,6 +65,14 @@ def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("--checkpoint-every must be >= 0")
     if args.primary_target_randomize < 0:
         raise ValueError("--primary-target-randomize must be >= 0")
+    if args.state_exploration_scale < 0:
+        raise ValueError("--state-exploration-scale must be >= 0")
+    if args.state_exploration_rank < 0:
+        raise ValueError("--state-exploration-rank must be >= 0")
+    if args.state_exploration_period < 1:
+        raise ValueError("--state-exploration-period must be >= 1")
+    if args.state_exploration_samples < 0:
+        raise ValueError("--state-exploration-samples must be >= 0")
     if args.secondary_matrix_period < 1:
         raise ValueError("--secondary-matrix-period must be >= 1")
     torch.manual_seed(args.seed)
@@ -132,6 +140,10 @@ def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
         token_learning_rate=args.token_learning_rate,
         base_learning_rate=args.base_learning_rate,
         primary_target_randomize=args.primary_target_randomize,
+        state_exploration_scale=args.state_exploration_scale,
+        state_exploration_rank=args.state_exploration_rank,
+        state_exploration_period=args.state_exploration_period,
+        state_exploration_samples=args.state_exploration_samples,
         addend_digits=addend_digits,
         number_base=model.number_base,
         seed=args.seed,
@@ -252,7 +264,11 @@ def main(
     batch_size: int = 32,
     token_learning_rate: float = 1.0,
     base_learning_rate: float = 0.1,
-    primary_target_randomize: float = 1.0,
+    primary_target_randomize: float = 0.0,
+    state_exploration_scale: float = 0.0,
+    state_exploration_rank: int = 8,
+    state_exploration_period: int = 100,
+    state_exploration_samples: int = 1024,
     momentum_decay: float = 0.9,
     addend_digits: int = 3,
     seed: int = 0,
@@ -307,6 +323,10 @@ def main(
         "token_learning_rate": token_learning_rate,
         "base_learning_rate": base_learning_rate,
         "primary_target_randomize": primary_target_randomize,
+        "state_exploration_scale": state_exploration_scale,
+        "state_exploration_rank": state_exploration_rank,
+        "state_exploration_period": state_exploration_period,
+        "state_exploration_samples": state_exploration_samples,
         "momentum_decay": momentum_decay,
         "addend_digits": addend_digits,
         "seed": seed,

@@ -164,7 +164,7 @@ modal run matrix_network_modal.py \
   --n 64 \
   --addend-digits 10 \
   --batch-size 32 \
-  --primary-target-randomize 0.1 \
+  --state-exploration-scale 0.1 \
   --secondary-matrix-scale 0 \
   --checkpoint-every 0 \
   --eval-every 100 \
@@ -181,7 +181,7 @@ modal run matrix_network_modal.py \
   --n 64 \
   --addend-digits 10 \
   --batch-size 32 \
-  --primary-target-randomize 0.1 \
+  --state-exploration-scale 0.1 \
   --secondary-matrix-scale 0 \
   --checkpoint-every 0 \
   --eval-every 100 \
@@ -198,7 +198,7 @@ modal run matrix_network_modal.py \
   --n 64 \
   --addend-digits 10 \
   --batch-size 32 \
-  --primary-target-randomize 0.1 \
+  --state-exploration-scale 0.1 \
   --secondary-matrix-scale 0 \
   --gpu T4 \
   --device cuda
@@ -212,7 +212,7 @@ modal run matrix_network_modal.py \
   --n 64 \
   --addend-digits 10 \
   --batch-size 32 \
-  --primary-target-randomize 0.1 \
+  --state-exploration-scale 0.1 \
   --secondary-matrix-scale 0.01 \
   --secondary-matrix-period 20 \
   --gpu T4 \

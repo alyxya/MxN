@@ -86,21 +86,51 @@ def one_hot_vectors(count: int, dim: int, device: torch.device) -> torch.Tensor:
     return vectors
 
 
-def randomized_one_hot_targets(
+def explored_one_hot_targets(
     token_ids: torch.Tensor,
     *,
     vocab_size: int,
     dim: int,
     device: torch.device,
-    strength: float,
+    isotropic_strength: float,
+    exploration_directions: torch.Tensor | None,
+    exploration_strength: float,
 ) -> torch.Tensor:
     if vocab_size > dim:
         raise ValueError(f"vocab_size must be <= dim for one-hot targets, got vocab_size={vocab_size} dim={dim}")
     targets = torch.zeros((token_ids.shape[0], dim), device=device)
     targets.scatter_(1, token_ids.unsqueeze(1), 1.0)
-    if strength > 0:
-        targets.add_(torch.randn_like(targets) * (strength / (dim**0.5)))
+    if isotropic_strength > 0:
+        targets.add_(torch.randn_like(targets) * (isotropic_strength / (dim**0.5)))
+    if exploration_strength > 0 and exploration_directions is not None and exploration_directions.numel() > 0:
+        directions = normalize_last_dim(exploration_directions.to(device=device, dtype=targets.dtype))
+        coeffs = torch.randn((token_ids.shape[0], directions.shape[0]), device=device, dtype=targets.dtype)
+        targets.add_((coeffs @ directions) * (exploration_strength / (directions.shape[0] ** 0.5)))
     return normalize_last_dim(targets)
+
+
+@dataclass
+class StateExplorationCache:
+    samples: torch.Tensor | None = None
+    directions: torch.Tensor | None = None
+
+    def add_samples(self, states: torch.Tensor, *, max_samples: int) -> None:
+        if max_samples <= 0 or states.numel() == 0:
+            return
+        states = normalize_last_dim(states.detach())
+        if self.samples is None:
+            self.samples = states[-max_samples:].clone()
+            return
+        self.samples = torch.cat([self.samples.to(states.device), states], dim=0)[-max_samples:].clone()
+
+    def refresh(self, *, rank: int) -> None:
+        if self.samples is None or self.samples.numel() == 0 or rank <= 0:
+            self.directions = None
+            return
+        states = normalize_last_dim(self.samples)
+        _, _, vh = torch.linalg.svd(states, full_matrices=True)
+        keep = min(rank, vh.shape[0])
+        self.directions = normalize_last_dim(vh[-keep:].detach())
 
 
 def random_sinusoidal_vectors(shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
@@ -530,6 +560,10 @@ def format_run_config(args: argparse.Namespace, *, addend_digits: int) -> str:
         ("token_learning_rate", args.token_learning_rate),
         ("base_learning_rate", args.base_learning_rate),
         ("primary_target_randomize", args.primary_target_randomize),
+        ("state_exploration_scale", args.state_exploration_scale),
+        ("state_exploration_rank", args.state_exploration_rank),
+        ("state_exploration_period", args.state_exploration_period),
+        ("state_exploration_samples", args.state_exploration_samples),
         ("momentum_decay", args.momentum_decay),
         ("secondary_matrix_scale", args.secondary_matrix_scale),
         ("secondary_matrix_period", args.secondary_matrix_period),
@@ -555,6 +589,9 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
         f"_tlr{format_float_token(args.token_learning_rate)}"
         f"_blr{format_float_token(args.base_learning_rate)}"
         f"_ptr{format_float_token(args.primary_target_randomize)}"
+        f"_ses{format_float_token(args.state_exploration_scale)}"
+        f"_ser{args.state_exploration_rank}"
+        f"_sep{args.state_exploration_period}"
         f"_mom{format_float_token(args.momentum_decay)}"
         f"_sms{format_float_token(args.secondary_matrix_scale)}"
         f"_smp{args.secondary_matrix_period}"
@@ -764,6 +801,9 @@ def apply_batch_update(
     token_learning_rate: float,
     base_learning_rate: float,
     primary_target_randomize: float,
+    state_exploration_scale: float,
+    state_exploration_directions: torch.Tensor | None,
+    state_exploration_samples: List[torch.Tensor] | None,
     secondary_matrix_scale: float,
     use_secondary_objective: bool,
     update_orthogonalize_steps: int,
@@ -869,6 +909,8 @@ def apply_batch_update(
         final_ops = final_ops_buffer[primary_start:total_prefixes]
         middle_states = middle_ops @ query_mat
         state_vecs = normalize_last_dim((final_ops @ query_mat).squeeze(-1))
+        if state_exploration_samples is not None:
+            state_exploration_samples.append(state_vecs.detach())
         scores = model.unembed_vectors @ state_vecs.transpose(0, 1)
         prefix_indices = torch.arange(total_count, device=model.device)
         target_scores = scores[target_ids_tensor, prefix_indices]
@@ -879,12 +921,14 @@ def apply_batch_update(
         if mistake_count == 0:
             return float(target_scores.sum().item()), correct_count, total_count, 0
 
-        target_mats = randomized_one_hot_targets(
+        target_mats = explored_one_hot_targets(
             target_ids_tensor,
             vocab_size=model.vocab_size,
             dim=n,
             device=model.device,
-            strength=primary_target_randomize,
+            isotropic_strength=primary_target_randomize,
+            exploration_directions=state_exploration_directions,
+            exploration_strength=state_exploration_scale,
         ).unsqueeze(-1)
 
         if model.uses_left_token_mats():
@@ -1088,6 +1132,10 @@ def train(
     token_learning_rate: float,
     base_learning_rate: float,
     primary_target_randomize: float,
+    state_exploration_scale: float,
+    state_exploration_rank: int,
+    state_exploration_period: int,
+    state_exploration_samples: int,
     addend_digits: int,
     number_base: int,
     seed: int,
@@ -1102,6 +1150,7 @@ def train(
 ) -> Tuple[ManualRotationMatrixNetwork, ManualRotationOptimizerState]:
     rng = random.Random(seed)
     workspace = BatchUpdateWorkspace()
+    state_exploration_cache = StateExplorationCache()
     digit_token_ids = [model.stoi[ch] for ch in digit_alphabet(number_base)]
     plus_id = model.stoi[PLUS_TOKEN]
     equals_id = model.stoi[EQUALS_TOKEN]
@@ -1129,6 +1178,7 @@ def train(
     for iter_idx in range(1, iters + 1):
         sequences, prompt_lens = sample_batch()
         use_secondary_objective = secondary_matrix_scale != 0.0 and iter_idx % secondary_matrix_period == 0
+        collected_state_samples: List[torch.Tensor] | None = [] if state_exploration_scale > 0 else None
         mean_target_score, token_acc = apply_batch_update(
             model,
             optimizer_state,
@@ -1138,10 +1188,20 @@ def train(
             token_learning_rate=token_learning_rate,
             base_learning_rate=base_learning_rate,
             primary_target_randomize=primary_target_randomize,
+            state_exploration_scale=state_exploration_scale,
+            state_exploration_directions=state_exploration_cache.directions,
+            state_exploration_samples=collected_state_samples,
             secondary_matrix_scale=secondary_matrix_scale,
             use_secondary_objective=use_secondary_objective,
             update_orthogonalize_steps=update_orthogonalize_steps,
         )
+        if collected_state_samples:
+            state_exploration_cache.add_samples(
+                torch.cat(collected_state_samples, dim=0),
+                max_samples=state_exploration_samples,
+            )
+            if iter_idx == 1 or iter_idx % state_exploration_period == 0:
+                state_exploration_cache.refresh(rank=state_exploration_rank)
 
         if iter_idx % log_every == 0 or iter_idx == 1:
             print(
@@ -1186,7 +1246,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
     p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token embedding matrices")
     p.add_argument("--base-learning-rate", type=float, default=0.1, help="Step size for the base matrix")
-    p.add_argument("--primary-target-randomize", type=float, default=1.0, help="Gaussian noise strength added to primary one-hot target directions during training")
+    p.add_argument("--primary-target-randomize", type=float, default=0.0, help="Deprecated isotropic Gaussian noise strength added to primary one-hot target directions during training")
+    p.add_argument("--state-exploration-scale", type=float, default=0.0, help="Training-only target noise strength sampled from low-usage state SVD directions")
+    p.add_argument("--state-exploration-rank", type=int, default=8, help="Number of least-used SVD directions to use for state exploration target noise")
+    p.add_argument("--state-exploration-period", type=int, default=100, help="Refresh low-usage state directions every N training iterations")
+    p.add_argument("--state-exploration-samples", type=int, default=1024, help="Rolling state sample count used when computing exploration directions")
     p.add_argument("--momentum-decay", type=float, default=0.9, help="EMA decay for primary matrix momentum buffers")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
@@ -1213,6 +1277,14 @@ def main() -> None:
         raise ValueError("--checkpoint-every must be >= 0")
     if args.primary_target_randomize < 0:
         raise ValueError("--primary-target-randomize must be >= 0")
+    if args.state_exploration_scale < 0:
+        raise ValueError("--state-exploration-scale must be >= 0")
+    if args.state_exploration_rank < 0:
+        raise ValueError("--state-exploration-rank must be >= 0")
+    if args.state_exploration_period < 1:
+        raise ValueError("--state-exploration-period must be >= 1")
+    if args.state_exploration_samples < 0:
+        raise ValueError("--state-exploration-samples must be >= 0")
     if args.secondary_matrix_period < 1:
         raise ValueError("--secondary-matrix-period must be >= 1")
 
@@ -1278,6 +1350,10 @@ def main() -> None:
         token_learning_rate=args.token_learning_rate,
         base_learning_rate=args.base_learning_rate,
         primary_target_randomize=args.primary_target_randomize,
+        state_exploration_scale=args.state_exploration_scale,
+        state_exploration_rank=args.state_exploration_rank,
+        state_exploration_period=args.state_exploration_period,
+        state_exploration_samples=args.state_exploration_samples,
         addend_digits=addend_digits,
         number_base=model.number_base,
         seed=args.seed,
