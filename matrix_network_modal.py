@@ -263,7 +263,7 @@ def main(
     iters: int = 5000,
     batch_size: int = 32,
     token_learning_rate: float = 1.0,
-    base_learning_rate: float = 0.1,
+    base_learning_rate: float = 1.0,
     primary_target_randomize: float = 0.0,
     state_exploration_scale: float = 0.0,
     state_exploration_rank: int = 8,

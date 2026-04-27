@@ -1245,7 +1245,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--iters", type=int, default=5000, help="Training iterations")
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
     p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token embedding matrices")
-    p.add_argument("--base-learning-rate", type=float, default=0.1, help="Step size for the base matrix")
+    p.add_argument("--base-learning-rate", type=float, default=1.0, help="Step size for the base matrix")
     p.add_argument("--primary-target-randomize", type=float, default=0.0, help="Deprecated isotropic Gaussian noise strength added to primary one-hot target directions during training")
     p.add_argument("--state-exploration-scale", type=float, default=0.0, help="Training-only target noise strength sampled from low-usage state SVD directions")
     p.add_argument("--state-exploration-rank", type=int, default=8, help="Number of least-used SVD directions to use for state exploration target noise")
