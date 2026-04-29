@@ -17,13 +17,13 @@ def normalize_last_dim(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
     return x / (x.norm(dim=-1, keepdim=True) + eps)
 
 
-def one_hot_vectors(count: int, dim: int, device: torch.device) -> torch.Tensor:
+def one_hot_vectors(count: int, dim: int, device: torch.device | str | None = None) -> torch.Tensor:
     vectors = torch.zeros((count, dim), device=device)
     vectors[:, :count] = cached_eye(count, device, vectors.dtype)
     return vectors
 
 
-def initialize_rotation_like(shape: Tuple[int, ...], device: torch.device, strength: float) -> torch.Tensor:
+def initialize_rotation_like(shape: Tuple[int, ...], device: torch.device | str | None, strength: float) -> torch.Tensor:
     n = shape[-1]
     eye = cached_eye(n, device, torch.float32)
     is_batched = len(shape) > 2
@@ -46,7 +46,11 @@ def orthogonalize_newton_schulz(w: torch.Tensor) -> torch.Tensor:
     return 1.5 * w - 0.5 * (w @ w.transpose(-1, -2) @ w)
 
 
-def cached_eye(n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+def cached_eye(n: int, device: torch.device | str | None, dtype: torch.dtype) -> torch.Tensor:
+    if device is None:
+        device = torch.empty((), dtype=dtype).device
+    else:
+        device = torch.device(device)
     key = (n, device.type, device.index, dtype)
     eye = _EYE_CACHE.get(key)
     if eye is None:

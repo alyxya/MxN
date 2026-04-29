@@ -11,9 +11,9 @@ class MatrixNetwork:
         self,
         *,
         n: int,
-        device: torch.device,
         vocab: str,
         output_vocab: str,
+        device: torch.device | str | None = None,
     ):
         if n < len(vocab):
             raise ValueError(f"n must be >= {len(vocab)} to fit fixed one-hot heads, got {n}")
@@ -23,7 +23,6 @@ class MatrixNetwork:
             raise ValueError("output_vocab must be a subset of vocab")
 
         self.n = n
-        self.device = device
         self.vocab = vocab
         self.output_vocab = output_vocab
         self.vocab_size = len(vocab)
@@ -35,6 +34,7 @@ class MatrixNetwork:
         self.unembed_vectors = one_hot_vectors(self.vocab_size, n, device)
         self.base_mat = initialize_rotation_like((n, n), device, 0.0)
         self.token_mats = initialize_rotation_like((self.vocab_size, n, n), device, 0.0)
+        self.device = self.base_mat.device
 
     def encode(self, text: str) -> List[int]:
         return [self.stoi[ch] for ch in text]
