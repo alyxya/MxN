@@ -144,7 +144,6 @@ def main(
     command: str = "train",
     n: int = 32,
     number_base: int = 10,
-    token_mat_mode: str = "right",
     iters: int = 5000,
     batch_size: int = 32,
     token_learning_rate: float = 1.0,
@@ -200,7 +199,6 @@ def main(
     args_dict = {
         "n": n,
         "number_base": number_base,
-        "token_mat_mode": token_mat_mode,
         "iters": iters,
         "batch_size": batch_size,
         "token_learning_rate": token_learning_rate,

@@ -11,7 +11,7 @@ from matrix_network import (
     DEFAULT_UPDATE_ORTHOGONALIZE_STEPS,
     MatrixNetwork,
     MatrixNetworkOptimizerState,
-    advance_prefix_operator_pair,
+    advance_prefix_operator,
     format_float_token,
     format_subspace_summary,
     generate_until_token,
@@ -20,7 +20,7 @@ from matrix_network import (
     normalize_columns,
     pick_device,
     predict_next_id_from_prefix_operators,
-    prefix_operator_pair_from_ids,
+    prefix_operator_from_ids,
     save_checkpoint,
     state_from_prefix_operators,
     subspace_summary,
@@ -121,9 +121,9 @@ def random_problem_ids(
     return prompt_ids, target_ids
 
 
-def make_addition_model(*, n: int, device: torch.device, number_base: int, token_mat_mode: str) -> MatrixNetwork:
+def make_addition_model(*, n: int, device: torch.device, number_base: int) -> MatrixNetwork:
     vocab, output_vocab = addition_vocabs(number_base)
-    return MatrixNetwork(n=n, device=device, vocab=vocab, output_vocab=output_vocab, token_mat_mode=token_mat_mode)
+    return MatrixNetwork(n=n, device=device, vocab=vocab, output_vocab=output_vocab)
 
 
 def make_addition_batch_sampler(
@@ -193,19 +193,19 @@ def evaluate_addition(
         if did_stop and pred_ids == target_ids[:-1]:
             exact += 1
 
-        left_total_op, right_total_op = prefix_operator_pair_from_ids(model, prompt_ids)
+        right_total_op = prefix_operator_from_ids(model, prompt_ids)
         for target_id in target_ids:
-            state = state_from_prefix_operators(model, left_total_op, right_total_op, model.query)
+            state = state_from_prefix_operators(model, right_total_op, model.query)
             state_normed = normalize_columns(state.unsqueeze(1))[:, 0]
             primary_states.append(state_normed.detach().cpu())
             query_target = normalize_columns(
-                (right_total_op.transpose(-1, -2) @ model.base_mat.transpose(-1, -2) @ left_total_op.transpose(-1, -2) @ model.unembed_vectors[target_id].unsqueeze(1))
+                (right_total_op.transpose(-1, -2) @ model.base_mat.transpose(-1, -2) @ model.unembed_vectors[target_id].unsqueeze(1))
             )[:, 0]
             primary_query_targets.append(query_target.detach().cpu())
-            pred_id = predict_next_id_from_prefix_operators(model, left_total_op, right_total_op)
+            pred_id = predict_next_id_from_prefix_operators(model, right_total_op)
             tf_correct += int(pred_id == target_id)
             tf_total += 1
-            left_total_op, right_total_op = advance_prefix_operator_pair(model, left_total_op, right_total_op, target_id)
+            right_total_op = advance_prefix_operator(model, right_total_op, target_id)
 
     primary_state_summary = subspace_summary(torch.stack(primary_states, dim=0))
     primary_query_summary = subspace_summary(torch.stack(primary_query_targets, dim=0))
@@ -242,7 +242,6 @@ def format_run_config(args: argparse.Namespace, *, addend_digits: int) -> str:
         ("n", args.n),
         ("number_base", args.number_base),
         ("addend_digits", addend_digits),
-        ("token_mat_mode", args.token_mat_mode),
         ("iters", args.iters),
         ("batch_size", args.batch_size),
         ("token_learning_rate", args.token_learning_rate),
@@ -269,7 +268,6 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
         f"matrix_network_addition_n{args.n}"
         f"_d{addend_digits}"
         f"_base{args.number_base}"
-        f"_mode{args.token_mat_mode}"
         f"_it{args.iters}"
         f"_bs{args.batch_size}"
         f"_tlr{format_float_token(args.token_learning_rate)}"
@@ -326,7 +324,6 @@ def run_addition_training(
             n=args.n,
             device=device,
             number_base=args.number_base,
-            token_mat_mode=args.token_mat_mode,
         )
         addend_digits = args.addend_digits
     else:
@@ -337,8 +334,6 @@ def run_addition_training(
         )
         if model.n != args.n:
             print(f"loaded_n={model.n}; overriding --n={args.n}")
-        if model.token_mat_mode != args.token_mat_mode:
-            print(f"loaded_token_mat_mode={model.token_mat_mode}; ignoring --token-mat-mode={args.token_mat_mode}")
         loaded_number_base = len(model.output_vocab) - 1
         if loaded_number_base != args.number_base:
             print(f"loaded_number_base={loaded_number_base}; overriding --number-base={args.number_base}")
@@ -347,7 +342,6 @@ def run_addition_training(
             print(f"loaded_addend_digits={loaded_addend_digits}; overriding --addend-digits={args.addend_digits}")
         args.n = model.n
         args.number_base = loaded_number_base
-        args.token_mat_mode = model.token_mat_mode
         args.addend_digits = addend_digits
 
     save_path = save_path_override or args.save_path or default_save_path(args, addend_digits)
@@ -446,7 +440,6 @@ def run_addition_training(
         "device": str(device),
         "n": model.n,
         "number_base": args.number_base,
-        "token_mat_mode": model.token_mat_mode,
         "addend_digits": addend_digits,
     }
 
@@ -455,7 +448,6 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Matrix network addition trainer")
     p.add_argument("--n", type=int, default=32, help="Square matrix dimension; must be >= vocab size")
     p.add_argument("--number-base", type=int, default=10, help="Arithmetic base for generated addition problems (2-16)")
-    p.add_argument("--token-mat-mode", type=str, default="right", choices=["left", "right", "both"], help="Apply learned token matrices on the left of base, right of base, or both")
     p.add_argument("--iters", type=int, default=5000, help="Training iterations")
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
     p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token matrices")
