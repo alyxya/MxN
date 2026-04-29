@@ -320,6 +320,7 @@ def apply_batch_update(
     prompt_lens: Sequence[int],
     token_learning_rate: float,
     base_learning_rate: float,
+    target_randomize_scale: float,
     update_orthogonalize_steps: int,
 ) -> Tuple[float, float]:
     n = model.n
@@ -386,7 +387,11 @@ def apply_batch_update(
         if mistake_count == 0:
             return float(target_scores.sum().item()), correct_count, total_count, 0
 
-        target_mats = model.unembed_vectors[target_ids_tensor].unsqueeze(-1)
+        target_vectors = model.unembed_vectors[target_ids_tensor]
+        if target_randomize_scale > 0.0:
+            target_vectors = target_vectors + torch.randn_like(target_vectors) * target_randomize_scale
+            target_vectors = normalize_last_dim(target_vectors)
+        target_mats = target_vectors.unsqueeze(-1)
 
         u_base = normalize_last_dim(middle_states[mistaken_prefix_mask].squeeze(-1)).unsqueeze(-1)
         v_base = target_mats[mistaken_prefix_mask]
@@ -481,6 +486,7 @@ def train(
     iters: int,
     token_learning_rate: float,
     base_learning_rate: float,
+    target_randomize_scale: float,
     log_every: int,
     eval_every: int,
     update_orthogonalize_steps: int,
@@ -499,6 +505,7 @@ def train(
             prompt_lens=prompt_lens,
             token_learning_rate=token_learning_rate,
             base_learning_rate=base_learning_rate,
+            target_randomize_scale=target_randomize_scale,
             update_orthogonalize_steps=update_orthogonalize_steps,
         )
 

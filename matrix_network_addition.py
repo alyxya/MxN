@@ -242,6 +242,7 @@ def format_run_config(args: argparse.Namespace, *, addend_digits: int) -> str:
         ("batch_size", args.batch_size),
         ("token_learning_rate", args.token_learning_rate),
         ("base_learning_rate", args.base_learning_rate),
+        ("target_randomize_scale", args.target_randomize_scale),
         ("momentum_decay", args.momentum_decay),
         ("update_orthogonalize_steps", args.update_orthogonalize_steps),
         ("checkpoint_every", getattr(args, "checkpoint_every", 0)),
@@ -278,6 +279,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--batch-size must be > 0")
     if args.iters < 0:
         raise ValueError("--iters must be >= 0")
+    if args.target_randomize_scale < 0.0:
+        raise ValueError("--target-randomize-scale must be >= 0")
     if args.update_orthogonalize_steps < 0:
         raise ValueError("--update-orthogonalize-steps must be >= 0")
     if args.checkpoint_every < 0:
@@ -393,6 +396,7 @@ def run_addition_training(
         iters=args.iters,
         token_learning_rate=args.token_learning_rate,
         base_learning_rate=args.base_learning_rate,
+        target_randomize_scale=args.target_randomize_scale,
         log_every=args.log_every,
         eval_every=args.eval_every,
         update_orthogonalize_steps=args.update_orthogonalize_steps,
@@ -430,6 +434,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
     p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token matrices")
     p.add_argument("--base-learning-rate", type=float, default=1.0, help="Step size for the base matrix")
+    p.add_argument("--target-randomize-scale", type=float, default=0.0, help="Gaussian noise scale added to target vectors during training updates")
     p.add_argument("--momentum-decay", type=float, default=0.9, help="EMA decay for matrix momentum buffers")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
