@@ -75,13 +75,12 @@ def one_hot_vectors(count: int, dim: int, device: torch.device) -> torch.Tensor:
     return vectors
 
 
-def explored_one_hot_targets(
+def explored_targets(
     token_ids: torch.Tensor,
     *,
     vocab_size: int,
     dim: int,
     device: torch.device,
-    isotropic_strength: float,
     exploration_directions: torch.Tensor | None,
     exploration_strength: float,
 ) -> torch.Tensor:
@@ -89,8 +88,6 @@ def explored_one_hot_targets(
         raise ValueError(f"vocab_size must be <= dim for one-hot targets, got vocab_size={vocab_size} dim={dim}")
     targets = torch.zeros((token_ids.shape[0], dim), device=device)
     targets.scatter_(1, token_ids.unsqueeze(1), 1.0)
-    if isotropic_strength > 0:
-        targets.add_(torch.randn_like(targets) * (isotropic_strength / (dim**0.5)))
     if exploration_strength > 0 and exploration_directions is not None and exploration_directions.numel() > 0:
         directions = normalize_last_dim(exploration_directions.to(device=device, dtype=targets.dtype))
         coeffs = torch.randn((token_ids.shape[0], directions.shape[0]), device=device, dtype=targets.dtype)
@@ -170,8 +167,6 @@ class MatrixNetworkOptimizerState:
             value = state_dict.get(attr)
             if isinstance(value, torch.Tensor):
                 setattr(state, attr, value.to(device))
-        if state.token_momentum is None and isinstance(state_dict.get("right_token_momentum"), torch.Tensor):
-            state.token_momentum = state_dict["right_token_momentum"].to(device)
         return state
 
 
@@ -180,8 +175,7 @@ class BatchUpdateWorkspace:
     base_primary_delta: torch.Tensor | None = None
     token_primary_delta: torch.Tensor | None = None
     seq_middle_ops: torch.Tensor | None = None
-    seq_final_ops: torch.Tensor | None = None
-    seq_right_v_ops: torch.Tensor | None = None
+    seq_pre_token_ops: torch.Tensor | None = None
 
     def prepare(self, model: "MatrixNetwork") -> None:
         dtype = model.base_mat.dtype
@@ -211,21 +205,16 @@ class BatchUpdateWorkspace:
             return tensor
 
         ensure("seq_middle_ops")
-        ensure("seq_final_ops")
-        ensure("seq_right_v_ops")
+        ensure("seq_pre_token_ops")
 
 
 @dataclass
 class PrefixOperatorCache:
     prefix_ids: Tuple[int, ...]
-    reversed_prefix_ids: torch.Tensor
-    right_total_op: torch.Tensor
-    right_all_transpose_op: torch.Tensor
+    prefix_op: torch.Tensor
+    prefix_transpose_op: torch.Tensor
     middle_op: torch.Tensor
-    final_state_op: torch.Tensor
-    right_v_prefix_ops: torch.Tensor
-    base_query_target_op: torch.Tensor
-    query_target_op: torch.Tensor
+    pre_token_ops: torch.Tensor
 
 
 def pick_device(requested: str) -> torch.device:
@@ -293,7 +282,7 @@ class MatrixNetwork:
         cls,
         ckpt: Dict[str, Any],
         device: torch.device,
-    ) -> Tuple["MatrixNetwork", int | None]:
+    ) -> "MatrixNetwork":
         n = int(ckpt["n"])
         vocab = str(ckpt["vocab"])
         output_vocab = str(ckpt["output_vocab"])
@@ -303,20 +292,14 @@ class MatrixNetwork:
             vocab=vocab,
             output_vocab=output_vocab,
         )
-        if "token_mats" in ckpt:
-            model.token_mats = ckpt["token_mats"].to(device)
-        else:
-            model.token_mats = ckpt["right_token_mats"].to(device)
+        model.token_mats = ckpt["token_mats"].to(device)
         model.base_mat = ckpt["base_mat"].to(device)
         model.query = one_hot_vectors(1, n, device)[0]
         model.unembed_vectors = one_hot_vectors(model.vocab_size, n, device)
-        addend_digits = ckpt.get("addend_digits")
-        if addend_digits is not None:
-            addend_digits = int(addend_digits)
-        return model, addend_digits
+        return model
 
     @classmethod
-    def from_checkpoint(cls, path: str, device: torch.device) -> Tuple["MatrixNetwork", int | None]:
+    def from_checkpoint(cls, path: str, device: torch.device) -> "MatrixNetwork":
         ckpt = load_checkpoint_dict(path, device)
         return cls.from_checkpoint_dict(ckpt, device)
 
@@ -336,9 +319,9 @@ def load_training_checkpoint(
     device: torch.device,
     *,
     momentum_decay: float,
-) -> Tuple[MatrixNetwork, int | None, MatrixNetworkOptimizerState, int]:
+) -> Tuple[MatrixNetwork, MatrixNetworkOptimizerState, int, Dict[str, Any]]:
     ckpt = load_checkpoint_dict(path, device)
-    model, addend_digits = MatrixNetwork.from_checkpoint_dict(ckpt, device)
+    model = MatrixNetwork.from_checkpoint_dict(ckpt, device)
     optimizer_state = MatrixNetworkOptimizerState.from_state_dict(
         ckpt.get("optimizer_state"),
         momentum_decay=momentum_decay,
@@ -346,7 +329,8 @@ def load_training_checkpoint(
     )
     optimizer_state.ensure_initialized(model)
     completed_iters = int(ckpt.get("completed_iters") or 0)
-    return model, addend_digits, optimizer_state, completed_iters
+    metadata = dict(ckpt.get("metadata") or {})
+    return model, optimizer_state, completed_iters, metadata
 
 
 def save_checkpoint(
@@ -372,9 +356,8 @@ def save_checkpoint(
         "optimizer_state": None if optimizer_state is None else optimizer_state.state_dict(),
         "update_orthogonalize_steps": int(update_orthogonalize_steps),
         "completed_iters": None if completed_iters is None else int(completed_iters),
+        "metadata": dict(metadata or {}),
     }
-    if metadata:
-        payload.update(metadata)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
@@ -385,52 +368,48 @@ def save_checkpoint(
     tmp_path.replace(path)
 
 
-def format_float_token(x: float) -> str:
-    return format(x, ".6g").replace("-", "m").replace(".", "p")
-
-
 def prefix_operator_from_ids(model: MatrixNetwork, token_ids: Sequence[int]) -> torch.Tensor:
     eye = cached_eye(model.n, model.device, model.base_mat.dtype)
-    right_total_op = eye
+    prefix_op = eye
     for tid in token_ids:
-        right_total_op = right_total_op @ model.token_mats[tid]
-    return right_total_op
+        prefix_op = prefix_op @ model.token_mats[tid]
+    return prefix_op
 
 
 def advance_prefix_operator(
     model: MatrixNetwork,
-    right_total_op: torch.Tensor,
+    prefix_op: torch.Tensor,
     token_id: int,
 ) -> torch.Tensor:
-    return right_total_op @ model.token_mats[token_id]
+    return prefix_op @ model.token_mats[token_id]
 
 
-def state_from_prefix_operators(
+def state_from_prefix_op(
     model: MatrixNetwork,
-    right_total_op: torch.Tensor,
+    prefix_op: torch.Tensor,
     query: torch.Tensor,
 ) -> torch.Tensor:
-    return model.base_mat @ (right_total_op @ query)
+    return model.base_mat @ (prefix_op @ query)
 
 
-def predict_next_id_from_prefix_operators(
+def predict_next_id_from_prefix_op(
     model: MatrixNetwork,
-    right_total_op: torch.Tensor,
+    prefix_op: torch.Tensor,
 ) -> int:
-    state = state_from_prefix_operators(model, right_total_op, model.query)
+    state = state_from_prefix_op(model, prefix_op, model.query)
     scores = model.unembed_vectors[: model.output_vocab_size] @ normalize_columns(state.unsqueeze(1))
     return int(scores[:, 0].argmax().item())
 
 
 def generate_until_token_id(model: MatrixNetwork, prompt_ids: Sequence[int], stop_token_id: int, max_len: int) -> Tuple[List[int], bool]:
-    right_total_op = prefix_operator_from_ids(model, prompt_ids)
+    prefix_op = prefix_operator_from_ids(model, prompt_ids)
     pred_ids: List[int] = []
     for _ in range(max_len):
-        next_id = predict_next_id_from_prefix_operators(model, right_total_op)
+        next_id = predict_next_id_from_prefix_op(model, prefix_op)
         if next_id == stop_token_id:
             return pred_ids, True
         pred_ids.append(next_id)
-        right_total_op = advance_prefix_operator(model, right_total_op, next_id)
+        prefix_op = advance_prefix_operator(model, prefix_op, next_id)
     return pred_ids, False
 
 
@@ -497,7 +476,6 @@ def apply_batch_update(
     prompt_lens: Sequence[int],
     token_learning_rate: float,
     base_learning_rate: float,
-    primary_target_randomize: float,
     state_exploration_scale: float,
     state_exploration_directions: torch.Tensor | None,
     state_exploration_samples: List[torch.Tensor] | None,
@@ -520,37 +498,29 @@ def apply_batch_update(
         parent_cache: PrefixOperatorCache | None,
         token_id: int,
         prefix_len: int,
-        right_v_buffer: torch.Tensor,
+        pre_token_buffer: torch.Tensor,
     ) -> PrefixOperatorCache:
         prefix_key = (token_id,) if parent_cache is None else (*parent_cache.prefix_ids, token_id)
         last_tid = token_id
 
-        right_mat = model.token_mats[last_tid]
-        right_mat_t = right_mat.transpose(-1, -2)
+        token_mat = model.token_mats[last_tid]
+        token_mat_t = token_mat.transpose(-1, -2)
         if parent_cache is None:
-            right_total_op = right_mat
-            right_all_transpose_op = right_mat_t
-            right_v_buffer[0] = eye
+            prefix_op = token_mat
+            prefix_transpose_op = token_mat_t
+            pre_token_buffer[0] = eye
         else:
-            right_total_op = parent_cache.right_total_op @ right_mat
-            right_all_transpose_op = right_mat_t @ parent_cache.right_all_transpose_op
-            right_v_buffer[prefix_len - 1] = parent_cache.right_all_transpose_op
+            prefix_op = parent_cache.prefix_op @ token_mat
+            prefix_transpose_op = token_mat_t @ parent_cache.prefix_transpose_op
+            pre_token_buffer[prefix_len - 1] = parent_cache.prefix_transpose_op
 
-        middle_op = base @ right_total_op
-        final_state_op = middle_op
-        base_query_target_op = base_t
-        query_target_op = right_all_transpose_op @ base_query_target_op
-
+        middle_op = base @ prefix_op
         return PrefixOperatorCache(
             prefix_ids=prefix_key,
-            reversed_prefix_ids=torch.tensor(prefix_key[::-1], device=model.device, dtype=torch.long),
-            right_total_op=right_total_op,
-            right_all_transpose_op=right_all_transpose_op,
+            prefix_op=prefix_op,
+            prefix_transpose_op=prefix_transpose_op,
             middle_op=middle_op,
-            final_state_op=final_state_op,
-            right_v_prefix_ops=right_v_buffer[:prefix_len],
-            base_query_target_op=base_query_target_op,
-            query_target_op=query_target_op,
+            pre_token_ops=pre_token_buffer[:prefix_len],
         )
 
     def accumulate_primary_objectives(
@@ -558,7 +528,6 @@ def apply_batch_update(
         prompt_len: int,
         prefix_caches: Sequence[PrefixOperatorCache],
         middle_ops_buffer: torch.Tensor,
-        final_ops_buffer: torch.Tensor,
     ) -> Tuple[float, int, int, int]:
         total_prefixes = len(full_ids) - 1
         primary_start = prompt_len - 1
@@ -570,9 +539,8 @@ def apply_batch_update(
         prefix_lens = torch.arange(prompt_len, len(full_ids), device=model.device, dtype=torch.long)
         query_mat = model.query.unsqueeze(1)
         middle_ops = middle_ops_buffer[primary_start:total_prefixes]
-        final_ops = final_ops_buffer[primary_start:total_prefixes]
         middle_states = middle_ops @ query_mat
-        state_vecs = normalize_last_dim((final_ops @ query_mat).squeeze(-1))
+        state_vecs = normalize_last_dim(middle_states.squeeze(-1))
         if state_exploration_samples is not None:
             state_exploration_samples.append(state_vecs.detach())
         scores = model.unembed_vectors @ state_vecs.transpose(0, 1)
@@ -585,12 +553,11 @@ def apply_batch_update(
         if mistake_count == 0:
             return float(target_scores.sum().item()), correct_count, total_count, 0
 
-        target_mats = explored_one_hot_targets(
+        target_mats = explored_targets(
             target_ids_tensor,
             vocab_size=model.vocab_size,
             dim=n,
             device=model.device,
-            isotropic_strength=primary_target_randomize,
             exploration_directions=state_exploration_directions,
             exploration_strength=state_exploration_scale,
         ).unsqueeze(-1)
@@ -600,7 +567,7 @@ def apply_batch_update(
         base_primary_delta.add_(matrix_rotation_generator(u_base, v_base, 1.0).sum(dim=0))
 
         primary_caches = prefix_caches[primary_start:total_prefixes]
-        base_query_targets = torch.stack([cache.base_query_target_op for cache in primary_caches], dim=0) @ target_mats
+        base_query_targets = base_t @ target_mats
         max_prefix_len = int(prefix_lens.max().item())
         for idx in range(max_prefix_len):
             active_start = max(0, idx - prompt_len + 1)
@@ -610,12 +577,12 @@ def apply_batch_update(
             if not active_mask.any():
                 continue
             tid = full_ids[idx]
-            v_ops = right_v_buffer[idx].unsqueeze(0).expand(total_count - active_start, -1, -1)[active_mask]
-            right_total_ops = torch.stack(
-                [cache.right_total_op for cache in primary_caches[active_start:]],
+            v_ops = pre_token_buffer[idx].unsqueeze(0).expand(total_count - active_start, -1, -1)[active_mask]
+            prefix_ops = torch.stack(
+                [cache.prefix_op for cache in primary_caches[active_start:]],
                 dim=0,
             )[active_mask]
-            u_ops = v_ops @ right_total_ops
+            u_ops = v_ops @ prefix_ops
             active_count = int(active_mask.sum().item())
             u = normalize_last_dim((u_ops @ query_mat.unsqueeze(0).expand(active_count, -1, -1)).squeeze(-1)).unsqueeze(-1)
             v = normalize_last_dim((v_ops @ base_query_targets[active_start:][active_mask]).squeeze(-1)).unsqueeze(-1)
@@ -627,23 +594,20 @@ def apply_batch_update(
         seq_max_prefix_len = len(full_ids) - 1
         workspace.ensure_sequence_buffers(max_prefix_len=seq_max_prefix_len, n=n, device=model.device, dtype=base.dtype)
         middle_ops_buffer = workspace.seq_middle_ops[:seq_max_prefix_len]
-        final_ops_buffer = workspace.seq_final_ops[:seq_max_prefix_len]
-        right_v_buffer = workspace.seq_right_v_ops[:seq_max_prefix_len]
+        pre_token_buffer = workspace.seq_pre_token_ops[:seq_max_prefix_len]
 
         cache: PrefixOperatorCache | None = None
         prefix_caches: List[PrefixOperatorCache] = []
         for prefix_len in range(1, len(full_ids)):
-            cache = extend_prefix_cache(cache, full_ids[prefix_len - 1], prefix_len, right_v_buffer)
+            cache = extend_prefix_cache(cache, full_ids[prefix_len - 1], prefix_len, pre_token_buffer)
             prefix_caches.append(cache)
             middle_ops_buffer[prefix_len - 1] = cache.middle_op
-            final_ops_buffer[prefix_len - 1] = cache.final_state_op
 
         score_sum, correct_count, total_count, primary_mistake_count = accumulate_primary_objectives(
             full_ids,
             prompt_len,
             prefix_caches,
             middle_ops_buffer,
-            final_ops_buffer,
         )
         primary_objective_weight += float(primary_mistake_count)
         mean_target_score += score_sum
@@ -692,7 +656,6 @@ def train(
     iters: int,
     token_learning_rate: float,
     base_learning_rate: float,
-    primary_target_randomize: float,
     state_exploration_scale: float,
     state_exploration_rank: int,
     state_exploration_period: int,
@@ -717,7 +680,6 @@ def train(
             prompt_lens=prompt_lens,
             token_learning_rate=token_learning_rate,
             base_learning_rate=base_learning_rate,
-            primary_target_randomize=primary_target_randomize,
             state_exploration_scale=state_exploration_scale,
             state_exploration_directions=state_exploration_cache.directions,
             state_exploration_samples=collected_state_samples,

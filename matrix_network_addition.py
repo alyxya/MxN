@@ -12,17 +12,16 @@ from matrix_network import (
     MatrixNetwork,
     MatrixNetworkOptimizerState,
     advance_prefix_operator,
-    format_float_token,
     format_subspace_summary,
     generate_until_token,
     generate_until_token_id,
     load_training_checkpoint,
     normalize_columns,
     pick_device,
-    predict_next_id_from_prefix_operators,
+    predict_next_id_from_prefix_op,
     prefix_operator_from_ids,
     save_checkpoint,
-    state_from_prefix_operators,
+    state_from_prefix_op,
     subspace_summary,
     train,
 )
@@ -193,19 +192,19 @@ def evaluate_addition(
         if did_stop and pred_ids == target_ids[:-1]:
             exact += 1
 
-        right_total_op = prefix_operator_from_ids(model, prompt_ids)
+        prefix_op = prefix_operator_from_ids(model, prompt_ids)
         for target_id in target_ids:
-            state = state_from_prefix_operators(model, right_total_op, model.query)
+            state = state_from_prefix_op(model, prefix_op, model.query)
             state_normed = normalize_columns(state.unsqueeze(1))[:, 0]
             primary_states.append(state_normed.detach().cpu())
             query_target = normalize_columns(
-                (right_total_op.transpose(-1, -2) @ model.base_mat.transpose(-1, -2) @ model.unembed_vectors[target_id].unsqueeze(1))
+                (prefix_op.transpose(-1, -2) @ model.base_mat.transpose(-1, -2) @ model.unembed_vectors[target_id].unsqueeze(1))
             )[:, 0]
             primary_query_targets.append(query_target.detach().cpu())
-            pred_id = predict_next_id_from_prefix_operators(model, right_total_op)
+            pred_id = predict_next_id_from_prefix_op(model, prefix_op)
             tf_correct += int(pred_id == target_id)
             tf_total += 1
-            right_total_op = advance_prefix_operator(model, right_total_op, target_id)
+            prefix_op = advance_prefix_operator(model, prefix_op, target_id)
 
     primary_state_summary = subspace_summary(torch.stack(primary_states, dim=0))
     primary_query_summary = subspace_summary(torch.stack(primary_query_targets, dim=0))
@@ -246,7 +245,6 @@ def format_run_config(args: argparse.Namespace, *, addend_digits: int) -> str:
         ("batch_size", args.batch_size),
         ("token_learning_rate", args.token_learning_rate),
         ("base_learning_rate", args.base_learning_rate),
-        ("primary_target_randomize", args.primary_target_randomize),
         ("state_exploration_scale", args.state_exploration_scale),
         ("state_exploration_rank", args.state_exploration_rank),
         ("state_exploration_period", args.state_exploration_period),
@@ -268,16 +266,6 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
         f"matrix_network_addition_n{args.n}"
         f"_d{addend_digits}"
         f"_base{args.number_base}"
-        f"_it{args.iters}"
-        f"_bs{args.batch_size}"
-        f"_tlr{format_float_token(args.token_learning_rate)}"
-        f"_blr{format_float_token(args.base_learning_rate)}"
-        f"_ptr{format_float_token(args.primary_target_randomize)}"
-        f"_ses{format_float_token(args.state_exploration_scale)}"
-        f"_ser{args.state_exploration_rank}"
-        f"_sep{args.state_exploration_period}"
-        f"_mom{format_float_token(args.momentum_decay)}"
-        f"_orth{args.update_orthogonalize_steps}"
         f"_seed{args.seed}"
         f"_{timestamp}.pt"
     )
@@ -291,8 +279,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--update-orthogonalize-steps must be >= 0")
     if args.checkpoint_every < 0:
         raise ValueError("--checkpoint-every must be >= 0")
-    if args.primary_target_randomize < 0:
-        raise ValueError("--primary-target-randomize must be >= 0")
     if args.state_exploration_scale < 0:
         raise ValueError("--state-exploration-scale must be >= 0")
     if args.state_exploration_rank < 0:
@@ -301,6 +287,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--state-exploration-period must be >= 1")
     if args.state_exploration_samples < 0:
         raise ValueError("--state-exploration-samples must be >= 0")
+
 
 def run_addition_training(
     args: argparse.Namespace,
@@ -327,7 +314,7 @@ def run_addition_training(
         )
         addend_digits = args.addend_digits
     else:
-        model, loaded_addend_digits, optimizer_state, previous_completed_iters = load_training_checkpoint(
+        model, optimizer_state, previous_completed_iters, metadata = load_training_checkpoint(
             args.load_path,
             device,
             momentum_decay=args.momentum_decay,
@@ -337,8 +324,9 @@ def run_addition_training(
         loaded_number_base = len(model.output_vocab) - 1
         if loaded_number_base != args.number_base:
             print(f"loaded_number_base={loaded_number_base}; overriding --number-base={args.number_base}")
+        loaded_addend_digits = metadata.get("addend_digits")
         addend_digits = int(loaded_addend_digits or args.addend_digits)
-        if loaded_addend_digits is not None and loaded_addend_digits != args.addend_digits:
+        if loaded_addend_digits is not None and int(loaded_addend_digits) != args.addend_digits:
             print(f"loaded_addend_digits={loaded_addend_digits}; overriding --addend-digits={args.addend_digits}")
         args.n = model.n
         args.number_base = loaded_number_base
@@ -410,7 +398,6 @@ def run_addition_training(
         iters=args.iters,
         token_learning_rate=args.token_learning_rate,
         base_learning_rate=args.base_learning_rate,
-        primary_target_randomize=args.primary_target_randomize,
         state_exploration_scale=args.state_exploration_scale,
         state_exploration_rank=args.state_exploration_rank,
         state_exploration_period=args.state_exploration_period,
@@ -452,7 +439,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
     p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token matrices")
     p.add_argument("--base-learning-rate", type=float, default=1.0, help="Step size for the base matrix")
-    p.add_argument("--primary-target-randomize", type=float, default=0.0, help="Deprecated isotropic Gaussian noise strength added to primary one-hot target directions during training")
     p.add_argument("--state-exploration-scale", type=float, default=0.0, help="Training-only target noise strength sampled from low-usage state SVD directions")
     p.add_argument("--state-exploration-rank", type=int, default=8, help="Number of least-used SVD directions to use for state exploration target noise")
     p.add_argument("--state-exploration-period", type=int, default=100, help="Refresh low-usage state directions every N training iterations")
