@@ -40,10 +40,8 @@ def digit_alphabet(number_base: int) -> str:
     return DIGIT_SYMBOLS[:number_base]
 
 
-def addition_vocabs(number_base: int) -> Tuple[str, str]:
-    output_vocab = EOS_TOKEN + digit_alphabet(number_base)
-    vocab = output_vocab + PLUS_TOKEN + EQUALS_TOKEN
-    return vocab, output_vocab
+def addition_vocab(number_base: int) -> str:
+    return EOS_TOKEN + digit_alphabet(number_base) + PLUS_TOKEN + EQUALS_TOKEN
 
 
 def format_in_base(value: int, number_base: int, min_digits: int = 1) -> str:
@@ -121,8 +119,7 @@ def random_problem_ids(
 
 
 def make_addition_model(*, n: int, device: torch.device, number_base: int) -> MatrixNetwork:
-    vocab, output_vocab = addition_vocabs(number_base)
-    return MatrixNetwork(n=n, device=device, vocab=vocab, output_vocab=output_vocab)
+    return MatrixNetwork(n=n, device=device, vocab=addition_vocab(number_base))
 
 
 def make_addition_batch_sampler(
@@ -319,7 +316,7 @@ def run_addition_training(
         )
         if model.n != args.n:
             print(f"loaded_n={model.n}; overriding --n={args.n}")
-        loaded_number_base = len(model.output_vocab) - 1
+        loaded_number_base = int(metadata.get("number_base") or args.number_base)
         if loaded_number_base != args.number_base:
             print(f"loaded_number_base={loaded_number_base}; overriding --number-base={args.number_base}")
         loaded_addend_digits = metadata.get("addend_digits")
@@ -333,7 +330,7 @@ def run_addition_training(
     save_path = save_path_override or args.save_path or default_save_path(args, addend_digits)
     if save_path_transform is not None:
         save_path = save_path_transform(save_path)
-    print(f"output_vocab={model.output_vocab}")
+    print(f"vocab={model.vocab}")
     print(f"save_path={save_path}")
     args.save_path = save_path
     print(format_run_config(args, addend_digits=addend_digits))

@@ -12,21 +12,16 @@ class MatrixNetwork:
         *,
         n: int,
         vocab: str,
-        output_vocab: str,
         device: torch.device | str | None = None,
     ):
         if n < len(vocab):
             raise ValueError(f"n must be >= {len(vocab)} to fit fixed one-hot heads, got {n}")
-        if not output_vocab:
-            raise ValueError("output_vocab must not be empty")
-        if any(ch not in vocab for ch in output_vocab):
-            raise ValueError("output_vocab must be a subset of vocab")
+        if not vocab:
+            raise ValueError("vocab must not be empty")
 
         self.n = n
         self.vocab = vocab
-        self.output_vocab = output_vocab
         self.vocab_size = len(vocab)
-        self.output_vocab_size = len(output_vocab)
         self.stoi: Dict[str, int] = {ch: i for i, ch in enumerate(vocab)}
         self.itos: Dict[int, str] = {i: ch for ch, i in self.stoi.items()}
 
@@ -50,7 +45,7 @@ class MatrixNetwork:
 
     def predict_next_id(self, token_ids: Sequence[int]) -> int:
         state = self.prefix_state_ids(token_ids)
-        scores = self.unembed_vectors[: self.output_vocab_size] @ normalize_columns(state.unsqueeze(1))
+        scores = self.unembed_vectors @ normalize_columns(state.unsqueeze(1))
         return int(scores[:, 0].argmax().item())
 
     def predict_next(self, prefix: str) -> str:

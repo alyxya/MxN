@@ -149,7 +149,6 @@ def model_from_checkpoint_dict(ckpt: Dict[str, Any], device: torch.device) -> Ma
         n=n,
         device=device,
         vocab=str(ckpt["vocab"]),
-        output_vocab=str(ckpt["output_vocab"]),
     )
     model.token_mats = ckpt["token_mats"].to(device)
     model.base_mat = ckpt["base_mat"].to(device)
@@ -202,7 +201,6 @@ def save_checkpoint(
     payload = {
         "n": model.n,
         "vocab": model.vocab,
-        "output_vocab": model.output_vocab,
         "token_mats": model.token_mats,
         "base_mat": model.base_mat,
         "optimizer_state": None if optimizer_state is None else optimizer_state.state_dict(),
@@ -243,7 +241,7 @@ def predict_next_id_from_prefix_op(
     prefix_op: torch.Tensor,
 ) -> int:
     state = state_from_prefix_op(model, prefix_op, model.query)
-    scores = model.unembed_vectors[: model.output_vocab_size] @ normalize_columns(state.unsqueeze(1))
+    scores = model.unembed_vectors @ normalize_columns(state.unsqueeze(1))
     return int(scores[:, 0].argmax().item())
 
 
@@ -381,7 +379,7 @@ def apply_batch_update(
         scores = model.unembed_vectors @ state_vecs.transpose(0, 1)
         prefix_indices = torch.arange(total_count, device=model.device)
         target_scores = scores[target_ids_tensor, prefix_indices]
-        predicted_ids = scores[: model.output_vocab_size].argmax(dim=0)
+        predicted_ids = scores.argmax(dim=0)
         mistaken_prefix_mask = predicted_ids != target_ids_tensor
         mistake_count = int(mistaken_prefix_mask.sum().item())
         correct_count = total_count - mistake_count
