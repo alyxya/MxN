@@ -5,19 +5,8 @@ from pathlib import Path
 from typing import Any
 
 import modal
-import torch
 
-from matrix_network_manual_rotation import (
-    ManualRotationMatrixNetwork,
-    default_save_path,
-    format_run_config,
-    load_training_checkpoint,
-    pick_device,
-    save_checkpoint,
-    show_samples,
-    train,
-    ManualRotationOptimizerState,
-)
+from matrix_network_addition import run_addition_training, validate_args
 
 APP_NAME = "mxn-matrix-network"
 VOLUME_NAME = "mxn-matrix-network-checkpoints"
@@ -26,7 +15,7 @@ REMOTE_CHECKPOINT_ROOT = Path("/checkpoints")
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("torch", "numpy")
-    .add_local_python_source("matrix_network_manual_rotation")
+    .add_local_python_source("matrix_network", "matrix_network_addition")
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -57,128 +46,24 @@ def _remote_load_path(load_path: str) -> str:
 
 def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
     args = argparse.Namespace(**args_dict)
-    if not (0.0 <= args.momentum_decay < 1.0):
-        raise ValueError("--momentum-decay must be in [0, 1)")
-    if args.update_orthogonalize_steps < 0:
-        raise ValueError("--update-orthogonalize-steps must be >= 0")
-    if args.checkpoint_every < 0:
-        raise ValueError("--checkpoint-every must be >= 0")
-    if args.primary_target_randomize < 0:
-        raise ValueError("--primary-target-randomize must be >= 0")
-    if args.state_exploration_scale < 0:
-        raise ValueError("--state-exploration-scale must be >= 0")
-    if args.state_exploration_rank < 0:
-        raise ValueError("--state-exploration-rank must be >= 0")
-    if args.state_exploration_period < 1:
-        raise ValueError("--state-exploration-period must be >= 1")
-    if args.state_exploration_samples < 0:
-        raise ValueError("--state-exploration-samples must be >= 0")
-    if args.secondary_matrix_period < 1:
-        raise ValueError("--secondary-matrix-period must be >= 1")
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    validate_args(args)
+    if args.load_path is not None:
+        args.load_path = _remote_load_path(args.load_path)
 
-    device = pick_device(args.device)
-    print(f"device={device}")
-
-    optimizer_state = ManualRotationOptimizerState(momentum_decay=args.momentum_decay)
-    previous_completed_iters = 0
-    if args.load_path is None:
-        model = ManualRotationMatrixNetwork(
-            n=args.n,
-            device=device,
-            number_base=args.number_base,
-            token_mat_mode=args.token_mat_mode,
-        )
-        addend_digits = args.addend_digits
-    else:
-        model, loaded_addend_digits, optimizer_state, previous_completed_iters = load_training_checkpoint(
-            _remote_load_path(args.load_path),
-            device,
-            momentum_decay=args.momentum_decay,
-        )
-        if model.n != args.n:
-            print(f"loaded_n={model.n}; overriding --n={args.n}")
-        if model.number_base != args.number_base:
-            print(f"loaded_number_base={model.number_base}; ignoring --number-base={args.number_base}")
-        if model.token_mat_mode != args.token_mat_mode:
-            print(f"loaded_token_mat_mode={model.token_mat_mode}; ignoring --token-mat-mode={args.token_mat_mode}")
-        addend_digits = int(loaded_addend_digits or args.addend_digits)
-        if loaded_addend_digits is not None and loaded_addend_digits != args.addend_digits:
-            print(f"loaded_addend_digits={loaded_addend_digits}; overriding --addend-digits={args.addend_digits}")
-        args.n = model.n
-        args.number_base = model.number_base
-        args.token_mat_mode = model.token_mat_mode
-        args.addend_digits = addend_digits
-
-    default_path = default_save_path(args, addend_digits)
-    save_path = _remote_checkpoint_path(args.save_path or default_path)
-    print(f"output_vocab={model.output_vocab}")
-    print(f"save_path={save_path}")
-    args.save_path = save_path
-    print(format_run_config(args, addend_digits=addend_digits))
-
-    def checkpoint_callback(iter_idx: int, checkpoint_model: ManualRotationMatrixNetwork, checkpoint_optimizer: ManualRotationOptimizerState) -> None:
-        save_checkpoint(
-            checkpoint_model,
-            save_path,
-            addend_digits=addend_digits,
-            optimizer_state=checkpoint_optimizer,
-            update_orthogonalize_steps=args.update_orthogonalize_steps,
-            completed_iters=previous_completed_iters + iter_idx,
-        )
+    def commit_checkpoint(_: str) -> None:
         volume.commit()
-        print(f"checkpoint_iter={iter_idx} save_path={save_path}")
 
     start_time = time.perf_counter()
-    model, optimizer_state = train(
-        model=model,
-        optimizer_state=optimizer_state,
-        iters=args.iters,
-        batch_size=args.batch_size,
-        token_learning_rate=args.token_learning_rate,
-        base_learning_rate=args.base_learning_rate,
-        primary_target_randomize=args.primary_target_randomize,
-        state_exploration_scale=args.state_exploration_scale,
-        state_exploration_rank=args.state_exploration_rank,
-        state_exploration_period=args.state_exploration_period,
-        state_exploration_samples=args.state_exploration_samples,
-        addend_digits=addend_digits,
-        number_base=model.number_base,
-        seed=args.seed,
-        log_every=args.log_every,
-        eval_every=args.eval_every,
-        eval_samples=args.eval_samples,
-        secondary_matrix_scale=args.secondary_matrix_scale,
-        secondary_matrix_period=args.secondary_matrix_period,
-        update_orthogonalize_steps=args.update_orthogonalize_steps,
-        checkpoint_every=args.checkpoint_every,
-        checkpoint_callback=checkpoint_callback if args.checkpoint_every > 0 else None,
+    result = run_addition_training(
+        args,
+        save_path_transform=_remote_checkpoint_path,
+        checkpoint_saved_callback=commit_checkpoint,
     )
     elapsed_seconds = time.perf_counter() - start_time
-
-    save_checkpoint(
-        model,
-        save_path,
-        addend_digits=addend_digits,
-        optimizer_state=optimizer_state,
-        update_orthogonalize_steps=args.update_orthogonalize_steps,
-        completed_iters=previous_completed_iters + args.iters,
-    )
-    volume.commit()
-    print(f"saved_checkpoint={save_path}")
-    print("\nSample predictions:")
-    show_samples(model, seed=args.seed + 999, addend_digits=addend_digits, number_base=model.number_base)
     return {
-        "saved_checkpoint": save_path,
+        **result,
         "elapsed_seconds": elapsed_seconds,
         "iters_per_second": (args.iters / elapsed_seconds) if elapsed_seconds > 0 else None,
-        "device": str(device),
-        "n": model.n,
-        "number_base": model.number_base,
-        "token_mat_mode": model.token_mat_mode,
-        "addend_digits": addend_digits,
     }
 
 

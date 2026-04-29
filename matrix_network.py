@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-import argparse
-import random
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Sequence, Tuple
 
@@ -12,12 +9,7 @@ import torch
 TAU = 2.0 * torch.pi
 
 
-EOS_TOKEN = "~"
-PLUS_TOKEN = "+"
-EQUALS_TOKEN = "="
-DIGIT_SYMBOLS = "0123456789ABCDEF"
 EPS = 1e-12
-Problem = Tuple[int, int, str, str]
 INIT_ORTHOGONALIZE_STEPS = 4
 DEFAULT_UPDATE_ORTHOGONALIZE_STEPS = 1
 _EYE_CACHE: Dict[Tuple[int, str, int | None, torch.dtype], torch.Tensor] = {}
@@ -146,13 +138,13 @@ def _zeros_like_shape(shape: Sequence[int], *, device: torch.device, dtype: torc
 
 
 @dataclass
-class ManualRotationOptimizerState:
+class MatrixNetworkOptimizerState:
     momentum_decay: float
     base_momentum: torch.Tensor | None = None
     left_token_momentum: torch.Tensor | None = None
     right_token_momentum: torch.Tensor | None = None
 
-    def ensure_initialized(self, model: "ManualRotationMatrixNetwork") -> None:
+    def ensure_initialized(self, model: "MatrixNetwork") -> None:
         dtype = model.base_mat.dtype
         device = model.device
         n = model.n
@@ -186,7 +178,7 @@ class ManualRotationOptimizerState:
         *,
         momentum_decay: float,
         device: torch.device,
-    ) -> "ManualRotationOptimizerState":
+    ) -> "MatrixNetworkOptimizerState":
         state = cls(momentum_decay=momentum_decay)
         if not state_dict:
             return state
@@ -211,7 +203,7 @@ class BatchUpdateWorkspace:
     seq_left_u_ops: torch.Tensor | None = None
     seq_right_v_ops: torch.Tensor | None = None
 
-    def prepare(self, model: "ManualRotationMatrixNetwork") -> None:
+    def prepare(self, model: "MatrixNetwork") -> None:
         dtype = model.base_mat.dtype
         device = model.device
         n = model.n
@@ -264,86 +256,6 @@ class PrefixOperatorCache:
     query_target_op: torch.Tensor
 
 
-def digit_alphabet(number_base: int) -> str:
-    if not (2 <= number_base <= len(DIGIT_SYMBOLS)):
-        raise ValueError(f"number_base must be in [2, {len(DIGIT_SYMBOLS)}], got {number_base}")
-    return DIGIT_SYMBOLS[:number_base]
-
-
-def format_in_base(value: int, number_base: int, min_digits: int = 1) -> str:
-    digits = digit_alphabet(number_base)
-    if value == 0:
-        out = "0"
-    else:
-        chars: List[str] = []
-        x = value
-        while x > 0:
-            x, rem = divmod(x, number_base)
-            chars.append(digits[rem])
-        out = "".join(reversed(chars))
-    if len(out) < min_digits:
-        out = ("0" * (min_digits - len(out))) + out
-    return out
-
-
-def random_problem(rng: random.Random, addend_digits: int, number_base: int) -> Problem:
-    max_val = (number_base**addend_digits) - 1
-    left_addend = rng.randint(0, max_val)
-    right_addend = rng.randint(0, max_val)
-    prompt_text = (
-        f"{format_in_base(left_addend, number_base, min_digits=addend_digits)}"
-        f"{PLUS_TOKEN}"
-        f"{format_in_base(right_addend, number_base, min_digits=addend_digits)}"
-        f"{EQUALS_TOKEN}"
-    )
-    target_text = format_in_base(left_addend + right_addend, number_base)
-    return left_addend, right_addend, prompt_text, target_text
-
-
-def encode_number_ids(
-    value: int,
-    number_base: int,
-    digit_token_ids: Sequence[int],
-    *,
-    min_digits: int = 1,
-) -> List[int]:
-    if value == 0:
-        out = [digit_token_ids[0]]
-    else:
-        digits: List[int] = []
-        x = value
-        while x > 0:
-            x, rem = divmod(x, number_base)
-            digits.append(digit_token_ids[rem])
-        out = list(reversed(digits))
-    if len(out) < min_digits:
-        out = ([digit_token_ids[0]] * (min_digits - len(out))) + out
-    return out
-
-
-def random_problem_ids(
-    rng: random.Random,
-    *,
-    addend_digits: int,
-    number_base: int,
-    digit_token_ids: Sequence[int],
-    plus_id: int,
-    equals_id: int,
-    eos_id: int,
-) -> Tuple[List[int], List[int]]:
-    max_val = (number_base**addend_digits) - 1
-    left_addend = rng.randint(0, max_val)
-    right_addend = rng.randint(0, max_val)
-    prompt_ids = (
-        encode_number_ids(left_addend, number_base, digit_token_ids, min_digits=addend_digits)
-        + [plus_id]
-        + encode_number_ids(right_addend, number_base, digit_token_ids, min_digits=addend_digits)
-        + [equals_id]
-    )
-    target_ids = encode_number_ids(left_addend + right_addend, number_base, digit_token_ids, min_digits=1) + [eos_id]
-    return prompt_ids, target_ids
-
-
 def pick_device(requested: str) -> torch.device:
     if requested != "auto":
         return torch.device(requested)
@@ -354,24 +266,26 @@ def pick_device(requested: str) -> torch.device:
     return torch.device("cpu")
 
 
-class ManualRotationMatrixNetwork:
+class MatrixNetwork:
     def __init__(
         self,
         *,
         n: int,
         device: torch.device,
-        number_base: int,
+        vocab: str,
+        output_vocab: str,
         token_mat_mode: str,
     ):
-        output_vocab = EOS_TOKEN + digit_alphabet(number_base)
-        vocab = output_vocab + PLUS_TOKEN + EQUALS_TOKEN
         if n < len(vocab):
             raise ValueError(f"n must be >= {len(vocab)} to fit fixed one-hot heads, got {n}")
+        if not output_vocab:
+            raise ValueError("output_vocab must not be empty")
+        if any(ch not in vocab for ch in output_vocab):
+            raise ValueError("output_vocab must be a subset of vocab")
         if token_mat_mode not in {"left", "right", "both"}:
             raise ValueError(f"unsupported token_mat_mode={token_mat_mode}")
         self.n = n
         self.device = device
-        self.number_base = number_base
         self.token_mat_mode = token_mat_mode
         self.vocab = vocab
         self.output_vocab = output_vocab
@@ -442,14 +356,16 @@ class ManualRotationMatrixNetwork:
         cls,
         ckpt: Dict[str, Any],
         device: torch.device,
-    ) -> Tuple["ManualRotationMatrixNetwork", int | None]:
+    ) -> Tuple["MatrixNetwork", int | None]:
         n = int(ckpt["n"])
-        number_base = int(ckpt["number_base"])
+        vocab = str(ckpt["vocab"])
+        output_vocab = str(ckpt["output_vocab"])
         token_mat_mode = str(ckpt["token_mat_mode"])
         model = cls(
             n=n,
             device=device,
-            number_base=number_base,
+            vocab=vocab,
+            output_vocab=output_vocab,
             token_mat_mode=token_mat_mode,
         )
         model.left_token_mats = ckpt["left_token_mats"].to(device)
@@ -472,7 +388,7 @@ class ManualRotationMatrixNetwork:
         return model, addend_digits
 
     @classmethod
-    def from_checkpoint(cls, path: str, device: torch.device) -> Tuple["ManualRotationMatrixNetwork", int | None]:
+    def from_checkpoint(cls, path: str, device: torch.device) -> Tuple["MatrixNetwork", int | None]:
         ckpt = load_checkpoint_dict(path, device)
         return cls.from_checkpoint_dict(ckpt, device)
 
@@ -492,10 +408,10 @@ def load_training_checkpoint(
     device: torch.device,
     *,
     momentum_decay: float,
-) -> Tuple[ManualRotationMatrixNetwork, int | None, ManualRotationOptimizerState, int]:
+) -> Tuple[MatrixNetwork, int | None, MatrixNetworkOptimizerState, int]:
     ckpt = load_checkpoint_dict(path, device)
-    model, addend_digits = ManualRotationMatrixNetwork.from_checkpoint_dict(ckpt, device)
-    optimizer_state = ManualRotationOptimizerState.from_state_dict(
+    model, addend_digits = MatrixNetwork.from_checkpoint_dict(ckpt, device)
+    optimizer_state = MatrixNetworkOptimizerState.from_state_dict(
         ckpt.get("optimizer_state"),
         momentum_decay=momentum_decay,
         device=device,
@@ -506,20 +422,19 @@ def load_training_checkpoint(
 
 
 def save_checkpoint(
-    model: ManualRotationMatrixNetwork,
+    model: MatrixNetwork,
     save_path: str,
-    addend_digits: int,
     *,
-    optimizer_state: ManualRotationOptimizerState | None = None,
+    optimizer_state: MatrixNetworkOptimizerState | None = None,
     update_orthogonalize_steps: int = DEFAULT_UPDATE_ORTHOGONALIZE_STEPS,
     completed_iters: int | None = None,
+    metadata: Dict[str, Any] | None = None,
 ) -> None:
     path = Path(save_path)
     if path.parent:
         path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "n": model.n,
-        "number_base": model.number_base,
         "vocab": model.vocab,
         "output_vocab": model.output_vocab,
         "token_mat_mode": model.token_mat_mode,
@@ -530,11 +445,12 @@ def save_checkpoint(
         "past_queries": model.past_queries,
         "unembed_vectors": model.unembed_vectors,
         "past_unembed_vectors": model.past_unembed_vectors,
-        "addend_digits": addend_digits,
         "optimizer_state": None if optimizer_state is None else optimizer_state.state_dict(),
         "update_orthogonalize_steps": int(update_orthogonalize_steps),
         "completed_iters": None if completed_iters is None else int(completed_iters),
     }
+    if metadata:
+        payload.update(metadata)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
@@ -549,60 +465,7 @@ def format_float_token(x: float) -> str:
     return format(x, ".6g").replace("-", "m").replace(".", "p")
 
 
-def format_run_config(args: argparse.Namespace, *, addend_digits: int) -> str:
-    items = [
-        ("n", args.n),
-        ("number_base", args.number_base),
-        ("addend_digits", addend_digits),
-        ("token_mat_mode", args.token_mat_mode),
-        ("iters", args.iters),
-        ("batch_size", args.batch_size),
-        ("token_learning_rate", args.token_learning_rate),
-        ("base_learning_rate", args.base_learning_rate),
-        ("primary_target_randomize", args.primary_target_randomize),
-        ("state_exploration_scale", args.state_exploration_scale),
-        ("state_exploration_rank", args.state_exploration_rank),
-        ("state_exploration_period", args.state_exploration_period),
-        ("state_exploration_samples", args.state_exploration_samples),
-        ("momentum_decay", args.momentum_decay),
-        ("secondary_matrix_scale", args.secondary_matrix_scale),
-        ("secondary_matrix_period", args.secondary_matrix_period),
-        ("update_orthogonalize_steps", args.update_orthogonalize_steps),
-        ("checkpoint_every", getattr(args, "checkpoint_every", 0)),
-        ("seed", args.seed),
-        ("device", args.device),
-        ("load_path", args.load_path),
-        ("save_path", args.save_path),
-    ]
-    return "\n".join(f"{k}={v}" for k, v in items)
-
-
-def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    name = (
-        f"manual_rotation_n{args.n}"
-        f"_d{addend_digits}"
-        f"_base{args.number_base}"
-        f"_mode{args.token_mat_mode}"
-        f"_it{args.iters}"
-        f"_bs{args.batch_size}"
-        f"_tlr{format_float_token(args.token_learning_rate)}"
-        f"_blr{format_float_token(args.base_learning_rate)}"
-        f"_ptr{format_float_token(args.primary_target_randomize)}"
-        f"_ses{format_float_token(args.state_exploration_scale)}"
-        f"_ser{args.state_exploration_rank}"
-        f"_sep{args.state_exploration_period}"
-        f"_mom{format_float_token(args.momentum_decay)}"
-        f"_sms{format_float_token(args.secondary_matrix_scale)}"
-        f"_smp{args.secondary_matrix_period}"
-        f"_orth{args.update_orthogonalize_steps}"
-        f"_seed{args.seed}"
-        f"_{timestamp}.pt"
-    )
-    return str(Path("checkpoints") / name)
-
-
-def prefix_operator_pair_from_ids(model: ManualRotationMatrixNetwork, token_ids: Sequence[int]) -> Tuple[torch.Tensor, torch.Tensor]:
+def prefix_operator_pair_from_ids(model: MatrixNetwork, token_ids: Sequence[int]) -> Tuple[torch.Tensor, torch.Tensor]:
     eye = cached_eye(model.n, model.device, model.base_mat.dtype)
     right_total_op = eye
     left_total_op = eye
@@ -616,7 +479,7 @@ def prefix_operator_pair_from_ids(model: ManualRotationMatrixNetwork, token_ids:
 
 
 def advance_prefix_operator_pair(
-    model: ManualRotationMatrixNetwork,
+    model: MatrixNetwork,
     left_total_op: torch.Tensor,
     right_total_op: torch.Tensor,
     token_id: int,
@@ -629,7 +492,7 @@ def advance_prefix_operator_pair(
 
 
 def state_from_prefix_operators(
-    model: ManualRotationMatrixNetwork,
+    model: MatrixNetwork,
     left_total_op: torch.Tensor,
     right_total_op: torch.Tensor,
     query: torch.Tensor,
@@ -638,7 +501,7 @@ def state_from_prefix_operators(
 
 
 def predict_next_id_from_prefix_operators(
-    model: ManualRotationMatrixNetwork,
+    model: MatrixNetwork,
     left_total_op: torch.Tensor,
     right_total_op: torch.Tensor,
 ) -> int:
@@ -647,22 +510,22 @@ def predict_next_id_from_prefix_operators(
     return int(scores[:, 0].argmax().item())
 
 
-def generate_until_eos(model: ManualRotationMatrixNetwork, prompt_text: str, max_len: int) -> Tuple[str, bool]:
-    prefix_ids = model.encode(prompt_text)
-    pred_ids, did_stop = generate_ids_until_eos(model, prefix_ids, max_len)
-    return "".join(model.itos[tid] for tid in pred_ids), did_stop
-
-
-def generate_ids_until_eos(model: ManualRotationMatrixNetwork, prompt_ids: Sequence[int], max_len: int) -> Tuple[List[int], bool]:
+def generate_until_token_id(model: MatrixNetwork, prompt_ids: Sequence[int], stop_token_id: int, max_len: int) -> Tuple[List[int], bool]:
     left_total_op, right_total_op = prefix_operator_pair_from_ids(model, prompt_ids)
     pred_ids: List[int] = []
     for _ in range(max_len):
         next_id = predict_next_id_from_prefix_operators(model, left_total_op, right_total_op)
-        if next_id == model.stoi[EOS_TOKEN]:
+        if next_id == stop_token_id:
             return pred_ids, True
         pred_ids.append(next_id)
         left_total_op, right_total_op = advance_prefix_operator_pair(model, left_total_op, right_total_op, next_id)
     return pred_ids, False
+
+
+def generate_until_token(model: MatrixNetwork, prompt_text: str, stop_token: str, max_len: int) -> Tuple[str, bool]:
+    prefix_ids = model.encode(prompt_text)
+    pred_ids, did_stop = generate_until_token_id(model, prefix_ids, model.stoi[stop_token], max_len)
+    return "".join(model.itos[tid] for tid in pred_ids), did_stop
 
 
 def subspace_summary(vectors: torch.Tensor) -> Dict[str, float]:
@@ -713,88 +576,10 @@ def format_subspace_summary(label: str, summary: Dict[str, float]) -> str:
     )
 
 
-def evaluate(
-    model: ManualRotationMatrixNetwork,
-    eval_samples: int,
-    seed: int,
-    addend_digits: int,
-    number_base: int,
-) -> Tuple[float, float, float, Dict[str, Dict[str, float]]]:
-    rng = random.Random(seed)
-    exact = 0
-    tf_correct = 0
-    tf_total = 0
-    stopped = 0
-    digit_token_ids = [model.stoi[ch] for ch in digit_alphabet(number_base)]
-    plus_id = model.stoi[PLUS_TOKEN]
-    equals_id = model.stoi[EQUALS_TOKEN]
-    eos_id = model.stoi[EOS_TOKEN]
-    primary_states: List[torch.Tensor] = []
-    primary_query_targets: List[torch.Tensor] = []
-
-    for _ in range(eval_samples):
-        prompt_ids, target_ids = random_problem_ids(
-            rng,
-            addend_digits=addend_digits,
-            number_base=number_base,
-            digit_token_ids=digit_token_ids,
-            plus_id=plus_id,
-            equals_id=equals_id,
-            eos_id=eos_id,
-        )
-        pred_ids, did_stop = generate_ids_until_eos(model, prompt_ids, len(target_ids) + 1)
-        stopped += int(did_stop)
-        if did_stop and pred_ids == target_ids[:-1]:
-            exact += 1
-
-        left_total_op, right_total_op = prefix_operator_pair_from_ids(model, prompt_ids)
-        for target_id in target_ids:
-            state = state_from_prefix_operators(model, left_total_op, right_total_op, model.query)
-            state_normed = normalize_columns(state.unsqueeze(1))[:, 0]
-            primary_states.append(state_normed.detach().cpu())
-            query_target = normalize_columns(
-                (right_total_op.transpose(-1, -2) @ model.base_mat.transpose(-1, -2) @ left_total_op.transpose(-1, -2) @ model.unembed_vectors[target_id].unsqueeze(1))
-            )[:, 0]
-            primary_query_targets.append(query_target.detach().cpu())
-            pred_id = predict_next_id_from_prefix_operators(model, left_total_op, right_total_op)
-            tf_correct += int(pred_id == target_id)
-            tf_total += 1
-            left_total_op, right_total_op = advance_prefix_operator_pair(model, left_total_op, right_total_op, target_id)
-
-    primary_state_summary = subspace_summary(torch.stack(primary_states, dim=0))
-    primary_query_summary = subspace_summary(torch.stack(primary_query_targets, dim=0))
-
-    return (
-        exact / max(eval_samples, 1),
-        tf_correct / max(tf_total, 1),
-        stopped / max(eval_samples, 1),
-        {
-            "state": primary_state_summary,
-            "query_target": primary_query_summary,
-        },
-    )
-
-
-def show_samples(
-    model: ManualRotationMatrixNetwork,
-    seed: int,
-    addend_digits: int,
-    number_base: int,
-    count: int = 10,
-) -> None:
-    rng = random.Random(seed)
-    for _ in range(count):
-        left_addend, right_addend, prompt_text, target_text = random_problem(rng, addend_digits, number_base)
-        pred, did_stop = generate_until_eos(model, prompt_text, len(target_text) + 2)
-        ok = "OK" if (did_stop and pred == target_text) else "XX"
-        stop_txt = "eos" if did_stop else "max"
-        print(f"{prompt_text}{target_text:>4s} | pred={pred:>4s} ({stop_txt}) [{ok}]   ({left_addend}+{right_addend})")
-
-
 @torch.no_grad()
 def apply_batch_update(
-    model: ManualRotationMatrixNetwork,
-    optimizer_state: ManualRotationOptimizerState,
+    model: MatrixNetwork,
+    optimizer_state: MatrixNetworkOptimizerState,
     workspace: BatchUpdateWorkspace,
     sequences: Sequence[Sequence[int]],
     prompt_lens: Sequence[int],
@@ -1125,10 +910,11 @@ def apply_batch_update(
 
 def train(
     *,
-    model: ManualRotationMatrixNetwork,
-    optimizer_state: ManualRotationOptimizerState,
+    model: MatrixNetwork,
+    optimizer_state: MatrixNetworkOptimizerState,
+    sample_batch: Callable[[], Tuple[List[List[int]], List[int]]],
+    evaluate_callback: Callable[[MatrixNetwork, int], None] | None,
     iters: int,
-    batch_size: int,
     token_learning_rate: float,
     base_learning_rate: float,
     primary_target_randomize: float,
@@ -1136,44 +922,16 @@ def train(
     state_exploration_rank: int,
     state_exploration_period: int,
     state_exploration_samples: int,
-    addend_digits: int,
-    number_base: int,
-    seed: int,
     log_every: int,
     eval_every: int,
-    eval_samples: int,
     secondary_matrix_scale: float,
     secondary_matrix_period: int,
     update_orthogonalize_steps: int,
     checkpoint_every: int = 0,
-    checkpoint_callback: Callable[[int, ManualRotationMatrixNetwork, ManualRotationOptimizerState], None] | None = None,
-) -> Tuple[ManualRotationMatrixNetwork, ManualRotationOptimizerState]:
-    rng = random.Random(seed)
+    checkpoint_callback: Callable[[int, MatrixNetwork, MatrixNetworkOptimizerState], None] | None = None,
+) -> Tuple[MatrixNetwork, MatrixNetworkOptimizerState]:
     workspace = BatchUpdateWorkspace()
     state_exploration_cache = StateExplorationCache()
-    digit_token_ids = [model.stoi[ch] for ch in digit_alphabet(number_base)]
-    plus_id = model.stoi[PLUS_TOKEN]
-    equals_id = model.stoi[EQUALS_TOKEN]
-    eos_id = model.stoi[EOS_TOKEN]
-
-    def sample_batch() -> Tuple[List[List[int]], List[int]]:
-        sequences: List[List[int]] = []
-        prompt_lens: List[int] = []
-
-        for _ in range(batch_size):
-            prompt_ids, target_seq_ids = random_problem_ids(
-                rng,
-                addend_digits=addend_digits,
-                number_base=number_base,
-                digit_token_ids=digit_token_ids,
-                plus_id=plus_id,
-                equals_id=equals_id,
-                eos_id=eos_id,
-            )
-            sequences.append(prompt_ids + target_seq_ids)
-            prompt_lens.append(len(prompt_ids))
-
-        return sequences, prompt_lens
 
     for iter_idx in range(1, iters + 1):
         sequences, prompt_lens = sample_batch()
@@ -1209,176 +967,11 @@ def train(
                 f"token_acc={token_acc:.3f}"
             )
 
-        if iter_idx % eval_every == 0 or iter_idx == iters:
-            exact, tf_acc, stop_rate, subspace_stats = evaluate(
-                model,
-                eval_samples=eval_samples,
-                seed=seed + iter_idx,
-                addend_digits=addend_digits,
-                number_base=number_base,
-            )
-            print(
-                f"  eval exact_match={exact:.3f} teacher_forced_token_acc={tf_acc:.3f} "
-                f"stop_rate={stop_rate:.3f}"
-            )
-            print(
-                "  "
-                + " ".join(
-                    [
-                        format_subspace_summary("state", subspace_stats["state"]),
-                        format_subspace_summary("target", subspace_stats["query_target"]),
-                    ]
-                )
-            )
+        if evaluate_callback is not None and (iter_idx % eval_every == 0 or iter_idx == iters):
+            evaluate_callback(model, iter_idx)
 
         if checkpoint_callback is not None and checkpoint_every > 0 and iter_idx % checkpoint_every == 0:
             checkpoint_callback(iter_idx, model, optimizer_state)
 
     return model, optimizer_state
 
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Dense matrix network with manual rotation updates and static query/unembedding vectors")
-    p.add_argument("--n", type=int, default=32, help="Square matrix dimension; must be >= vocab size")
-    p.add_argument("--number-base", type=int, default=10, help="Arithmetic base for generated addition problems (2-16)")
-    p.add_argument("--token-mat-mode", type=str, default="right", choices=["left", "right", "both"], help="Apply learned token matrices on the left of base, right of base, or both")
-    p.add_argument("--iters", type=int, default=5000, help="Training iterations")
-    p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
-    p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token embedding matrices")
-    p.add_argument("--base-learning-rate", type=float, default=1.0, help="Step size for the base matrix")
-    p.add_argument("--primary-target-randomize", type=float, default=0.0, help="Deprecated isotropic Gaussian noise strength added to primary one-hot target directions during training")
-    p.add_argument("--state-exploration-scale", type=float, default=0.0, help="Training-only target noise strength sampled from low-usage state SVD directions")
-    p.add_argument("--state-exploration-rank", type=int, default=8, help="Number of least-used SVD directions to use for state exploration target noise")
-    p.add_argument("--state-exploration-period", type=int, default=100, help="Refresh low-usage state directions every N training iterations")
-    p.add_argument("--state-exploration-samples", type=int, default=1024, help="Rolling state sample count used when computing exploration directions")
-    p.add_argument("--momentum-decay", type=float, default=0.9, help="EMA decay for primary matrix momentum buffers")
-    p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--log-every", type=int, default=50)
-    p.add_argument("--eval-every", type=int, default=250)
-    p.add_argument("--eval-samples", type=int, default=300)
-    p.add_argument("--secondary-matrix-scale", type=float, default=0.0, help="Scale multiplier for matrix learning from past-token auxiliary objectives; 0 disables it")
-    p.add_argument("--secondary-matrix-period", type=int, default=1, help="Run secondary matrix objective every N training iterations when enabled")
-    p.add_argument("--update-orthogonalize-steps", type=int, default=1, help="Newton-Schulz orthogonalization steps after each matrix update")
-    p.add_argument("--checkpoint-every", type=int, default=0, help="Save latest checkpoint every N iterations; 0 disables periodic saves")
-    p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")
-    p.add_argument("--save-path", type=str, default=None, help="Optional checkpoint path override")
-    p.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "mps", "cuda"])
-    return p.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    if not (0.0 <= args.momentum_decay < 1.0):
-        raise ValueError("--momentum-decay must be in [0, 1)")
-    if args.update_orthogonalize_steps < 0:
-        raise ValueError("--update-orthogonalize-steps must be >= 0")
-    if args.checkpoint_every < 0:
-        raise ValueError("--checkpoint-every must be >= 0")
-    if args.primary_target_randomize < 0:
-        raise ValueError("--primary-target-randomize must be >= 0")
-    if args.state_exploration_scale < 0:
-        raise ValueError("--state-exploration-scale must be >= 0")
-    if args.state_exploration_rank < 0:
-        raise ValueError("--state-exploration-rank must be >= 0")
-    if args.state_exploration_period < 1:
-        raise ValueError("--state-exploration-period must be >= 1")
-    if args.state_exploration_samples < 0:
-        raise ValueError("--state-exploration-samples must be >= 0")
-    if args.secondary_matrix_period < 1:
-        raise ValueError("--secondary-matrix-period must be >= 1")
-
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-
-    device = pick_device(args.device)
-    print(f"device={device}")
-
-    optimizer_state = ManualRotationOptimizerState(momentum_decay=args.momentum_decay)
-    previous_completed_iters = 0
-    if args.load_path is None:
-        model = ManualRotationMatrixNetwork(
-            n=args.n,
-            device=device,
-            number_base=args.number_base,
-            token_mat_mode=args.token_mat_mode,
-        )
-        addend_digits = args.addend_digits
-    else:
-        model, loaded_addend_digits, optimizer_state, previous_completed_iters = load_training_checkpoint(
-            args.load_path,
-            device,
-            momentum_decay=args.momentum_decay,
-        )
-        if model.n != args.n:
-            print(f"loaded_n={model.n}; overriding --n={args.n}")
-        if model.number_base != args.number_base:
-            print(f"loaded_number_base={model.number_base}; ignoring --number-base={args.number_base}")
-        if model.token_mat_mode != args.token_mat_mode:
-            print(f"loaded_token_mat_mode={model.token_mat_mode}; ignoring --token-mat-mode={args.token_mat_mode}")
-        addend_digits = int(loaded_addend_digits or args.addend_digits)
-        if loaded_addend_digits is not None and loaded_addend_digits != args.addend_digits:
-            print(f"loaded_addend_digits={loaded_addend_digits}; overriding --addend-digits={args.addend_digits}")
-        args.n = model.n
-        args.number_base = model.number_base
-        args.token_mat_mode = model.token_mat_mode
-        args.addend_digits = addend_digits
-
-    save_path = args.save_path or default_save_path(args, addend_digits)
-    print(f"output_vocab={model.output_vocab}")
-    print(f"save_path={save_path}")
-    args.save_path = save_path
-    print(format_run_config(args, addend_digits=addend_digits))
-
-    def checkpoint_callback(iter_idx: int, checkpoint_model: ManualRotationMatrixNetwork, checkpoint_optimizer: ManualRotationOptimizerState) -> None:
-        save_checkpoint(
-            checkpoint_model,
-            save_path,
-            addend_digits=addend_digits,
-            optimizer_state=checkpoint_optimizer,
-            update_orthogonalize_steps=args.update_orthogonalize_steps,
-            completed_iters=previous_completed_iters + iter_idx,
-        )
-        print(f"checkpoint_iter={iter_idx} save_path={save_path}")
-
-    model, optimizer_state = train(
-        model=model,
-        optimizer_state=optimizer_state,
-        iters=args.iters,
-        batch_size=args.batch_size,
-        token_learning_rate=args.token_learning_rate,
-        base_learning_rate=args.base_learning_rate,
-        primary_target_randomize=args.primary_target_randomize,
-        state_exploration_scale=args.state_exploration_scale,
-        state_exploration_rank=args.state_exploration_rank,
-        state_exploration_period=args.state_exploration_period,
-        state_exploration_samples=args.state_exploration_samples,
-        addend_digits=addend_digits,
-        number_base=model.number_base,
-        seed=args.seed,
-        log_every=args.log_every,
-        eval_every=args.eval_every,
-        eval_samples=args.eval_samples,
-        secondary_matrix_scale=args.secondary_matrix_scale,
-        secondary_matrix_period=args.secondary_matrix_period,
-        update_orthogonalize_steps=args.update_orthogonalize_steps,
-        checkpoint_every=args.checkpoint_every,
-        checkpoint_callback=checkpoint_callback if args.checkpoint_every > 0 else None,
-    )
-
-    save_checkpoint(
-        model,
-        save_path,
-        addend_digits=addend_digits,
-        optimizer_state=optimizer_state,
-        update_orthogonalize_steps=args.update_orthogonalize_steps,
-        completed_iters=previous_completed_iters + args.iters,
-    )
-    print(f"saved_checkpoint={save_path}")
-    print("\nSample predictions:")
-    show_samples(model, seed=args.seed + 999, addend_digits=addend_digits, number_base=model.number_base)
-
-
-if __name__ == "__main__":
-    main()
