@@ -7,16 +7,15 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 
-from matrix_network import (
+from matrix_network import MatrixNetwork, normalize_columns
+from matrix_network_training import (
     DEFAULT_UPDATE_ORTHOGONALIZE_STEPS,
-    MatrixNetwork,
     MatrixNetworkOptimizerState,
     advance_prefix_operator,
     format_subspace_summary,
     generate_until_token,
     generate_until_token_id,
     load_training_checkpoint,
-    normalize_columns,
     pick_device,
     predict_next_id_from_prefix_op,
     prefix_operator_from_ids,
