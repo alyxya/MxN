@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 
-from matrix_network import MatrixNetwork, normalize_columns
+from matrix_network import MatrixNetwork
+from matrix_network_ops import normalize_columns
 from matrix_network_training import (
     DEFAULT_UPDATE_ORTHOGONALIZE_STEPS,
     MatrixNetworkOptimizerState,

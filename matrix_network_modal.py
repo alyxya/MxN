@@ -15,7 +15,7 @@ REMOTE_CHECKPOINT_ROOT = Path("/checkpoints")
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("torch", "numpy")
-    .add_local_python_source("matrix_network", "matrix_network_training", "matrix_network_addition")
+    .add_local_python_source("matrix_network", "matrix_network_ops", "matrix_network_training", "matrix_network_addition")
 )
 
 app = modal.App(APP_NAME, image=image)

@@ -5,9 +5,9 @@ from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 import torch
 
-from matrix_network import (
+from matrix_network import MatrixNetwork
+from matrix_network_ops import (
     EPS,
-    MatrixNetwork,
     cached_eye,
     normalize_columns,
     normalize_last_dim,
