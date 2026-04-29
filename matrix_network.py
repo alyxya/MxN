@@ -3,7 +3,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 import torch
 
-from matrix_network_ops import initialize_rotation_like, normalize_columns, one_hot_vectors
+from matrix_network_ops import normalize_columns, one_hot_vectors
 
 
 class MatrixNetwork:
@@ -32,8 +32,8 @@ class MatrixNetwork:
 
         self.query = one_hot_vectors(1, n, device)[0]
         self.unembed_vectors = one_hot_vectors(self.vocab_size, n, device)
-        self.base_mat = initialize_rotation_like((n, n), device, 0.0)
-        self.token_mats = initialize_rotation_like((self.vocab_size, n, n), device, 0.0)
+        self.base_mat = torch.eye(n, device=device)
+        self.token_mats = torch.eye(n, device=device).expand(self.vocab_size, n, n).clone()
         self.device = self.base_mat.device
 
     def encode(self, text: str) -> List[int]:
