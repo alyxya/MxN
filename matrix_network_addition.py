@@ -253,8 +253,6 @@ def format_run_config(args: argparse.Namespace, *, addend_digits: int) -> str:
         ("state_exploration_period", args.state_exploration_period),
         ("state_exploration_samples", args.state_exploration_samples),
         ("momentum_decay", args.momentum_decay),
-        ("secondary_matrix_scale", args.secondary_matrix_scale),
-        ("secondary_matrix_period", args.secondary_matrix_period),
         ("update_orthogonalize_steps", args.update_orthogonalize_steps),
         ("checkpoint_every", getattr(args, "checkpoint_every", 0)),
         ("seed", args.seed),
@@ -281,8 +279,6 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
         f"_ser{args.state_exploration_rank}"
         f"_sep{args.state_exploration_period}"
         f"_mom{format_float_token(args.momentum_decay)}"
-        f"_sms{format_float_token(args.secondary_matrix_scale)}"
-        f"_smp{args.secondary_matrix_period}"
         f"_orth{args.update_orthogonalize_steps}"
         f"_seed{args.seed}"
         f"_{timestamp}.pt"
@@ -307,9 +303,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--state-exploration-period must be >= 1")
     if args.state_exploration_samples < 0:
         raise ValueError("--state-exploration-samples must be >= 0")
-    if args.secondary_matrix_period < 1:
-        raise ValueError("--secondary-matrix-period must be >= 1")
-
 
 def run_addition_training(
     args: argparse.Namespace,
@@ -430,8 +423,6 @@ def run_addition_training(
         state_exploration_samples=args.state_exploration_samples,
         log_every=args.log_every,
         eval_every=args.eval_every,
-        secondary_matrix_scale=args.secondary_matrix_scale,
-        secondary_matrix_period=args.secondary_matrix_period,
         update_orthogonalize_steps=args.update_orthogonalize_steps,
         checkpoint_every=args.checkpoint_every,
         checkpoint_callback=checkpoint_callback if args.checkpoint_every > 0 else None,
@@ -480,8 +471,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
-    p.add_argument("--secondary-matrix-scale", type=float, default=0.0, help="Scale multiplier for matrix learning from past-token auxiliary objectives; 0 disables it")
-    p.add_argument("--secondary-matrix-period", type=int, default=1, help="Run secondary matrix objective every N training iterations when enabled")
     p.add_argument("--update-orthogonalize-steps", type=int, default=DEFAULT_UPDATE_ORTHOGONALIZE_STEPS, help="Newton-Schulz orthogonalization steps after each matrix update")
     p.add_argument("--checkpoint-every", type=int, default=0, help="Save latest checkpoint every N iterations; 0 disables periodic saves")
     p.add_argument("--load-path", type=str, default=None, help="Optional checkpoint to continue training from")

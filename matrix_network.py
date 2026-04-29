@@ -6,9 +6,6 @@ from typing import Any, Callable, Dict, List, Sequence, Tuple
 import torch
 
 
-TAU = 2.0 * torch.pi
-
-
 EPS = 1e-12
 INIT_ORTHOGONALIZE_STEPS = 4
 DEFAULT_UPDATE_ORTHOGONALIZE_STEPS = 1
@@ -125,14 +122,6 @@ class StateExplorationCache:
         self.directions = normalize_last_dim(vh[-keep:].detach())
 
 
-def random_sinusoidal_vectors(shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
-    dim = shape[-1]
-    t = torch.arange(dim, device=device, dtype=torch.float32)
-    frequencies = torch.rand((*shape[:-1], 1), device=device) * TAU
-    phases = torch.rand((*shape[:-1], 1), device=device) * TAU
-    return normalize_last_dim(torch.sin(frequencies * t + phases))
-
-
 def _zeros_like_shape(shape: Sequence[int], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return torch.zeros(tuple(shape), device=device, dtype=dtype)
 
@@ -195,8 +184,6 @@ class BatchUpdateWorkspace:
     base_primary_delta: torch.Tensor | None = None
     left_primary_delta: torch.Tensor | None = None
     right_primary_delta: torch.Tensor | None = None
-    left_secondary_delta: torch.Tensor | None = None
-    right_secondary_delta: torch.Tensor | None = None
     seq_middle_ops: torch.Tensor | None = None
     seq_final_ops: torch.Tensor | None = None
     seq_left_total_ops: torch.Tensor | None = None
@@ -221,8 +208,6 @@ class BatchUpdateWorkspace:
         ensure_zero("base_primary_delta", (n, n))
         ensure_zero("left_primary_delta", (vocab_size, n, n))
         ensure_zero("right_primary_delta", (vocab_size, n, n))
-        ensure_zero("left_secondary_delta", (vocab_size, n, n))
-        ensure_zero("right_secondary_delta", (vocab_size, n, n))
 
     def ensure_sequence_buffers(self, *, max_prefix_len: int, n: int, device: torch.device, dtype: torch.dtype) -> None:
         def ensure(name: str) -> torch.Tensor:
@@ -295,9 +280,7 @@ class MatrixNetwork:
         self.itos: Dict[int, str] = {i: ch for ch, i in self.stoi.items()}
 
         self.query = one_hot_vectors(1, n, device)[0]
-        self.past_queries = torch.empty((0, n), device=device)
         self.unembed_vectors = one_hot_vectors(self.vocab_size, n, device)
-        self.past_unembed_vectors = torch.empty((0, self.vocab_size, n), device=device)
 
         self.base_mat = initialize_rotation_like((n, n), device, 0.0)
         self.left_token_mats = initialize_rotation_like((self.vocab_size, n, n), device, 0.0)
@@ -311,23 +294,6 @@ class MatrixNetwork:
 
     def encode(self, s: str) -> List[int]:
         return [self.stoi[ch] for ch in s]
-
-    def ensure_past_queries(self, count: int) -> None:
-        current = self.past_queries.shape[0]
-        if count <= current and self.past_unembed_vectors.shape[:2] == (current, self.vocab_size):
-            return
-        if self.past_unembed_vectors.shape[:2] != (current, self.vocab_size):
-            current = 0
-            self.past_queries = torch.empty((0, self.n), device=self.device)
-            self.past_unembed_vectors = torch.empty((0, self.vocab_size, self.n), device=self.device)
-        extra_queries = random_sinusoidal_vectors((count - current, self.n), self.device)
-        extra_unembeds = random_sinusoidal_vectors((count - current, self.vocab_size, self.n), self.device)
-        if current == 0:
-            self.past_queries = extra_queries
-            self.past_unembed_vectors = extra_unembeds
-        else:
-            self.past_queries = torch.cat([self.past_queries, extra_queries], dim=0)
-            self.past_unembed_vectors = torch.cat([self.past_unembed_vectors, extra_unembeds], dim=0)
 
     def prefix_state_from_query(self, token_ids: Sequence[int], query: torch.Tensor) -> torch.Tensor:
         v = query
@@ -371,17 +337,8 @@ class MatrixNetwork:
         model.left_token_mats = ckpt["left_token_mats"].to(device)
         model.right_token_mats = ckpt["right_token_mats"].to(device)
         model.base_mat = ckpt["base_mat"].to(device)
-        if "past_queries" in ckpt:
-            model.past_queries = ckpt["past_queries"].to(device)
-        if "past_unembed_vectors" in ckpt:
-            past_unembed_vectors = ckpt["past_unembed_vectors"].to(device)
-            if past_unembed_vectors.ndim == 3:
-                model.past_unembed_vectors = past_unembed_vectors
         model.query = one_hot_vectors(1, n, device)[0]
         model.unembed_vectors = one_hot_vectors(model.vocab_size, n, device)
-        if model.past_unembed_vectors.shape[:2] != (model.past_queries.shape[0], model.vocab_size):
-            model.past_queries = torch.empty((0, n), device=device)
-            model.past_unembed_vectors = torch.empty((0, model.vocab_size, n), device=device)
         addend_digits = ckpt.get("addend_digits")
         if addend_digits is not None:
             addend_digits = int(addend_digits)
@@ -442,9 +399,7 @@ def save_checkpoint(
         "right_token_mats": model.right_token_mats,
         "base_mat": model.base_mat,
         "query": model.query,
-        "past_queries": model.past_queries,
         "unembed_vectors": model.unembed_vectors,
-        "past_unembed_vectors": model.past_unembed_vectors,
         "optimizer_state": None if optimizer_state is None else optimizer_state.state_dict(),
         "update_orthogonalize_steps": int(update_orthogonalize_steps),
         "completed_iters": None if completed_iters is None else int(completed_iters),
@@ -589,23 +544,16 @@ def apply_batch_update(
     state_exploration_scale: float,
     state_exploration_directions: torch.Tensor | None,
     state_exploration_samples: List[torch.Tensor] | None,
-    secondary_matrix_scale: float,
-    use_secondary_objective: bool,
     update_orthogonalize_steps: int,
 ) -> Tuple[float, float]:
     n = model.n
-    max_lag = max((len(full_ids) - 1 for full_ids in sequences), default=0)
-    model.ensure_past_queries(max_lag)
     workspace.prepare(model)
     base_primary_delta = workspace.base_primary_delta
     left_primary_delta = workspace.left_primary_delta
     right_primary_delta = workspace.right_primary_delta
-    left_secondary_delta = workspace.left_secondary_delta
-    right_secondary_delta = workspace.right_secondary_delta
     correct = 0
     total = 0
     primary_objective_weight = 0.0
-    secondary_objective_weight = 0.0
     mean_target_score = 0.0
 
     base = model.base_mat
@@ -763,53 +711,6 @@ def apply_batch_update(
 
         return float(target_scores.sum().item()), correct_count, total_count, mistake_count
 
-    def accumulate_secondary_objectives(cache: PrefixOperatorCache) -> int:
-        prefix_len = len(cache.prefix_ids)
-        if prefix_len == 0:
-            return 0
-
-        query_bank = model.past_queries[:prefix_len]
-        query_mats = query_bank.transpose(0, 1)
-        middle_states = cache.middle_op @ query_mats
-        state_mats = cache.final_state_op @ query_mats
-        state_normed = normalize_columns(state_mats)
-        past_unembed_bank = model.past_unembed_vectors[:prefix_len]
-        scores = torch.einsum("lvn,nl->vl", past_unembed_bank, state_normed)
-        target_ids_tensor = cache.reversed_prefix_ids
-        lag_indices = torch.arange(prefix_len, device=model.device)
-
-        target_scores = scores[target_ids_tensor, lag_indices]
-        predicted_ids = scores.argmax(dim=0)
-        mistaken_lag_mask = predicted_ids != target_ids_tensor
-        mistake_count = int(mistaken_lag_mask.sum().item())
-        if mistake_count == 0:
-            return 0
-
-        target_mats = past_unembed_bank[lag_indices, target_ids_tensor].transpose(0, 1)
-        base_query_targets = cache.base_query_target_op @ target_mats
-
-        if model.uses_left_token_mats():
-            for idx in range(prefix_len - 1, -1, -1):
-                tid = cache.prefix_ids[idx]
-                active_end = idx + 1
-                active_mask = mistaken_lag_mask[:active_end]
-                if not active_mask.any():
-                    continue
-                u = normalize_columns(cache.left_u_ops[idx] @ middle_states[:, :active_end][:, active_mask])
-                v = normalize_columns((cache.left_u_ops[idx] @ cache.left_total_op.transpose(-1, -2)) @ target_mats[:, :active_end][:, active_mask])
-                left_secondary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0))
-
-        if model.uses_right_token_mats():
-            for idx, tid in enumerate(cache.prefix_ids):
-                active_end = idx + 1
-                active_mask = mistaken_lag_mask[:active_end]
-                if not active_mask.any():
-                    continue
-                u = normalize_columns((cache.right_v_prefix_ops[idx] @ cache.right_total_op) @ query_mats[:, :active_end][:, active_mask])
-                v = normalize_columns(cache.right_v_prefix_ops[idx] @ base_query_targets[:, :active_end][:, active_mask])
-                right_secondary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0))
-        return mistake_count
-
     for full_ids, prompt_len in zip(sequences, prompt_lens):
         seq_max_prefix_len = len(full_ids) - 1
         workspace.ensure_sequence_buffers(max_prefix_len=seq_max_prefix_len, n=n, device=model.device, dtype=base.dtype)
@@ -828,10 +729,6 @@ def apply_batch_update(
             final_ops_buffer[prefix_len - 1] = cache.final_state_op
             left_total_ops_buffer[prefix_len - 1] = cache.left_total_op
 
-        if use_secondary_objective:
-            for prefix_len, cache in enumerate(prefix_caches, start=1):
-                secondary_objective_weight += float(accumulate_secondary_objectives(cache))
-
         score_sum, correct_count, total_count, primary_mistake_count = accumulate_primary_objectives(
             full_ids,
             prompt_len,
@@ -846,7 +743,6 @@ def apply_batch_update(
         total += total_count
 
     primary_scale = 1.0 / float(max(primary_objective_weight, 1.0))
-    secondary_scale = 1.0 / float(max(secondary_objective_weight, 1.0))
     optimizer_state.ensure_initialized(model)
     decay = optimizer_state.momentum_decay
     momentum_inject = 1.0 - decay
@@ -884,24 +780,6 @@ def apply_batch_update(
             update_orthogonalize_steps,
         )
 
-    left_secondary_active = left_secondary_delta.abs().amax(dim=(1, 2)) > 0
-    if left_secondary_active.any():
-        model.left_token_mats[left_secondary_active] = apply_matrix_rotation(
-            model.left_token_mats[left_secondary_active],
-            left_secondary_delta[left_secondary_active] * (secondary_scale * secondary_matrix_scale),
-            token_learning_rate,
-            update_orthogonalize_steps,
-        )
-
-    right_secondary_active = right_secondary_delta.abs().amax(dim=(1, 2)) > 0
-    if right_secondary_active.any():
-        model.right_token_mats[right_secondary_active] = apply_matrix_rotation(
-            model.right_token_mats[right_secondary_active],
-            right_secondary_delta[right_secondary_active] * (secondary_scale * secondary_matrix_scale),
-            token_learning_rate,
-            update_orthogonalize_steps,
-        )
-
     return (
         mean_target_score / max(total, 1),
         correct / max(total, 1),
@@ -924,8 +802,6 @@ def train(
     state_exploration_samples: int,
     log_every: int,
     eval_every: int,
-    secondary_matrix_scale: float,
-    secondary_matrix_period: int,
     update_orthogonalize_steps: int,
     checkpoint_every: int = 0,
     checkpoint_callback: Callable[[int, MatrixNetwork, MatrixNetworkOptimizerState], None] | None = None,
@@ -935,7 +811,6 @@ def train(
 
     for iter_idx in range(1, iters + 1):
         sequences, prompt_lens = sample_batch()
-        use_secondary_objective = secondary_matrix_scale != 0.0 and iter_idx % secondary_matrix_period == 0
         collected_state_samples: List[torch.Tensor] | None = [] if state_exploration_scale > 0 else None
         mean_target_score, token_acc = apply_batch_update(
             model,
@@ -949,8 +824,6 @@ def train(
             state_exploration_scale=state_exploration_scale,
             state_exploration_directions=state_exploration_cache.directions,
             state_exploration_samples=collected_state_samples,
-            secondary_matrix_scale=secondary_matrix_scale,
-            use_secondary_objective=use_secondary_objective,
             update_orthogonalize_steps=update_orthogonalize_steps,
         )
         if collected_state_samples:
@@ -974,4 +847,3 @@ def train(
             checkpoint_callback(iter_idx, model, optimizer_state)
 
     return model, optimizer_state
-
