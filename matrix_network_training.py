@@ -148,7 +148,7 @@ def model_from_checkpoint_dict(ckpt: Dict[str, Any], device: torch.device) -> Ma
     model = MatrixNetwork(
         n=n,
         device=device,
-        vocab=str(ckpt["vocab"]),
+        vocab=ckpt["vocab"],
     )
     model.token_mats = ckpt["token_mats"].to(device)
     model.base_mat = ckpt["base_mat"].to(device)

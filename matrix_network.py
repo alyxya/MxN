@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from typing import Dict, List, Sequence
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import torch
 
@@ -11,19 +11,24 @@ class MatrixNetwork:
         self,
         *,
         n: int,
-        vocab: str,
+        vocab: Iterable[str],
         device: torch.device | str | None = None,
     ):
-        if n < len(vocab):
-            raise ValueError(f"n must be >= {len(vocab)} to fit fixed one-hot heads, got {n}")
-        if not vocab:
+        vocab_tokens = tuple(vocab)
+        if not vocab_tokens:
             raise ValueError("vocab must not be empty")
+        if any(not isinstance(token, str) or not token for token in vocab_tokens):
+            raise ValueError("vocab tokens must be non-empty strings")
+        if len(set(vocab_tokens)) != len(vocab_tokens):
+            raise ValueError("vocab tokens must be unique")
+        if n < len(vocab_tokens):
+            raise ValueError(f"n must be >= {len(vocab_tokens)} to fit fixed one-hot heads, got {n}")
 
         self.n = n
-        self.vocab = vocab
-        self.vocab_size = len(vocab)
-        self.stoi: Dict[str, int] = {ch: i for i, ch in enumerate(vocab)}
-        self.itos: Dict[int, str] = {i: ch for ch, i in self.stoi.items()}
+        self.vocab: Tuple[str, ...] = vocab_tokens
+        self.vocab_size = len(vocab_tokens)
+        self.stoi: Dict[str, int] = {token: i for i, token in enumerate(vocab_tokens)}
+        self.itos: Dict[int, str] = {i: token for token, i in self.stoi.items()}
 
         self.query = one_hot_vectors(1, n, device)[0]
         self.unembed_vectors = one_hot_vectors(self.vocab_size, n, device)
@@ -32,7 +37,10 @@ class MatrixNetwork:
         self.device = self.base_mat.device
 
     def encode(self, text: str) -> List[int]:
-        return [self.stoi[ch] for ch in text]
+        return self.encode_tokens(text)
+
+    def encode_tokens(self, tokens: Iterable[str]) -> List[int]:
+        return [self.stoi[token] for token in tokens]
 
     def prefix_state_from_query(self, token_ids: Sequence[int], query: torch.Tensor) -> torch.Tensor:
         v = query

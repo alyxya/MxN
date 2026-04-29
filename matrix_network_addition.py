@@ -40,8 +40,8 @@ def digit_alphabet(number_base: int) -> str:
     return DIGIT_SYMBOLS[:number_base]
 
 
-def addition_vocab(number_base: int) -> str:
-    return EOS_TOKEN + digit_alphabet(number_base) + PLUS_TOKEN + EQUALS_TOKEN
+def addition_vocab(number_base: int) -> Tuple[str, ...]:
+    return tuple(EOS_TOKEN + digit_alphabet(number_base) + PLUS_TOKEN + EQUALS_TOKEN)
 
 
 def format_in_base(value: int, number_base: int, min_digits: int = 1) -> str:
