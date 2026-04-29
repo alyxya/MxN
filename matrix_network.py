@@ -75,48 +75,18 @@ def one_hot_vectors(count: int, dim: int, device: torch.device) -> torch.Tensor:
     return vectors
 
 
-def explored_targets(
+def one_hot_targets(
     token_ids: torch.Tensor,
     *,
     vocab_size: int,
     dim: int,
     device: torch.device,
-    exploration_directions: torch.Tensor | None,
-    exploration_strength: float,
 ) -> torch.Tensor:
     if vocab_size > dim:
         raise ValueError(f"vocab_size must be <= dim for one-hot targets, got vocab_size={vocab_size} dim={dim}")
     targets = torch.zeros((token_ids.shape[0], dim), device=device)
     targets.scatter_(1, token_ids.unsqueeze(1), 1.0)
-    if exploration_strength > 0 and exploration_directions is not None and exploration_directions.numel() > 0:
-        directions = normalize_last_dim(exploration_directions.to(device=device, dtype=targets.dtype))
-        coeffs = torch.randn((token_ids.shape[0], directions.shape[0]), device=device, dtype=targets.dtype)
-        targets.add_((coeffs @ directions) * (exploration_strength / (directions.shape[0] ** 0.5)))
     return normalize_last_dim(targets)
-
-
-@dataclass
-class StateExplorationCache:
-    samples: torch.Tensor | None = None
-    directions: torch.Tensor | None = None
-
-    def add_samples(self, states: torch.Tensor, *, max_samples: int) -> None:
-        if max_samples <= 0 or states.numel() == 0:
-            return
-        states = normalize_last_dim(states.detach())
-        if self.samples is None:
-            self.samples = states[-max_samples:].clone()
-            return
-        self.samples = torch.cat([self.samples.to(states.device), states], dim=0)[-max_samples:].clone()
-
-    def refresh(self, *, rank: int) -> None:
-        if self.samples is None or self.samples.numel() == 0 or rank <= 0:
-            self.directions = None
-            return
-        states = normalize_last_dim(self.samples)
-        _, _, vh = torch.linalg.svd(states, full_matrices=True)
-        keep = min(rank, vh.shape[0])
-        self.directions = normalize_last_dim(vh[-keep:].detach())
 
 
 def _zeros_like_shape(shape: Sequence[int], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -476,9 +446,6 @@ def apply_batch_update(
     prompt_lens: Sequence[int],
     token_learning_rate: float,
     base_learning_rate: float,
-    state_exploration_scale: float,
-    state_exploration_directions: torch.Tensor | None,
-    state_exploration_samples: List[torch.Tensor] | None,
     update_orthogonalize_steps: int,
 ) -> Tuple[float, float]:
     n = model.n
@@ -541,8 +508,6 @@ def apply_batch_update(
         middle_ops = middle_ops_buffer[primary_start:total_prefixes]
         middle_states = middle_ops @ query_mat
         state_vecs = normalize_last_dim(middle_states.squeeze(-1))
-        if state_exploration_samples is not None:
-            state_exploration_samples.append(state_vecs.detach())
         scores = model.unembed_vectors @ state_vecs.transpose(0, 1)
         prefix_indices = torch.arange(total_count, device=model.device)
         target_scores = scores[target_ids_tensor, prefix_indices]
@@ -553,13 +518,11 @@ def apply_batch_update(
         if mistake_count == 0:
             return float(target_scores.sum().item()), correct_count, total_count, 0
 
-        target_mats = explored_targets(
+        target_mats = one_hot_targets(
             target_ids_tensor,
             vocab_size=model.vocab_size,
             dim=n,
             device=model.device,
-            exploration_directions=state_exploration_directions,
-            exploration_strength=state_exploration_scale,
         ).unsqueeze(-1)
 
         u_base = normalize_last_dim(middle_states[mistaken_prefix_mask].squeeze(-1)).unsqueeze(-1)
@@ -656,10 +619,6 @@ def train(
     iters: int,
     token_learning_rate: float,
     base_learning_rate: float,
-    state_exploration_scale: float,
-    state_exploration_rank: int,
-    state_exploration_period: int,
-    state_exploration_samples: int,
     log_every: int,
     eval_every: int,
     update_orthogonalize_steps: int,
@@ -667,11 +626,9 @@ def train(
     checkpoint_callback: Callable[[int, MatrixNetwork, MatrixNetworkOptimizerState], None] | None = None,
 ) -> Tuple[MatrixNetwork, MatrixNetworkOptimizerState]:
     workspace = BatchUpdateWorkspace()
-    state_exploration_cache = StateExplorationCache()
 
     for iter_idx in range(1, iters + 1):
         sequences, prompt_lens = sample_batch()
-        collected_state_samples: List[torch.Tensor] | None = [] if state_exploration_scale > 0 else None
         mean_target_score, token_acc = apply_batch_update(
             model,
             optimizer_state,
@@ -680,18 +637,8 @@ def train(
             prompt_lens=prompt_lens,
             token_learning_rate=token_learning_rate,
             base_learning_rate=base_learning_rate,
-            state_exploration_scale=state_exploration_scale,
-            state_exploration_directions=state_exploration_cache.directions,
-            state_exploration_samples=collected_state_samples,
             update_orthogonalize_steps=update_orthogonalize_steps,
         )
-        if collected_state_samples:
-            state_exploration_cache.add_samples(
-                torch.cat(collected_state_samples, dim=0),
-                max_samples=state_exploration_samples,
-            )
-            if iter_idx == 1 or iter_idx % state_exploration_period == 0:
-                state_exploration_cache.refresh(rank=state_exploration_rank)
 
         if iter_idx % log_every == 0 or iter_idx == 1:
             print(

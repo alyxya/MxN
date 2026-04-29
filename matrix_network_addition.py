@@ -245,10 +245,6 @@ def format_run_config(args: argparse.Namespace, *, addend_digits: int) -> str:
         ("batch_size", args.batch_size),
         ("token_learning_rate", args.token_learning_rate),
         ("base_learning_rate", args.base_learning_rate),
-        ("state_exploration_scale", args.state_exploration_scale),
-        ("state_exploration_rank", args.state_exploration_rank),
-        ("state_exploration_period", args.state_exploration_period),
-        ("state_exploration_samples", args.state_exploration_samples),
         ("momentum_decay", args.momentum_decay),
         ("update_orthogonalize_steps", args.update_orthogonalize_steps),
         ("checkpoint_every", getattr(args, "checkpoint_every", 0)),
@@ -279,14 +275,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--update-orthogonalize-steps must be >= 0")
     if args.checkpoint_every < 0:
         raise ValueError("--checkpoint-every must be >= 0")
-    if args.state_exploration_scale < 0:
-        raise ValueError("--state-exploration-scale must be >= 0")
-    if args.state_exploration_rank < 0:
-        raise ValueError("--state-exploration-rank must be >= 0")
-    if args.state_exploration_period < 1:
-        raise ValueError("--state-exploration-period must be >= 1")
-    if args.state_exploration_samples < 0:
-        raise ValueError("--state-exploration-samples must be >= 0")
 
 
 def run_addition_training(
@@ -398,10 +386,6 @@ def run_addition_training(
         iters=args.iters,
         token_learning_rate=args.token_learning_rate,
         base_learning_rate=args.base_learning_rate,
-        state_exploration_scale=args.state_exploration_scale,
-        state_exploration_rank=args.state_exploration_rank,
-        state_exploration_period=args.state_exploration_period,
-        state_exploration_samples=args.state_exploration_samples,
         log_every=args.log_every,
         eval_every=args.eval_every,
         update_orthogonalize_steps=args.update_orthogonalize_steps,
@@ -439,10 +423,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
     p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token matrices")
     p.add_argument("--base-learning-rate", type=float, default=1.0, help="Step size for the base matrix")
-    p.add_argument("--state-exploration-scale", type=float, default=0.0, help="Training-only target noise strength sampled from low-usage state SVD directions")
-    p.add_argument("--state-exploration-rank", type=int, default=8, help="Number of least-used SVD directions to use for state exploration target noise")
-    p.add_argument("--state-exploration-period", type=int, default=100, help="Refresh low-usage state directions every N training iterations")
-    p.add_argument("--state-exploration-samples", type=int, default=1024, help="Rolling state sample count used when computing exploration directions")
     p.add_argument("--momentum-decay", type=float, default=0.9, help="EMA decay for primary matrix momentum buffers")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
