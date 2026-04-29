@@ -174,8 +174,8 @@ def evaluate_addition(
     plus_id = model.stoi[PLUS_TOKEN]
     equals_id = model.stoi[EQUALS_TOKEN]
     eos_id = model.stoi[EOS_TOKEN]
-    primary_states: List[torch.Tensor] = []
-    primary_query_targets: List[torch.Tensor] = []
+    states: List[torch.Tensor] = []
+    query_targets: List[torch.Tensor] = []
 
     for _ in range(eval_samples):
         prompt_ids, target_ids = random_problem_ids(
@@ -196,25 +196,25 @@ def evaluate_addition(
         for target_id in target_ids:
             state = state_from_prefix_op(model, prefix_op, model.query)
             state_normed = normalize_columns(state.unsqueeze(1))[:, 0]
-            primary_states.append(state_normed.detach().cpu())
+            states.append(state_normed.detach().cpu())
             query_target = normalize_columns(
                 (prefix_op.transpose(-1, -2) @ model.base_mat.transpose(-1, -2) @ model.unembed_vectors[target_id].unsqueeze(1))
             )[:, 0]
-            primary_query_targets.append(query_target.detach().cpu())
+            query_targets.append(query_target.detach().cpu())
             pred_id = predict_next_id_from_prefix_op(model, prefix_op)
             tf_correct += int(pred_id == target_id)
             tf_total += 1
             prefix_op = advance_prefix_operator(model, prefix_op, target_id)
 
-    primary_state_summary = subspace_summary(torch.stack(primary_states, dim=0))
-    primary_query_summary = subspace_summary(torch.stack(primary_query_targets, dim=0))
+    state_summary = subspace_summary(torch.stack(states, dim=0))
+    query_target_summary = subspace_summary(torch.stack(query_targets, dim=0))
     return (
         exact / max(eval_samples, 1),
         tf_correct / max(tf_total, 1),
         stopped / max(eval_samples, 1),
         {
-            "state": primary_state_summary,
-            "query_target": primary_query_summary,
+            "state": state_summary,
+            "query_target": query_target_summary,
         },
     )
 
@@ -271,6 +271,16 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
 def validate_args(args: argparse.Namespace) -> None:
     if not (0.0 <= args.momentum_decay < 1.0):
         raise ValueError("--momentum-decay must be in [0, 1)")
+    if args.log_every <= 0:
+        raise ValueError("--log-every must be > 0")
+    if args.eval_every <= 0:
+        raise ValueError("--eval-every must be > 0")
+    if args.eval_samples <= 0:
+        raise ValueError("--eval-samples must be > 0")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be > 0")
+    if args.iters < 0:
+        raise ValueError("--iters must be >= 0")
     if args.update_orthogonalize_steps < 0:
         raise ValueError("--update-orthogonalize-steps must be >= 0")
     if args.checkpoint_every < 0:
@@ -423,7 +433,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32, help="Problems per iteration")
     p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token matrices")
     p.add_argument("--base-learning-rate", type=float, default=1.0, help="Step size for the base matrix")
-    p.add_argument("--momentum-decay", type=float, default=0.9, help="EMA decay for primary matrix momentum buffers")
+    p.add_argument("--momentum-decay", type=float, default=0.9, help="EMA decay for matrix momentum buffers")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)

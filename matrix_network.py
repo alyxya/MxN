@@ -60,8 +60,11 @@ def apply_matrix_rotation(
 def initialize_rotation_like(shape: Tuple[int, ...], device: torch.device, strength: float) -> torch.Tensor:
     n = shape[-1]
     eye = cached_eye(n, device, torch.float32)
-    if len(shape) > 2:
+    is_batched = len(shape) > 2
+    if is_batched:
         eye = eye.expand(*shape[:-2], n, n).clone()
+    if strength == 0.0:
+        return eye if is_batched else eye.clone()
     noise = torch.randn(shape, device=device) / (n**0.5)
     w = (eye + strength * noise) / ((1.0 + strength**2) ** 0.5)
     for _ in range(INIT_ORTHOGONALIZE_STEPS):
@@ -73,20 +76,6 @@ def one_hot_vectors(count: int, dim: int, device: torch.device) -> torch.Tensor:
     vectors = torch.zeros((count, dim), device=device)
     vectors[:, :count] = cached_eye(count, device, vectors.dtype)
     return vectors
-
-
-def one_hot_targets(
-    token_ids: torch.Tensor,
-    *,
-    vocab_size: int,
-    dim: int,
-    device: torch.device,
-) -> torch.Tensor:
-    if vocab_size > dim:
-        raise ValueError(f"vocab_size must be <= dim for one-hot targets, got vocab_size={vocab_size} dim={dim}")
-    targets = torch.zeros((token_ids.shape[0], dim), device=device)
-    targets.scatter_(1, token_ids.unsqueeze(1), 1.0)
-    return normalize_last_dim(targets)
 
 
 def _zeros_like_shape(shape: Sequence[int], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -142,8 +131,8 @@ class MatrixNetworkOptimizerState:
 
 @dataclass
 class BatchUpdateWorkspace:
-    base_primary_delta: torch.Tensor | None = None
-    token_primary_delta: torch.Tensor | None = None
+    base_delta: torch.Tensor | None = None
+    token_delta: torch.Tensor | None = None
     seq_middle_ops: torch.Tensor | None = None
     seq_pre_token_ops: torch.Tensor | None = None
 
@@ -162,8 +151,8 @@ class BatchUpdateWorkspace:
                 tensor.zero_()
             return tensor
 
-        ensure_zero("base_primary_delta", (n, n))
-        ensure_zero("token_primary_delta", (vocab_size, n, n))
+        ensure_zero("base_delta", (n, n))
+        ensure_zero("token_delta", (vocab_size, n, n))
 
     def ensure_sequence_buffers(self, *, max_prefix_len: int, n: int, device: torch.device, dtype: torch.dtype) -> None:
         def ensure(name: str) -> torch.Tensor:
@@ -180,11 +169,9 @@ class BatchUpdateWorkspace:
 
 @dataclass
 class PrefixOperatorCache:
-    prefix_ids: Tuple[int, ...]
     prefix_op: torch.Tensor
     prefix_transpose_op: torch.Tensor
     middle_op: torch.Tensor
-    pre_token_ops: torch.Tensor
 
 
 def pick_device(requested: str) -> torch.device:
@@ -321,20 +308,13 @@ def save_checkpoint(
         "output_vocab": model.output_vocab,
         "token_mats": model.token_mats,
         "base_mat": model.base_mat,
-        "query": model.query,
-        "unembed_vectors": model.unembed_vectors,
         "optimizer_state": None if optimizer_state is None else optimizer_state.state_dict(),
         "update_orthogonalize_steps": int(update_orthogonalize_steps),
         "completed_iters": None if completed_iters is None else int(completed_iters),
         "metadata": dict(metadata or {}),
     }
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    torch.save(
-        {
-            **payload,
-        },
-        tmp_path,
-    )
+    torch.save(payload, tmp_path)
     tmp_path.replace(path)
 
 
@@ -403,7 +383,7 @@ def subspace_summary(vectors: torch.Tensor) -> Dict[str, float]:
     energy = svals.square()
     total_energy = float(energy.sum().item())
     if total_energy <= EPS:
-        return {"rank_eps": 0.0, "rank_99": 0.0, "pr": 0.0, "erank": 0.0}
+        return {"rank_eps": 0.0, "rank_99": 0.0, "pr": 0.0, "erank": 0.0, "dim": float(dim), "samples": float(sample_count)}
 
     max_energy = float(energy.max().item())
     rank_eps = int((energy > (max_energy * 1e-6)).sum().item())
@@ -450,11 +430,11 @@ def apply_batch_update(
 ) -> Tuple[float, float]:
     n = model.n
     workspace.prepare(model)
-    base_primary_delta = workspace.base_primary_delta
-    token_primary_delta = workspace.token_primary_delta
+    base_delta = workspace.base_delta
+    token_delta = workspace.token_delta
     correct = 0
     total = 0
-    primary_objective_weight = 0.0
+    mistake_weight = 0.0
     mean_target_score = 0.0
 
     base = model.base_mat
@@ -467,10 +447,7 @@ def apply_batch_update(
         prefix_len: int,
         pre_token_buffer: torch.Tensor,
     ) -> PrefixOperatorCache:
-        prefix_key = (token_id,) if parent_cache is None else (*parent_cache.prefix_ids, token_id)
-        last_tid = token_id
-
-        token_mat = model.token_mats[last_tid]
+        token_mat = model.token_mats[token_id]
         token_mat_t = token_mat.transpose(-1, -2)
         if parent_cache is None:
             prefix_op = token_mat
@@ -483,29 +460,26 @@ def apply_batch_update(
 
         middle_op = base @ prefix_op
         return PrefixOperatorCache(
-            prefix_ids=prefix_key,
             prefix_op=prefix_op,
             prefix_transpose_op=prefix_transpose_op,
             middle_op=middle_op,
-            pre_token_ops=pre_token_buffer[:prefix_len],
         )
 
-    def accumulate_primary_objectives(
+    def accumulate_sequence_updates(
         full_ids: Sequence[int],
         prompt_len: int,
         prefix_caches: Sequence[PrefixOperatorCache],
         middle_ops_buffer: torch.Tensor,
     ) -> Tuple[float, int, int, int]:
         total_prefixes = len(full_ids) - 1
-        primary_start = prompt_len - 1
-        total_count = total_prefixes - primary_start
+        target_start = prompt_len - 1
+        total_count = total_prefixes - target_start
         if total_count <= 0:
             return 0.0, 0, 0, 0
 
         target_ids_tensor = torch.tensor(full_ids[prompt_len:], device=model.device, dtype=torch.long)
-        prefix_lens = torch.arange(prompt_len, len(full_ids), device=model.device, dtype=torch.long)
         query_mat = model.query.unsqueeze(1)
-        middle_ops = middle_ops_buffer[primary_start:total_prefixes]
+        middle_ops = middle_ops_buffer[target_start:total_prefixes]
         middle_states = middle_ops @ query_mat
         state_vecs = normalize_last_dim(middle_states.squeeze(-1))
         scores = model.unembed_vectors @ state_vecs.transpose(0, 1)
@@ -518,21 +492,15 @@ def apply_batch_update(
         if mistake_count == 0:
             return float(target_scores.sum().item()), correct_count, total_count, 0
 
-        target_mats = one_hot_targets(
-            target_ids_tensor,
-            vocab_size=model.vocab_size,
-            dim=n,
-            device=model.device,
-        ).unsqueeze(-1)
+        target_mats = model.unembed_vectors[target_ids_tensor].unsqueeze(-1)
 
         u_base = normalize_last_dim(middle_states[mistaken_prefix_mask].squeeze(-1)).unsqueeze(-1)
-        v_base = normalize_last_dim(target_mats[mistaken_prefix_mask].squeeze(-1)).unsqueeze(-1)
-        base_primary_delta.add_(matrix_rotation_generator(u_base, v_base, 1.0).sum(dim=0))
+        v_base = target_mats[mistaken_prefix_mask]
+        base_delta.add_(matrix_rotation_generator(u_base, v_base, 1.0).sum(dim=0))
 
-        primary_caches = prefix_caches[primary_start:total_prefixes]
+        target_caches = prefix_caches[target_start:total_prefixes]
         base_query_targets = base_t @ target_mats
-        max_prefix_len = int(prefix_lens.max().item())
-        for idx in range(max_prefix_len):
+        for idx in range(total_prefixes):
             active_start = max(0, idx - prompt_len + 1)
             if active_start >= total_count:
                 continue
@@ -542,14 +510,14 @@ def apply_batch_update(
             tid = full_ids[idx]
             v_ops = pre_token_buffer[idx].unsqueeze(0).expand(total_count - active_start, -1, -1)[active_mask]
             prefix_ops = torch.stack(
-                [cache.prefix_op for cache in primary_caches[active_start:]],
+                [cache.prefix_op for cache in target_caches[active_start:]],
                 dim=0,
             )[active_mask]
             u_ops = v_ops @ prefix_ops
             active_count = int(active_mask.sum().item())
             u = normalize_last_dim((u_ops @ query_mat.unsqueeze(0).expand(active_count, -1, -1)).squeeze(-1)).unsqueeze(-1)
             v = normalize_last_dim((v_ops @ base_query_targets[active_start:][active_mask]).squeeze(-1)).unsqueeze(-1)
-            token_primary_delta[tid].add_(matrix_rotation_generator(u, v, 1.0).sum(dim=0))
+            token_delta[tid].add_(matrix_rotation_generator(u, v, 1.0).sum(dim=0))
 
         return float(target_scores.sum().item()), correct_count, total_count, mistake_count
 
@@ -566,18 +534,18 @@ def apply_batch_update(
             prefix_caches.append(cache)
             middle_ops_buffer[prefix_len - 1] = cache.middle_op
 
-        score_sum, correct_count, total_count, primary_mistake_count = accumulate_primary_objectives(
+        score_sum, correct_count, total_count, mistake_count = accumulate_sequence_updates(
             full_ids,
             prompt_len,
             prefix_caches,
             middle_ops_buffer,
         )
-        primary_objective_weight += float(primary_mistake_count)
+        mistake_weight += float(mistake_count)
         mean_target_score += score_sum
         correct += correct_count
         total += total_count
 
-    primary_scale = 1.0 / float(max(primary_objective_weight, 1.0))
+    update_scale = 1.0 / float(max(mistake_weight, 1.0))
     optimizer_state.ensure_initialized(model)
     decay = optimizer_state.momentum_decay
     momentum_inject = 1.0 - decay
@@ -585,7 +553,7 @@ def apply_batch_update(
     assert optimizer_state.base_momentum is not None
     assert optimizer_state.token_momentum is not None
 
-    optimizer_state.base_momentum.mul_(decay).add_(base_primary_delta * (primary_scale * momentum_inject))
+    optimizer_state.base_momentum.mul_(decay).add_(base_delta * (update_scale * momentum_inject))
     if float(optimizer_state.base_momentum.abs().amax().item()) > EPS:
         model.base_mat = apply_matrix_rotation(
             model.base_mat,
@@ -594,7 +562,7 @@ def apply_batch_update(
             update_orthogonalize_steps,
         )
 
-    optimizer_state.token_momentum.mul_(decay).add_(token_primary_delta * (primary_scale * momentum_inject))
+    optimizer_state.token_momentum.mul_(decay).add_(token_delta * (update_scale * momentum_inject))
     token_hist_active = optimizer_state.token_momentum.abs().amax(dim=(1, 2)) > EPS
     if token_hist_active.any():
         model.token_mats[token_hist_active] = apply_matrix_rotation(
