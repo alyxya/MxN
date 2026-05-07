@@ -22,7 +22,9 @@ class MatrixNetwork:
         if len(set(vocab_tokens)) != len(vocab_tokens):
             raise ValueError("vocab tokens must be unique")
         if n < len(vocab_tokens):
-            raise ValueError(f"n must be >= {len(vocab_tokens)} to fit fixed one-hot heads, got {n}")
+            raise ValueError(
+                f"n must be >= {len(vocab_tokens)} to fit fixed one-hot heads, got {n}"
+            )
 
         self.n = n
         self.vocab: Tuple[str, ...] = vocab_tokens
@@ -33,28 +35,24 @@ class MatrixNetwork:
         self.query = one_hot_vectors(1, n, device)[0]
         self.unembed_vectors = one_hot_vectors(self.vocab_size, n, device)
         self.base_mat = torch.eye(n, device=device)
-        self.token_mats = torch.eye(n, device=device).expand(self.vocab_size, n, n).clone()
+        self.token_mats = (
+            torch.eye(n, device=device).expand(self.vocab_size, n, n).clone()
+        )
+        self.state_mat = self.base_mat.clone()
         self.device = self.base_mat.device
 
-    def encode(self, text: str) -> List[int]:
-        return self.encode_tokens(text)
-
-    def encode_tokens(self, tokens: Iterable[str]) -> List[int]:
+    def encode(self, tokens: Iterable[str]) -> List[int]:
         return [self.stoi[token] for token in tokens]
 
-    def prefix_state_from_query(self, token_ids: Sequence[int], query: torch.Tensor) -> torch.Tensor:
-        v = query
-        for token_id in reversed(token_ids):
-            v = self.token_mats[token_id] @ v
-        return self.base_mat @ v
+    def reset_state(self) -> None:
+        self.state_mat = self.base_mat.clone()
 
-    def prefix_state_ids(self, token_ids: Sequence[int]) -> torch.Tensor:
-        return self.prefix_state_from_query(token_ids, self.query)
+    def apply_context(self, token_ids: Sequence[int]) -> None:
+        self.reset_state()
+        for token_id in token_ids:
+            self.state_mat = self.state_mat @ self.token_mats[token_id]
 
-    def predict_next_id(self, token_ids: Sequence[int]) -> int:
-        state = self.prefix_state_ids(token_ids)
+    def predict_next_id(self) -> int:
+        state = self.state_mat @ self.query
         scores = self.unembed_vectors @ normalize_columns(state.unsqueeze(1))
         return int(scores[:, 0].argmax().item())
-
-    def predict_next(self, prefix: str) -> str:
-        return self.itos[self.predict_next_id(self.encode(prefix))]

@@ -152,6 +152,7 @@ def model_from_checkpoint_dict(ckpt: Dict[str, Any], device: torch.device) -> Ma
     )
     model.token_mats = ckpt["token_mats"].to(device)
     model.base_mat = ckpt["base_mat"].to(device)
+    model.reset_state()
     model.query = one_hot_vectors(1, n, device)[0]
     model.unembed_vectors = one_hot_vectors(model.vocab_size, n, device)
     return model
