@@ -70,8 +70,7 @@ def save_checkpoint(
     payload = {
         "n": model.n,
         "vocab": model.vocab,
-        "token_mats": model.token_mats,
-        "base_mat": model.base_mat,
+        "model_state": model.state_dict(),
         "optimizer_state": optimizer.to_dict(),
         "completed_iters": completed_iters,
         "metadata": metadata or {},
@@ -84,8 +83,11 @@ def save_checkpoint(
 def load_checkpoint(path: str, device: torch.device, *, momentum_decay: float) -> Tuple[MatrixNetwork, OptimizerState, int, Dict[str, Any]]:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model = MatrixNetwork(n=int(ckpt["n"]), vocab=ckpt["vocab"], device=device)
-    model.token_mats = ckpt["token_mats"].to(device)
-    model.base_mat = ckpt["base_mat"].to(device)
+    if "model_state" in ckpt:
+        model.load_state_dict(ckpt["model_state"])
+    else:
+        model.base_mat.copy_(ckpt["base_mat"].to(device))
+        model.token_mats.copy_(ckpt["token_mats"].to(device))
     model.reset_state()
     optimizer = OptimizerState.from_dict(ckpt.get("optimizer_state"), model, momentum_decay)
     completed_iters = int(ckpt.get("completed_iters") or 0)
@@ -157,8 +159,8 @@ def apply_batch_update(
 
     base_update = optimizer.base_momentum + base_d * current_update_weight
     token_update = optimizer.token_momentum + token_d * current_update_weight
-    model.base_mat = rotate_matrix(model.base_mat, base_update, base_lr)
-    model.token_mats = rotate_matrix(model.token_mats, token_update, token_lr)
+    model.base_mat.copy_(rotate_matrix(model.base_mat, base_update, base_lr))
+    model.token_mats.copy_(rotate_matrix(model.token_mats, token_update, token_lr))
     model.reset_state()
 
     return target_score_sum / max(total, 1), correct / max(total, 1)
