@@ -16,12 +16,6 @@ def normalize_last_dim(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
     return x / (x.norm(dim=-1, keepdim=True) + eps)
 
 
-def one_hot_vectors(count: int, dim: int, device: torch.device | str | None = None) -> torch.Tensor:
-    vectors = torch.zeros((count, dim), device=device)
-    vectors[:, :count] = cached_eye(count, device, vectors.dtype)
-    return vectors
-
-
 def orthogonalize_steps(w: torch.Tensor, steps: int) -> torch.Tensor:
     for _ in range(max(steps, 0)):
         w = orthogonalize_newton_schulz(w)
