@@ -16,7 +16,9 @@ class MatrixNetwork(torch.nn.Module):
         self.vocab = tuple(vocab)
         self.vocab_size = len(self.vocab)
         if n < self.vocab_size:
-            raise ValueError(f"n must be >= len(vocab); got n={n}, vocab_size={self.vocab_size}")
+            raise ValueError(
+                f"n must be >= len(vocab); got n={n}, vocab_size={self.vocab_size}"
+            )
 
         self.n = n
         self.stoi = {token: i for i, token in enumerate(self.vocab)}
@@ -48,8 +50,10 @@ class MatrixNetwork(torch.nn.Module):
 
     def predict(self) -> int:
         with torch.no_grad():
-            state = self.query @ self.state_mat
-            return int((self.unembed_vectors @ state).argmax().item())
+            # Equivalent to: state = self.query @ self.state_mat
+            state = self.state_mat[0]
+            # Equivalent to scoring against the one-hot unembedding vectors.
+            return int(state[: self.vocab_size].argmax().item())
 
     @property
     def device(self) -> torch.device:
