@@ -57,14 +57,12 @@ def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu=None, timeout=24 * 3600)
-def train_remote_cpu(args_dict: dict[str, Any]) -> dict[str, Any]:
-    return _train_impl(args_dict)
+def train_remote(gpu: str | None):
+    @app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu=gpu, timeout=24 * 3600)
+    def run(args_dict: dict[str, Any]) -> dict[str, Any]:
+        return _train_impl(args_dict)
 
-
-@app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu="T4", timeout=24 * 3600)
-def train_remote_t4(args_dict: dict[str, Any]) -> dict[str, Any]:
-    return _train_impl(args_dict)
+    return run
 
 
 @app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu=None, timeout=600)
@@ -126,7 +124,6 @@ def main(
     checkpoint_every: int = 250,
     load_path: str = "",
     save_path: str = "",
-    device: str = "auto",
     gpu: str = "T4",
     prefix: str = "",
     remote_path: str = "",
@@ -158,6 +155,16 @@ def main(
     if command != "train":
         raise ValueError(f"unsupported command={command!r}; expected train, list, download, or upload")
 
+    gpu_key = gpu.lower()
+    if gpu_key in {"", "none", "cpu"}:
+        gpu_type = None
+        device = "cpu"
+    elif gpu_key == "t4":
+        gpu_type = "T4"
+        device = "cuda"
+    else:
+        raise ValueError(f"unsupported --gpu {gpu!r}; supported values are 'none' and 'T4'")
+
     args_dict = {
         "n": n,
         "number_base": number_base,
@@ -180,15 +187,7 @@ def main(
         "device": device,
     }
 
-    gpu_key = gpu.lower()
-    if gpu_key in {"", "none", "cpu"}:
-        fn = train_remote_cpu
-    elif gpu_key == "t4":
-        fn = train_remote_t4
-    else:
-        raise ValueError(f"unsupported --gpu {gpu!r}; supported values are 'none' and 'T4'")
-
-    result = fn.remote(args_dict)
+    result = train_remote(gpu_type).remote(args_dict)
     print("\nModal run result:")
     for k, v in result.items():
         print(f"{k}={v}")
