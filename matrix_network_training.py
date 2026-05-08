@@ -8,7 +8,6 @@ import torch
 from matrix_network import MatrixNetwork
 from matrix_network_ops import (
     EPS,
-    cached_eye,
     normalize_last_dim,
     orthogonalize_steps,
 )
@@ -27,8 +26,8 @@ def pick_device(requested: str) -> torch.device:
     return torch.device("cpu")
 
 
-def matrix_rotation_generator(u: torch.Tensor, v: torch.Tensor, weight: float) -> torch.Tensor:
-    return (v @ u.transpose(-1, -2) - u @ v.transpose(-1, -2)) * weight
+def matrix_rotation_generator(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    return v @ u.transpose(-1, -2) - u @ v.transpose(-1, -2)
 
 
 def apply_matrix_rotation(
@@ -37,7 +36,7 @@ def apply_matrix_rotation(
     learning_rate: float,
     orthogonalize_steps_count: int,
 ) -> torch.Tensor:
-    eye = cached_eye(current.shape[-1], current.device, current.dtype)
+    eye = torch.eye(current.shape[-1], device=current.device, dtype=current.dtype)
     if current.ndim == 2:
         updated = (eye + learning_rate * momentum_generator) @ current
     else:
@@ -168,67 +167,6 @@ def save_checkpoint(
     tmp_path.replace(path)
 
 
-def prefix_operator_from_ids(model: MatrixNetwork, token_ids: Sequence[int]) -> torch.Tensor:
-    prefix_op = cached_eye(model.n, model.device, model.base_mat.dtype)
-    for tid in token_ids:
-        prefix_op = prefix_op @ model.token_mats[tid]
-    return prefix_op
-
-
-def advance_prefix_operator(
-    model: MatrixNetwork,
-    prefix_op: torch.Tensor,
-    token_id: int,
-) -> torch.Tensor:
-    return prefix_op @ model.token_mats[token_id]
-
-
-def state_from_prefix_op(
-    model: MatrixNetwork,
-    prefix_op: torch.Tensor,
-    query: torch.Tensor,
-) -> torch.Tensor:
-    return model.base_mat @ (prefix_op @ query)
-
-
-def predict_next_id_from_prefix_op(
-    model: MatrixNetwork,
-    prefix_op: torch.Tensor,
-) -> int:
-    state = state_from_prefix_op(model, prefix_op, model.query)
-    scores = model.unembed_vectors @ state
-    return int(scores.argmax().item())
-
-
-def generate_until_token_id(
-    model: MatrixNetwork,
-    prompt_ids: Sequence[int],
-    stop_token_id: int,
-    max_len: int,
-) -> Tuple[List[int], bool]:
-    model.reset_state()
-    model.apply_context(prompt_ids)
-    pred_ids: List[int] = []
-    for _ in range(max_len):
-        next_id = model.predict()
-        if next_id == stop_token_id:
-            return pred_ids, True
-        pred_ids.append(next_id)
-        model.apply_context([next_id])
-    return pred_ids, False
-
-
-def generate_until_token(
-    model: MatrixNetwork,
-    prompt_text: str,
-    stop_token: str,
-    max_len: int,
-) -> Tuple[str, bool]:
-    prefix_ids = model.encode(prompt_text)
-    pred_ids, did_stop = generate_until_token_id(model, prefix_ids, model.stoi[stop_token], max_len)
-    return "".join(model.decode(tid) for tid in pred_ids), did_stop
-
-
 @torch.no_grad()
 def apply_batch_update(
     model: MatrixNetwork,
@@ -241,7 +179,6 @@ def apply_batch_update(
     update_orthogonalize_steps: int,
     current_update_weight: float,
 ) -> Tuple[float, float]:
-    n = model.n
     base_delta = torch.zeros_like(model.base_mat)
     token_delta = torch.zeros_like(model.token_mats)
     correct = 0
@@ -256,7 +193,7 @@ def apply_batch_update(
     assert optimizer_state.base_momentum is not None
     assert optimizer_state.token_momentum is not None
 
-    eye = cached_eye(n, model.device, model.base_mat.dtype)
+    eye = torch.eye(model.n, device=model.device, dtype=model.base_mat.dtype)
 
     def randomized_target(target_id: int) -> torch.Tensor:
         target = model.unembed_vectors[target_id]
@@ -275,7 +212,6 @@ def apply_batch_update(
             matrix_rotation_generator(
                 normalize_last_dim(state).unsqueeze(1),
                 target_col,
-                1.0,
             )
         )
 
@@ -287,15 +223,18 @@ def apply_batch_update(
             previous_tokens_t = previous_tokens_op.transpose(-1, -2)
             u = normalize_last_dim((previous_tokens_t @ prefix_query).squeeze(1)).unsqueeze(1)
             v = normalize_last_dim((previous_tokens_t @ base_target).squeeze(1)).unsqueeze(1)
-            token_delta[token_id].add_(matrix_rotation_generator(u, v, 1.0))
+            token_delta[token_id].add_(matrix_rotation_generator(u, v))
             previous_tokens_op = previous_tokens_op @ model.token_mats[token_id]
 
     for full_ids, prompt_len in zip(sequences, prompt_lens):
+        prefix_op = eye
+        for token_id in full_ids[:prompt_len]:
+            prefix_op = prefix_op @ model.token_mats[token_id]
+
         for target_pos in range(prompt_len, len(full_ids)):
             prefix_ids = full_ids[:target_pos]
             target_id = full_ids[target_pos]
-            prefix_op = prefix_operator_from_ids(model, prefix_ids)
-            state = state_from_prefix_op(model, prefix_op, model.query)
+            state = model.base_mat @ (prefix_op @ model.query)
             state_normed = normalize_last_dim(state)
             scores = model.unembed_vectors @ state_normed
 
@@ -303,10 +242,10 @@ def apply_batch_update(
             mean_target_score += float(scores[target_id].item())
             if int(scores.argmax().item()) == target_id:
                 correct += 1
-                continue
-
-            mistakes += 1
-            add_rotation_updates(prefix_ids, prefix_op, randomized_target(target_id), state)
+            else:
+                mistakes += 1
+                add_rotation_updates(prefix_ids, prefix_op, randomized_target(target_id), state)
+            prefix_op = prefix_op @ model.token_mats[target_id]
 
     update_scale = 1.0 / float(max(mistakes, 1))
     mean_base_delta = base_delta * update_scale

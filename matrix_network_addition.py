@@ -8,19 +8,13 @@ from typing import Any, Dict, List, Sequence, Tuple
 import torch
 
 from matrix_network import MatrixNetwork
-from matrix_network_ops import normalize_columns
+from matrix_network_ops import normalize_last_dim
 from matrix_network_training import (
     DEFAULT_UPDATE_ORTHOGONALIZE_STEPS,
     MatrixNetworkOptimizerState,
-    advance_prefix_operator,
-    generate_until_token,
-    generate_until_token_id,
     load_training_checkpoint,
     pick_device,
-    predict_next_id_from_prefix_op,
-    prefix_operator_from_ids,
     save_checkpoint,
-    state_from_prefix_op,
     train,
 )
 from matrix_network_utils import format_subspace_summary, subspace_summary
@@ -154,6 +148,39 @@ def make_addition_batch_sampler(
     return sample_batch
 
 
+def generate_until_token_id(
+    model: MatrixNetwork,
+    prompt_ids: Sequence[int],
+    stop_token_id: int,
+    max_len: int,
+) -> Tuple[List[int], bool]:
+    model.reset_state()
+    model.apply_context(prompt_ids)
+    pred_ids: List[int] = []
+    for _ in range(max_len):
+        next_id = model.predict()
+        if next_id == stop_token_id:
+            return pred_ids, True
+        pred_ids.append(next_id)
+        model.apply_context([next_id])
+    return pred_ids, False
+
+
+def generate_until_token(
+    model: MatrixNetwork,
+    prompt_text: str,
+    stop_token: str,
+    max_len: int,
+) -> Tuple[str, bool]:
+    pred_ids, did_stop = generate_until_token_id(
+        model,
+        model.encode(prompt_text),
+        model.stoi[stop_token],
+        max_len,
+    )
+    return "".join(model.decode(tid) for tid in pred_ids), did_stop
+
+
 def evaluate_addition(
     model: MatrixNetwork,
     eval_samples: int,
@@ -172,6 +199,7 @@ def evaluate_addition(
     eos_id = model.stoi[EOS_TOKEN]
     states: List[torch.Tensor] = []
     query_targets: List[torch.Tensor] = []
+    eye = torch.eye(model.n, device=model.device, dtype=model.base_mat.dtype)
 
     for _ in range(eval_samples):
         prompt_ids, target_ids = random_problem_ids(
@@ -188,19 +216,22 @@ def evaluate_addition(
         if did_stop and pred_ids == target_ids[:-1]:
             exact += 1
 
-        prefix_op = prefix_operator_from_ids(model, prompt_ids)
+        prefix_op = eye
+        for token_id in prompt_ids:
+            prefix_op = prefix_op @ model.token_mats[token_id]
+
         for target_id in target_ids:
-            state = state_from_prefix_op(model, prefix_op, model.query)
-            state_normed = normalize_columns(state.unsqueeze(1))[:, 0]
+            state = model.base_mat @ (prefix_op @ model.query)
+            state_normed = normalize_last_dim(state)
             states.append(state_normed.detach().cpu())
-            query_target = normalize_columns(
-                (prefix_op.transpose(-1, -2) @ model.base_mat.transpose(-1, -2) @ model.unembed_vectors[target_id].unsqueeze(1))
-            )[:, 0]
+            query_target = normalize_last_dim(
+                prefix_op.transpose(-1, -2) @ model.base_mat.transpose(-1, -2) @ model.unembed_vectors[target_id]
+            )
             query_targets.append(query_target.detach().cpu())
-            pred_id = predict_next_id_from_prefix_op(model, prefix_op)
+            pred_id = int((model.unembed_vectors @ state).argmax().item())
             tf_correct += int(pred_id == target_id)
             tf_total += 1
-            prefix_op = advance_prefix_operator(model, prefix_op, target_id)
+            prefix_op = prefix_op @ model.token_mats[target_id]
 
     state_summary = subspace_summary(torch.stack(states, dim=0))
     query_target_summary = subspace_summary(torch.stack(query_targets, dim=0))
