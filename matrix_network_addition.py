@@ -13,7 +13,6 @@ from matrix_network_training import (
     DEFAULT_UPDATE_ORTHOGONALIZE_STEPS,
     MatrixNetworkOptimizerState,
     advance_prefix_operator,
-    format_subspace_summary,
     generate_until_token,
     generate_until_token_id,
     load_training_checkpoint,
@@ -22,9 +21,9 @@ from matrix_network_training import (
     prefix_operator_from_ids,
     save_checkpoint,
     state_from_prefix_op,
-    subspace_summary,
     train,
 )
+from matrix_network_utils import format_subspace_summary, subspace_summary
 
 
 EOS_TOKEN = "~"
