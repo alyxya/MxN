@@ -7,13 +7,6 @@ import torch
 from matrix_network import MatrixNetwork
 
 
-def eye_like_mats(mats: torch.Tensor) -> torch.Tensor:
-    eye = torch.eye(mats.shape[-1], device=mats.device, dtype=mats.dtype)
-    while eye.ndim < mats.ndim:
-        eye = eye.unsqueeze(0)
-    return eye
-
-
 def skew(update_terms: torch.Tensor) -> torch.Tensor:
     return update_terms - update_terms.transpose(-1, -2)
 
@@ -24,7 +17,10 @@ def exp_rotation(generator: torch.Tensor, lr: float, max_step_norm: float = 0.00
     norm_ratio = float((norm / max_step_norm).item())
     squarings = 0 if norm_ratio <= 1.0 else math.ceil(math.log2(norm_ratio))
 
-    r = eye_like_mats(a) + a / (2 ** squarings)
+    eye = torch.eye(a.shape[-1], device=a.device, dtype=a.dtype)
+    while eye.ndim < a.ndim:
+        eye = eye.unsqueeze(0)
+    r = eye + a / (2 ** squarings)
     for _ in range(squarings):
         r = r @ r
     return r
