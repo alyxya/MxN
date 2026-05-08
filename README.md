@@ -8,8 +8,8 @@ The core idea is:
 1. Start with a learned `base_mat`.
 2. Maintain a current `state_mat`, initially a copy of `base_mat`.
 3. Each token owns a learned matrix.
-4. Applying context means multiplying token matrices into `state_mat`.
-5. Prediction reads a fixed query vector through the current state matrix and
+4. Applying context means left-multiplying token matrices into `state_mat`.
+5. Prediction reads a fixed query row through the current state matrix and
    chooses the output token with the largest score.
 
 In code, inference is intentionally small:
@@ -34,18 +34,20 @@ Applying context is just matrix multiplication:
 
 ```text
 state_mat = base_mat
-state_mat = state_mat @ token_mat[token_0]
-state_mat = state_mat @ token_mat[token_1]
+state_mat = token_mat[token_0] @ state_mat
+state_mat = token_mat[token_1] @ state_mat
 ...
 ```
 
 Prediction is:
 
 ```text
-state = state_mat @ query
+state = state_mat.T @ query
 scores = unembed_vectors @ state
 prediction = argmax(scores)
 ```
+
+Equivalently, the query is read as the row vector `query.T @ state_mat`.
 
 The matrices are kept near-orthogonal, so the state acts like a sequence of
 rotations/reflections in a shared vector space.

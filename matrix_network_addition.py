@@ -96,16 +96,16 @@ def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, 
 
         prefix_op = eye
         for tid in prompt_ids:
-            prefix_op = prefix_op @ model.token_mats[tid]
+            prefix_op = model.token_mats[tid] @ prefix_op
         for tid in target_ids:
-            state = model.base_mat @ (prefix_op @ model.query)
+            state = (prefix_op @ model.base_mat).T @ model.query
             states.append(state.detach().cpu())
-            target_vec = prefix_op.T @ model.base_mat.T @ model.unembed_vectors[tid]
+            target_vec = model.unembed_vectors[tid]
             targets.append(target_vec.detach().cpu())
             pred_id = int((model.unembed_vectors @ state).argmax().item())
             tf_correct += int(pred_id == tid)
             tf_total += 1
-            prefix_op = prefix_op @ model.token_mats[tid]
+            prefix_op = model.token_mats[tid] @ prefix_op
 
     print(
         f"  eval exact_match={exact / max(samples, 1):.3f} "

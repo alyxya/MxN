@@ -44,11 +44,11 @@ class MatrixNetwork(torch.nn.Module):
     def apply_context(self, token_ids: Sequence[int]) -> None:
         with torch.no_grad():
             for token_id in token_ids:
-                self.state_mat.copy_(self.state_mat @ self.token_mats[token_id])
+                self.state_mat.copy_(self.token_mats[token_id] @ self.state_mat)
 
     def predict(self) -> int:
         with torch.no_grad():
-            state = self.state_mat @ self.query
+            state = self.query @ self.state_mat
             return int((self.unembed_vectors @ state).argmax().item())
 
     @property

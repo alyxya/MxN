@@ -82,11 +82,11 @@ def apply_batch_update(
     for full_ids, prompt_len in zip(sequences, prompt_lens):
         prefix_op = eye
         for tid in full_ids[:prompt_len]:
-            prefix_op = prefix_op @ model.token_mats[tid]
+            prefix_op = model.token_mats[tid] @ prefix_op
 
         for pos in range(prompt_len, len(full_ids)):
             target_id = full_ids[pos]
-            state = model.base_mat @ (prefix_op @ model.query)
+            state = (prefix_op @ model.base_mat).T @ model.query
             scores = model.unembed_vectors @ state
 
             total += 1
@@ -99,21 +99,27 @@ def apply_batch_update(
                 if target_noise > 0.0:
                     target = normalize(target + torch.randn_like(target) * target_noise)
 
-                u = state.unsqueeze(1)
-                v = target.unsqueeze(1)
-                base_update_terms.add_(v @ u.T)
+                base_query = (prefix_op.T @ model.query).unsqueeze(1)
+                base_target = (model.base_mat @ target).unsqueeze(1)
+                base_update_terms.add_(base_query @ base_target.T)
 
-                prefix_query = (prefix_op @ model.query).unsqueeze(1)
-                base_target = (model.base_mat.T @ target).unsqueeze(1)
-                prev_op = eye
-                for tid in full_ids[:pos]:
-                    pt = prev_op.T
-                    pu = (pt @ prefix_query).squeeze(1).unsqueeze(1)
-                    pv = (pt @ base_target).squeeze(1).unsqueeze(1)
-                    token_update_terms[tid].add_(pv @ pu.T)
-                    prev_op = prev_op @ model.token_mats[tid]
+                prior_ids = full_ids[:pos]
+                later_ops: List[torch.Tensor] = []
+                later_op = eye
+                for tid in reversed(prior_ids):
+                    later_ops.append(later_op)
+                    later_op = later_op @ model.token_mats[tid]
+                later_ops.reverse()
 
-            prefix_op = prefix_op @ model.token_mats[target_id]
+                earlier_op = eye
+                target_base = model.base_mat @ target
+                for tid, later_op in zip(prior_ids, later_ops):
+                    token_query = (later_op.T @ model.query).unsqueeze(1)
+                    token_target = (model.token_mats[tid] @ (earlier_op @ target_base)).unsqueeze(1)
+                    token_update_terms[tid].add_(token_query @ token_target.T)
+                    earlier_op = model.token_mats[tid] @ earlier_op
+
+            prefix_op = model.token_mats[target_id] @ prefix_op
 
     optimizer.step(base_update_terms, token_update_terms, mistakes)
 
