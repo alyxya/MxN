@@ -3,7 +3,7 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 import torch
 
-from matrix_network_ops import normalize_columns, one_hot_vectors
+from matrix_network_ops import one_hot_vectors
 
 
 class MatrixNetwork:
@@ -44,6 +44,9 @@ class MatrixNetwork:
     def encode(self, tokens: Iterable[str]) -> List[int]:
         return [self.stoi[token] for token in tokens]
 
+    def decode(self, token_id: int) -> str:
+        return self.itos[token_id]
+
     def reset_state(self) -> None:
         self.state_mat = self.base_mat.clone()
 
@@ -51,7 +54,7 @@ class MatrixNetwork:
         for token_id in token_ids:
             self.state_mat = self.state_mat @ self.token_mats[token_id]
 
-    def predict_next_id(self) -> int:
+    def predict(self) -> int:
         state = self.state_mat @ self.query
-        scores = self.unembed_vectors @ normalize_columns(state.unsqueeze(1))
-        return int(scores[:, 0].argmax().item())
+        scores = self.unembed_vectors @ state
+        return int(scores.argmax().item())
