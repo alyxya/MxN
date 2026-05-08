@@ -11,7 +11,6 @@ from matrix_network import MatrixNetwork
 from matrix_network_optimizer import MatrixNetworkOptimizer
 from matrix_network_training import (
     load_checkpoint,
-    normalize,
     save_checkpoint,
     train,
 )
@@ -99,9 +98,9 @@ def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, 
         for tid in prompt_ids:
             prefix_op = prefix_op @ model.token_mats[tid]
         for tid in target_ids:
-            state = normalize(model.base_mat @ (prefix_op @ model.query))
+            state = model.base_mat @ (prefix_op @ model.query)
             states.append(state.detach().cpu())
-            target_vec = normalize(prefix_op.T @ model.base_mat.T @ model.unembed_vectors[tid])
+            target_vec = prefix_op.T @ model.base_mat.T @ model.unembed_vectors[tid]
             targets.append(target_vec.detach().cpu())
             pred_id = int((model.unembed_vectors @ state).argmax().item())
             tf_correct += int(pred_id == tid)

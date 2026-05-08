@@ -87,8 +87,7 @@ def apply_batch_update(
         for pos in range(prompt_len, len(full_ids)):
             target_id = full_ids[pos]
             state = model.base_mat @ (prefix_op @ model.query)
-            state_n = normalize(state)
-            scores = model.unembed_vectors @ state_n
+            scores = model.unembed_vectors @ state
 
             total += 1
             target_score_sum += float(scores[target_id].item())
@@ -100,7 +99,7 @@ def apply_batch_update(
                 if target_noise > 0.0:
                     target = normalize(target + torch.randn_like(target) * target_noise)
 
-                u = state_n.unsqueeze(1)
+                u = state.unsqueeze(1)
                 v = target.unsqueeze(1)
                 base_update_terms.add_(v @ u.T)
 
@@ -109,8 +108,8 @@ def apply_batch_update(
                 prev_op = eye
                 for tid in full_ids[:pos]:
                     pt = prev_op.T
-                    pu = normalize((pt @ prefix_query).squeeze(1)).unsqueeze(1)
-                    pv = normalize((pt @ base_target).squeeze(1)).unsqueeze(1)
+                    pu = (pt @ prefix_query).squeeze(1).unsqueeze(1)
+                    pv = (pt @ base_target).squeeze(1).unsqueeze(1)
                     token_update_terms[tid].add_(pv @ pu.T)
                     prev_op = prev_op @ model.token_mats[tid]
 
