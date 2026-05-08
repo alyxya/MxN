@@ -18,16 +18,6 @@ def orthogonalize(w: torch.Tensor, steps: int) -> torch.Tensor:
     return w
 
 
-def pick_device(requested: str) -> torch.device:
-    if requested != "auto":
-        return torch.device(requested)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
 def rotate_matrix(current: torch.Tensor, generator: torch.Tensor, lr: float, ortho_steps: int) -> torch.Tensor:
     eye = torch.eye(current.shape[-1], device=current.device, dtype=current.dtype)
     while eye.ndim < current.ndim:
