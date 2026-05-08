@@ -3,8 +3,6 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 import torch
 
-from matrix_network_ops import one_hot_vectors
-
 
 class MatrixNetwork:
     def __init__(
@@ -32,11 +30,12 @@ class MatrixNetwork:
         self.stoi: Dict[str, int] = {token: i for i, token in enumerate(vocab_tokens)}
         self.itos: Dict[int, str] = {i: token for token, i in self.stoi.items()}
 
-        self.query = one_hot_vectors(1, n, device)[0]
-        self.unembed_vectors = one_hot_vectors(self.vocab_size, n, device)
-        self.base_mat = torch.eye(n, device=device)
+        eye = torch.eye(n, device=device)
+        self.query = eye[0].clone()
+        self.unembed_vectors = eye[: self.vocab_size].clone()
+        self.base_mat = eye.clone()
         self.token_mats = (
-            torch.eye(n, device=device).expand(self.vocab_size, n, n).clone()
+            eye.expand(self.vocab_size, n, n).clone()
         )
         self.state_mat = self.base_mat.clone()
         self.device = self.base_mat.device
