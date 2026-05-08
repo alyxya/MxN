@@ -58,24 +58,35 @@ Training does not use backpropagation. For each target token position:
 2. Predict the next token.
 3. If the prediction is wrong, choose the target vector.
 4. Optionally add noise to the target vector.
-5. Build skew-symmetric rotation updates that rotate the current state toward
+5. Build learned rotation update terms that rotate the current state toward
    that target.
 6. Accumulate updates for both `base_mat` and all token matrices that appear in
    the prefix.
-7. Apply momentum to those rotation updates.
-8. Apply the resulting rotations to the matrices, then orthogonalize.
+7. Apply momentum to those learned update terms.
+8. Convert the resulting terms to a skew-symmetric generator, exponentiate it,
+   and apply the resulting rotation to the matrices.
 
-The rotation generator is:
+Each learned update term is:
 
 ```text
-v @ u.T - u @ v.T
+v @ u.T
 ```
 
-where `u` is the current vector and `v` is the target vector. This produces a
-skew-symmetric matrix that nudges `u` toward `v` while preserving the
-rotation-like structure.
+where `u` is the current vector and `v` is the target vector. These terms can be
+averaged and mixed linearly. When applying the update, the optimizer turns the
+terms into the skew-symmetric generator:
 
-Momentum is an exponential moving average of these learned rotation updates:
+```text
+A = update_terms - update_terms.T
+R = exp(A * learning_rate)
+matrix = R @ matrix
+```
+
+The exponential is approximated by scaling `A * learning_rate`, using
+`I + scaled_A` as the small-step approximation, then repeatedly squaring back up
+to the full rotation.
+
+Momentum is an exponential moving average of these learned update terms:
 
 ```text
 momentum = momentum_decay * previous_momentum

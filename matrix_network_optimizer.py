@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 from typing import Any, Dict
 
 import torch
@@ -6,15 +7,31 @@ import torch
 from matrix_network import MatrixNetwork
 
 
-def orthogonalize(w: torch.Tensor) -> torch.Tensor:
-    return 1.5 * w - 0.5 * (w @ w.transpose(-1, -2) @ w)
-
-
-def rotate_matrix(current: torch.Tensor, generator: torch.Tensor, lr: float) -> torch.Tensor:
-    eye = torch.eye(current.shape[-1], device=current.device, dtype=current.dtype)
-    while eye.ndim < current.ndim:
+def eye_like_mats(mats: torch.Tensor) -> torch.Tensor:
+    eye = torch.eye(mats.shape[-1], device=mats.device, dtype=mats.dtype)
+    while eye.ndim < mats.ndim:
         eye = eye.unsqueeze(0)
-    return orthogonalize((eye + lr * generator) @ current)
+    return eye
+
+
+def skew(update_terms: torch.Tensor) -> torch.Tensor:
+    return update_terms - update_terms.transpose(-1, -2)
+
+
+def exp_rotation(generator: torch.Tensor, lr: float, max_step_norm: float = 0.001) -> torch.Tensor:
+    a = generator * lr
+    norm = torch.linalg.matrix_norm(a, ord="fro", dim=(-2, -1)).max()
+    norm_ratio = float((norm / max_step_norm).item())
+    squarings = 0 if norm_ratio <= 1.0 else math.ceil(math.log2(norm_ratio))
+
+    r = eye_like_mats(a) + a / (2 ** squarings)
+    for _ in range(squarings):
+        r = r @ r
+    return r
+
+
+def apply_rotation(current: torch.Tensor, update_terms: torch.Tensor, lr: float) -> torch.Tensor:
+    return exp_rotation(skew(update_terms), lr) @ current
 
 
 class MatrixNetworkOptimizer:
@@ -36,22 +53,23 @@ class MatrixNetworkOptimizer:
         self.token_momentum = torch.zeros_like(model.token_mats)
 
     @torch.no_grad()
-    def step(self, base_delta: torch.Tensor, token_delta: torch.Tensor, update_count: int) -> None:
+    def step(self, base_update_terms: torch.Tensor, token_update_terms: torch.Tensor, update_count: int) -> None:
         scale = 1.0 / max(update_count, 1)
-        base_delta = base_delta * scale
-        token_delta = token_delta * scale
+        base_update_terms = base_update_terms * scale
+        token_update_terms = token_update_terms * scale
 
-        self.base_momentum.mul_(self.momentum_decay).add_(base_delta * (1.0 - self.momentum_decay))
-        self.token_momentum.mul_(self.momentum_decay).add_(token_delta * (1.0 - self.momentum_decay))
+        self.base_momentum.mul_(self.momentum_decay).add_(base_update_terms * (1.0 - self.momentum_decay))
+        self.token_momentum.mul_(self.momentum_decay).add_(token_update_terms * (1.0 - self.momentum_decay))
 
-        base_update = self.base_momentum + base_delta * self.current_update_weight
-        token_update = self.token_momentum + token_delta * self.current_update_weight
-        self.model.base_mat.copy_(rotate_matrix(self.model.base_mat, base_update, self.base_lr))
-        self.model.token_mats.copy_(rotate_matrix(self.model.token_mats, token_update, self.token_lr))
+        base_update = self.base_momentum + base_update_terms * self.current_update_weight
+        token_update = self.token_momentum + token_update_terms * self.current_update_weight
+        self.model.base_mat.copy_(apply_rotation(self.model.base_mat, base_update, self.base_lr))
+        self.model.token_mats.copy_(apply_rotation(self.model.token_mats, token_update, self.token_lr))
         self.model.reset_state()
 
     def state_dict(self) -> Dict[str, Any]:
         return {
+            "update_format": "outer_product_terms",
             "momentum_decay": self.momentum_decay,
             "base_lr": self.base_lr,
             "token_lr": self.token_lr,
@@ -67,11 +85,14 @@ class MatrixNetworkOptimizer:
         self.base_lr = float(state.get("base_lr", self.base_lr))
         self.token_lr = float(state.get("token_lr", self.token_lr))
         self.current_update_weight = float(state.get("current_update_weight", self.current_update_weight))
+        legacy_skew_momentum = state.get("update_format") != "outer_product_terms"
 
         base_momentum = state.get("base_momentum")
         if isinstance(base_momentum, torch.Tensor):
-            self.base_momentum.copy_(base_momentum.to(self.model.device))
+            loaded = base_momentum.to(self.model.device)
+            self.base_momentum.copy_(loaded * 0.5 if legacy_skew_momentum else loaded)
 
         token_momentum = state.get("token_momentum")
         if isinstance(token_momentum, torch.Tensor):
-            self.token_momentum.copy_(token_momentum.to(self.model.device))
+            loaded = token_momentum.to(self.model.device)
+            self.token_momentum.copy_(loaded * 0.5 if legacy_skew_momentum else loaded)

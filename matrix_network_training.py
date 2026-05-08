@@ -73,8 +73,8 @@ def apply_batch_update(
     prompt_lens: Sequence[int],
     target_noise: float,
 ) -> Tuple[float, float]:
-    base_delta = torch.zeros_like(model.base_mat)
-    token_delta = torch.zeros_like(model.token_mats)
+    base_update_terms = torch.zeros_like(model.base_mat)
+    token_update_terms = torch.zeros_like(model.token_mats)
     correct = total = mistakes = 0
     target_score_sum = 0.0
     eye = torch.eye(model.n, device=model.device, dtype=model.base_mat.dtype)
@@ -102,7 +102,7 @@ def apply_batch_update(
 
                 u = state_n.unsqueeze(1)
                 v = target.unsqueeze(1)
-                base_delta.add_(v @ u.T - u @ v.T)
+                base_update_terms.add_(v @ u.T)
 
                 prefix_query = (prefix_op @ model.query).unsqueeze(1)
                 base_target = (model.base_mat.T @ target).unsqueeze(1)
@@ -111,12 +111,12 @@ def apply_batch_update(
                     pt = prev_op.T
                     pu = normalize((pt @ prefix_query).squeeze(1)).unsqueeze(1)
                     pv = normalize((pt @ base_target).squeeze(1)).unsqueeze(1)
-                    token_delta[tid].add_(pv @ pu.T - pu @ pv.T)
+                    token_update_terms[tid].add_(pv @ pu.T)
                     prev_op = prev_op @ model.token_mats[tid]
 
             prefix_op = prefix_op @ model.token_mats[target_id]
 
-    optimizer.step(base_delta, token_delta, mistakes)
+    optimizer.step(base_update_terms, token_update_terms, mistakes)
 
     return target_score_sum / max(total, 1), correct / max(total, 1)
 
