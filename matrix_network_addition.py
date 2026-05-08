@@ -213,7 +213,6 @@ def run_training(
         token_lr=args.token_learning_rate,
         base_lr=args.base_learning_rate,
         target_noise=args.target_randomize_scale,
-        ortho_steps=args.update_orthogonalize_steps,
         current_update_weight=args.current_update_weight,
         log_every=args.log_every,
         eval_every=args.eval_every,
@@ -247,7 +246,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-randomize-scale", type=float, default=0.0)
     p.add_argument("--momentum-decay", type=float, default=0.9)
     p.add_argument("--current-update-weight", type=float, default=0.0)
-    p.add_argument("--update-orthogonalize-steps", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)

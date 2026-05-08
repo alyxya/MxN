@@ -12,17 +12,15 @@ def normalize(x: torch.Tensor) -> torch.Tensor:
     return x / (x.norm(dim=-1, keepdim=True) + 1e-12)
 
 
-def orthogonalize(w: torch.Tensor, steps: int) -> torch.Tensor:
-    for _ in range(steps):
-        w = 1.5 * w - 0.5 * (w @ w.transpose(-1, -2) @ w)
-    return w
+def orthogonalize(w: torch.Tensor) -> torch.Tensor:
+    return 1.5 * w - 0.5 * (w @ w.transpose(-1, -2) @ w)
 
 
-def rotate_matrix(current: torch.Tensor, generator: torch.Tensor, lr: float, ortho_steps: int) -> torch.Tensor:
+def rotate_matrix(current: torch.Tensor, generator: torch.Tensor, lr: float) -> torch.Tensor:
     eye = torch.eye(current.shape[-1], device=current.device, dtype=current.dtype)
     while eye.ndim < current.ndim:
         eye = eye.unsqueeze(0)
-    return orthogonalize((eye + lr * generator) @ current, ortho_steps)
+    return orthogonalize((eye + lr * generator) @ current)
 
 
 @dataclass
@@ -105,7 +103,6 @@ def apply_batch_update(
     token_lr: float,
     base_lr: float,
     target_noise: float,
-    ortho_steps: int,
     current_update_weight: float,
 ) -> Tuple[float, float]:
     base_delta = torch.zeros_like(model.base_mat)
@@ -160,8 +157,8 @@ def apply_batch_update(
 
     base_update = optimizer.base_momentum + base_d * current_update_weight
     token_update = optimizer.token_momentum + token_d * current_update_weight
-    model.base_mat = rotate_matrix(model.base_mat, base_update, base_lr, ortho_steps)
-    model.token_mats = rotate_matrix(model.token_mats, token_update, token_lr, ortho_steps)
+    model.base_mat = rotate_matrix(model.base_mat, base_update, base_lr)
+    model.token_mats = rotate_matrix(model.token_mats, token_update, token_lr)
     model.reset_state()
 
     return target_score_sum / max(total, 1), correct / max(total, 1)
@@ -176,7 +173,6 @@ def train(
     token_lr: float,
     base_lr: float,
     target_noise: float,
-    ortho_steps: int,
     current_update_weight: float,
     log_every: int,
     eval_every: int = 0,
@@ -189,7 +185,7 @@ def train(
         score, acc = apply_batch_update(
             model, optimizer, sequences, prompt_lens,
             token_lr=token_lr, base_lr=base_lr, target_noise=target_noise,
-            ortho_steps=ortho_steps, current_update_weight=current_update_weight,
+            current_update_weight=current_update_weight,
         )
         if it == 1 or it % log_every == 0:
             print(f"iter={it:5d} mean_target_score={score:.4f} token_acc={acc:.3f}")

@@ -119,5 +119,3 @@ Useful training knobs:
   update construction.
 - `--momentum-decay`: EMA decay for base/token matrix update momentum.
 - `--current-update-weight`: extra direct weight for the current batch update.
-- `--update-orthogonalize-steps`: Newton-Schulz orthogonalization steps after
-  matrix updates.
