@@ -17,6 +17,7 @@ image = (
     .pip_install("torch", "numpy")
     .add_local_python_source(
         "matrix_network",
+        "matrix_network_optimizer",
         "matrix_network_training",
         "matrix_network_addition",
         "matrix_network_utils",

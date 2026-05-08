@@ -1,65 +1,20 @@
 #!/usr/bin/env python3
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 import torch
 
 from matrix_network import MatrixNetwork
+from matrix_network_optimizer import MatrixNetworkOptimizer
 
 
 def normalize(x: torch.Tensor) -> torch.Tensor:
     return x / (x.norm(dim=-1, keepdim=True) + 1e-12)
 
 
-def orthogonalize(w: torch.Tensor) -> torch.Tensor:
-    return 1.5 * w - 0.5 * (w @ w.transpose(-1, -2) @ w)
-
-
-def rotate_matrix(current: torch.Tensor, generator: torch.Tensor, lr: float) -> torch.Tensor:
-    eye = torch.eye(current.shape[-1], device=current.device, dtype=current.dtype)
-    while eye.ndim < current.ndim:
-        eye = eye.unsqueeze(0)
-    return orthogonalize((eye + lr * generator) @ current)
-
-
-@dataclass
-class OptimizerState:
-    momentum_decay: float
-    base_momentum: torch.Tensor
-    token_momentum: torch.Tensor
-
-    @classmethod
-    def for_model(cls, model: MatrixNetwork, momentum_decay: float) -> "OptimizerState":
-        return cls(
-            momentum_decay=momentum_decay,
-            base_momentum=torch.zeros_like(model.base_mat),
-            token_momentum=torch.zeros_like(model.token_mats),
-        )
-
-    @classmethod
-    def from_dict(cls, state: Dict[str, Any] | None, model: MatrixNetwork, momentum_decay: float) -> "OptimizerState":
-        if not state:
-            return cls.for_model(model, momentum_decay)
-        base_mom = state.get("base_momentum")
-        token_mom = state.get("token_momentum")
-        return cls(
-            momentum_decay=float(state.get("momentum_decay", momentum_decay)),
-            base_momentum=base_mom.to(model.device) if isinstance(base_mom, torch.Tensor) else torch.zeros_like(model.base_mat),
-            token_momentum=token_mom.to(model.device) if isinstance(token_mom, torch.Tensor) else torch.zeros_like(model.token_mats),
-        )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "momentum_decay": self.momentum_decay,
-            "base_momentum": self.base_momentum,
-            "token_momentum": self.token_momentum,
-        }
-
-
 def save_checkpoint(
     model: MatrixNetwork,
-    optimizer: OptimizerState,
+    optimizer: MatrixNetworkOptimizer,
     path: str,
     *,
     completed_iters: int = 0,
@@ -71,7 +26,7 @@ def save_checkpoint(
         "n": model.n,
         "vocab": model.vocab,
         "model_state": model.state_dict(),
-        "optimizer_state": optimizer.to_dict(),
+        "optimizer_state": optimizer.state_dict(),
         "completed_iters": completed_iters,
         "metadata": metadata or {},
     }
@@ -80,7 +35,15 @@ def save_checkpoint(
     tmp.replace(save_path)
 
 
-def load_checkpoint(path: str, device: torch.device, *, momentum_decay: float) -> Tuple[MatrixNetwork, OptimizerState, int, Dict[str, Any]]:
+def load_checkpoint(
+    path: str,
+    device: torch.device,
+    *,
+    momentum_decay: float,
+    base_lr: float,
+    token_lr: float,
+    current_update_weight: float,
+) -> Tuple[MatrixNetwork, MatrixNetworkOptimizer, int, Dict[str, Any]]:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model = MatrixNetwork(n=int(ckpt["n"]), vocab=ckpt["vocab"], device=device)
     if "model_state" in ckpt:
@@ -89,7 +52,14 @@ def load_checkpoint(path: str, device: torch.device, *, momentum_decay: float) -
         model.base_mat.copy_(ckpt["base_mat"].to(device))
         model.token_mats.copy_(ckpt["token_mats"].to(device))
     model.reset_state()
-    optimizer = OptimizerState.from_dict(ckpt.get("optimizer_state"), model, momentum_decay)
+    optimizer = MatrixNetworkOptimizer(
+        model,
+        momentum_decay=momentum_decay,
+        base_lr=base_lr,
+        token_lr=token_lr,
+        current_update_weight=current_update_weight,
+    )
+    optimizer.load_state_dict(ckpt.get("optimizer_state"))
     completed_iters = int(ckpt.get("completed_iters") or 0)
     metadata = dict(ckpt.get("metadata") or {})
     return model, optimizer, completed_iters, metadata
@@ -98,21 +68,16 @@ def load_checkpoint(path: str, device: torch.device, *, momentum_decay: float) -
 @torch.no_grad()
 def apply_batch_update(
     model: MatrixNetwork,
-    optimizer: OptimizerState,
+    optimizer: MatrixNetworkOptimizer,
     sequences: Sequence[Sequence[int]],
     prompt_lens: Sequence[int],
-    *,
-    token_lr: float,
-    base_lr: float,
     target_noise: float,
-    current_update_weight: float,
 ) -> Tuple[float, float]:
     base_delta = torch.zeros_like(model.base_mat)
     token_delta = torch.zeros_like(model.token_mats)
     correct = total = mistakes = 0
     target_score_sum = 0.0
     eye = torch.eye(model.n, device=model.device, dtype=model.base_mat.dtype)
-    decay = optimizer.momentum_decay
 
     for full_ids, prompt_len in zip(sequences, prompt_lens):
         prefix_op = eye
@@ -151,17 +116,7 @@ def apply_batch_update(
 
             prefix_op = prefix_op @ model.token_mats[target_id]
 
-    scale = 1.0 / max(mistakes, 1)
-    base_d = base_delta * scale
-    token_d = token_delta * scale
-    optimizer.base_momentum.mul_(decay).add_(base_d * (1.0 - decay))
-    optimizer.token_momentum.mul_(decay).add_(token_d * (1.0 - decay))
-
-    base_update = optimizer.base_momentum + base_d * current_update_weight
-    token_update = optimizer.token_momentum + token_d * current_update_weight
-    model.base_mat.copy_(rotate_matrix(model.base_mat, base_update, base_lr))
-    model.token_mats.copy_(rotate_matrix(model.token_mats, token_update, token_lr))
-    model.reset_state()
+    optimizer.step(base_delta, token_delta, mistakes)
 
     return target_score_sum / max(total, 1), correct / max(total, 1)
 
@@ -169,25 +124,21 @@ def apply_batch_update(
 def train(
     *,
     model: MatrixNetwork,
-    optimizer: OptimizerState,
+    optimizer: MatrixNetworkOptimizer,
     sample_batch: Callable[[], Tuple[List[List[int]], List[int]]],
     iters: int,
-    token_lr: float,
-    base_lr: float,
     target_noise: float,
-    current_update_weight: float,
     log_every: int,
     eval_every: int = 0,
     evaluate: Callable[[MatrixNetwork, int], None] | None = None,
     checkpoint_every: int = 0,
-    on_checkpoint: Callable[[int, MatrixNetwork, OptimizerState], None] | None = None,
+    on_checkpoint: Callable[[int, MatrixNetwork, MatrixNetworkOptimizer], None] | None = None,
 ) -> None:
     for it in range(1, iters + 1):
         sequences, prompt_lens = sample_batch()
         score, acc = apply_batch_update(
             model, optimizer, sequences, prompt_lens,
-            token_lr=token_lr, base_lr=base_lr, target_noise=target_noise,
-            current_update_weight=current_update_weight,
+            target_noise=target_noise,
         )
         if it == 1 or it % log_every == 0:
             print(f"iter={it:5d} mean_target_score={score:.4f} token_acc={acc:.3f}")

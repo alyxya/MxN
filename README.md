@@ -94,7 +94,9 @@ batch update on top of the momentum term.
 ## Files
 
 - `matrix_network.py`: core inference model.
-- `matrix_network_training.py`: checkpointing, rotation updates, momentum, the
+- `matrix_network_optimizer.py`: custom non-autograd optimizer that turns
+  rotation deltas into matrix updates, with momentum.
+- `matrix_network_training.py`: checkpointing, batch delta construction, the
   generic training loop, and small tensor math helpers.
 - `matrix_network_addition.py`: addition task data generation, evaluation, and
   the CLI training entrypoint.

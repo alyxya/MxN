@@ -8,8 +8,8 @@ from typing import Any, Callable, Dict, List, Tuple
 import torch
 
 from matrix_network import MatrixNetwork
+from matrix_network_optimizer import MatrixNetworkOptimizer
 from matrix_network_training import (
-    OptimizerState,
     load_checkpoint,
     normalize,
     save_checkpoint,
@@ -156,7 +156,12 @@ def run_training(
 
     if args.load_path:
         model, optimizer, prev_iters, loaded_meta = load_checkpoint(
-            args.load_path, device, momentum_decay=args.momentum_decay
+            args.load_path,
+            device,
+            momentum_decay=args.momentum_decay,
+            base_lr=args.base_learning_rate,
+            token_lr=args.token_learning_rate,
+            current_update_weight=args.current_update_weight,
         )
         if model.n != args.n:
             print(f"loaded_n={model.n}; overriding --n={args.n}")
@@ -171,7 +176,13 @@ def run_training(
             args.addend_digits = loaded_digits
     else:
         model = MatrixNetwork(n=args.n, vocab=vocab_for(args.number_base), device=device)
-        optimizer = OptimizerState.for_model(model, momentum_decay=args.momentum_decay)
+        optimizer = MatrixNetworkOptimizer(
+            model,
+            momentum_decay=args.momentum_decay,
+            base_lr=args.base_learning_rate,
+            token_lr=args.token_learning_rate,
+            current_update_weight=args.current_update_weight,
+        )
         prev_iters = 0
 
     save_path = args.save_path or str(default_save_dir / default_save_filename(args))
@@ -201,7 +212,7 @@ def run_training(
     def evaluate_cb(_: MatrixNetwork, it: int) -> None:
         evaluate(model, args.eval_samples, args.seed + it, args.addend_digits, args.number_base)
 
-    def checkpoint_cb(it: int, _model: MatrixNetwork, _opt: OptimizerState) -> None:
+    def checkpoint_cb(it: int, _model: MatrixNetwork, _opt: MatrixNetworkOptimizer) -> None:
         save(it)
         print(f"checkpoint_iter={it} save_path={save_path}")
 
@@ -210,10 +221,7 @@ def run_training(
         optimizer=optimizer,
         sample_batch=sample_batch,
         iters=args.iters,
-        token_lr=args.token_learning_rate,
-        base_lr=args.base_learning_rate,
         target_noise=args.target_randomize_scale,
-        current_update_weight=args.current_update_weight,
         log_every=args.log_every,
         eval_every=args.eval_every,
         evaluate=evaluate_cb,
