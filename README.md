@@ -94,12 +94,11 @@ batch update on top of the momentum term.
 ## Files
 
 - `matrix_network.py`: core inference model.
-- `matrix_network_training.py`: checkpointing, rotation updates, momentum, and
-  the generic training loop.
+- `matrix_network_training.py`: checkpointing, rotation updates, momentum, the
+  generic training loop, and small tensor math helpers.
 - `matrix_network_addition.py`: addition task data generation, evaluation, and
-  CLI training entrypoint.
+  the CLI training entrypoint.
 - `matrix_network_modal.py`: Modal remote training/checkpoint utilities.
-- `matrix_network_ops.py`: small tensor math helpers.
 - `matrix_network_utils.py`: miscellaneous diagnostics such as subspace stats.
 
 ## Example

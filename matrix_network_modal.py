@@ -6,18 +6,17 @@ from typing import Any
 
 import modal
 
-from matrix_network_addition import run_addition_training, validate_args
+from matrix_network_addition import run_training
 
 APP_NAME = "mxn-matrix-network"
 VOLUME_NAME = "mxn-matrix-network-checkpoints"
-REMOTE_CHECKPOINT_ROOT = Path("/checkpoints")
+REMOTE_ROOT = Path("/checkpoints")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("torch", "numpy")
     .add_local_python_source(
         "matrix_network",
-        "matrix_network_ops",
         "matrix_network_training",
         "matrix_network_addition",
         "matrix_network_utils",
@@ -28,121 +27,82 @@ app = modal.App(APP_NAME, image=image)
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
 
-def _strip_checkpoints_prefix(path: Path) -> Path:
-    if path.parts and path.parts[0] == "checkpoints":
-        return Path(*path.parts[1:])
-    return path
-
-
-def _remote_checkpoint_path(save_path: str) -> str:
-    path = Path(save_path)
-    if path.is_absolute():
-        return str(path)
-    return str(REMOTE_CHECKPOINT_ROOT / _strip_checkpoints_prefix(path))
-
-
-def _remote_load_path(load_path: str) -> str:
-    path = Path(load_path)
-    if path.is_absolute():
-        return str(path)
-    if path.parts and path.parts[0] == REMOTE_CHECKPOINT_ROOT.name:
-        return str(REMOTE_CHECKPOINT_ROOT / Path(*path.parts[1:]))
-    return str(REMOTE_CHECKPOINT_ROOT / _strip_checkpoints_prefix(path))
+def to_remote(path: str) -> str:
+    p = Path(path)
+    if p.is_absolute():
+        return str(p)
+    if p.parts and p.parts[0] == REMOTE_ROOT.name:
+        p = Path(*p.parts[1:])
+    return str(REMOTE_ROOT / p)
 
 
 def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
     args = argparse.Namespace(**args_dict)
-    validate_args(args)
-    if args.load_path is not None:
-        args.load_path = _remote_load_path(args.load_path)
+    if args.load_path:
+        args.load_path = to_remote(args.load_path)
+    if args.save_path:
+        args.save_path = to_remote(args.save_path)
 
-    def commit_checkpoint(_: str) -> None:
-        volume.commit()
-
-    start_time = time.perf_counter()
-    result = run_addition_training(
+    start = time.perf_counter()
+    result = run_training(
         args,
-        save_path_transform=_remote_checkpoint_path,
-        checkpoint_saved_callback=commit_checkpoint,
+        default_save_dir=REMOTE_ROOT,
+        on_checkpoint_saved=lambda _: volume.commit(),
     )
-    elapsed_seconds = time.perf_counter() - start_time
+    elapsed = time.perf_counter() - start
     return {
         **result,
-        "elapsed_seconds": elapsed_seconds,
-        "iters_per_second": (args.iters / elapsed_seconds) if elapsed_seconds > 0 else None,
+        "elapsed_seconds": elapsed,
+        "iters_per_second": (args.iters / elapsed) if elapsed > 0 else None,
     }
 
 
-@app.function(
-    image=image,
-    volumes={str(REMOTE_CHECKPOINT_ROOT): volume},
-    gpu=None,
-    timeout=24 * 60 * 60,
-)
+@app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu=None, timeout=24 * 3600)
 def train_remote_cpu(args_dict: dict[str, Any]) -> dict[str, Any]:
     return _train_impl(args_dict)
 
 
-@app.function(
-    image=image,
-    volumes={str(REMOTE_CHECKPOINT_ROOT): volume},
-    gpu="T4",
-    timeout=24 * 60 * 60,
-)
+@app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu="T4", timeout=24 * 3600)
 def train_remote_t4(args_dict: dict[str, Any]) -> dict[str, Any]:
     return _train_impl(args_dict)
 
 
-@app.function(
-    image=image,
-    volumes={str(REMOTE_CHECKPOINT_ROOT): volume},
-    gpu=None,
-    timeout=10 * 60,
-)
+@app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu=None, timeout=600)
 def list_checkpoints_remote(prefix: str = "") -> list[str]:
-    root = REMOTE_CHECKPOINT_ROOT
-    prefix_path = str(_strip_checkpoints_prefix(Path(prefix))) if prefix else ""
-    results: list[str] = []
-    if not root.exists():
-        return results
-    for path in sorted(root.rglob("*")):
+    if not REMOTE_ROOT.exists():
+        return []
+    prefix_path = Path(prefix)
+    if prefix_path.parts and prefix_path.parts[0] == REMOTE_ROOT.name:
+        prefix_path = Path(*prefix_path.parts[1:])
+    prefix_str = str(prefix_path) if prefix else ""
+    out: list[str] = []
+    for path in sorted(REMOTE_ROOT.rglob("*")):
         if not path.is_file():
             continue
-        rel = path.relative_to(root)
-        rel_str = str(rel)
-        if prefix_path and not rel_str.startswith(prefix_path):
+        rel = str(path.relative_to(REMOTE_ROOT))
+        if prefix_str and not rel.startswith(prefix_str):
             continue
-        results.append(str(Path("checkpoints") / rel))
-    return results
+        out.append(str(Path(REMOTE_ROOT.name) / rel))
+    return out
 
 
-@app.function(
-    image=image,
-    volumes={str(REMOTE_CHECKPOINT_ROOT): volume},
-    gpu=None,
-    timeout=10 * 60,
-)
+@app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu=None, timeout=600)
 def download_checkpoint_remote(remote_path: str) -> bytes:
-    path = Path(_remote_load_path(remote_path))
-    if not path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {path}")
-    return path.read_bytes()
+    p = Path(to_remote(remote_path))
+    if not p.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {p}")
+    return p.read_bytes()
 
 
-@app.function(
-    image=image,
-    volumes={str(REMOTE_CHECKPOINT_ROOT): volume},
-    gpu=None,
-    timeout=10 * 60,
-)
+@app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu=None, timeout=600)
 def upload_checkpoint_remote(remote_path: str, data: bytes) -> str:
-    path = Path(_remote_checkpoint_path(remote_path))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_bytes(data)
-    tmp_path.replace(path)
+    p = Path(to_remote(remote_path))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(p)
     volume.commit()
-    return str(path)
+    return str(p)
 
 
 @app.local_entrypoint()
@@ -173,27 +133,26 @@ def main(
     local_path: str = "",
 ) -> None:
     if command == "list":
-        checkpoints = list_checkpoints_remote.remote(prefix)
-        for path in checkpoints:
+        for path in list_checkpoints_remote.remote(prefix):
             print(path)
         return
 
     if command == "download":
         if not remote_path:
-            raise ValueError("--remote-path is required for --command download")
-        local_destination = Path(local_path) if local_path else Path("checkpoints") / Path(_strip_checkpoints_prefix(Path(remote_path)))
-        local_destination.parent.mkdir(parents=True, exist_ok=True)
-        local_destination.write_bytes(download_checkpoint_remote.remote(remote_path))
-        print(f"downloaded_checkpoint={local_destination}")
+            raise ValueError("--remote-path is required for download")
+        local_dest = Path(local_path) if local_path else Path("checkpoints") / Path(remote_path).name
+        local_dest.parent.mkdir(parents=True, exist_ok=True)
+        local_dest.write_bytes(download_checkpoint_remote.remote(remote_path))
+        print(f"downloaded_checkpoint={local_dest}")
         return
 
     if command == "upload":
         if not local_path:
-            raise ValueError("--local-path is required for --command upload")
-        local_source = Path(local_path)
-        remote_destination = remote_path or str(Path("checkpoints") / local_source.name)
-        remote_saved_path = upload_checkpoint_remote.remote(remote_destination, local_source.read_bytes())
-        print(f"uploaded_checkpoint={remote_saved_path}")
+            raise ValueError("--local-path is required for upload")
+        src = Path(local_path)
+        dest = remote_path or str(Path("checkpoints") / src.name)
+        saved = upload_checkpoint_remote.remote(dest, src.read_bytes())
+        print(f"uploaded_checkpoint={saved}")
         return
 
     if command != "train":
@@ -223,13 +182,13 @@ def main(
 
     gpu_key = gpu.lower()
     if gpu_key in {"", "none", "cpu"}:
-        remote_fn = train_remote_cpu
+        fn = train_remote_cpu
     elif gpu_key == "t4":
-        remote_fn = train_remote_t4
+        fn = train_remote_t4
     else:
         raise ValueError(f"unsupported --gpu {gpu!r}; supported values are 'none' and 'T4'")
 
-    result = remote_fn.remote(args_dict)
+    result = fn.remote(args_dict)
     print("\nModal run result:")
     for k, v in result.items():
         print(f"{k}={v}")
