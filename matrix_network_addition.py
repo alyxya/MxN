@@ -243,6 +243,7 @@ def format_run_config(args: argparse.Namespace, *, addend_digits: int) -> str:
         ("token_learning_rate", args.token_learning_rate),
         ("base_learning_rate", args.base_learning_rate),
         ("target_randomize_scale", args.target_randomize_scale),
+        ("momentum_decay", args.momentum_decay),
         ("current_update_weight", args.current_update_weight),
         ("update_orthogonalize_steps", args.update_orthogonalize_steps),
         ("checkpoint_every", getattr(args, "checkpoint_every", 0)),
@@ -267,8 +268,10 @@ def default_save_path(args: argparse.Namespace, addend_digits: int) -> str:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if not (0.0 <= args.current_update_weight <= 1.0):
-        raise ValueError("--current-update-weight must be in [0, 1]")
+    if not (0.0 <= args.momentum_decay < 1.0):
+        raise ValueError("--momentum-decay must be in [0, 1)")
+    if args.current_update_weight < 0.0:
+        raise ValueError("--current-update-weight must be >= 0")
     if args.log_every <= 0:
         raise ValueError("--log-every must be > 0")
     if args.eval_every <= 0:
@@ -302,7 +305,7 @@ def run_addition_training(
     device = pick_device(args.device)
     print(f"device={device}")
 
-    optimizer_state = MatrixNetworkOptimizerState(current_update_weight=args.current_update_weight)
+    optimizer_state = MatrixNetworkOptimizerState(momentum_decay=args.momentum_decay)
     previous_completed_iters = 0
     if args.load_path is None:
         model = make_addition_model(
@@ -315,7 +318,7 @@ def run_addition_training(
         model, optimizer_state, previous_completed_iters, metadata = load_training_checkpoint(
             args.load_path,
             device,
-            current_update_weight=args.current_update_weight,
+            momentum_decay=args.momentum_decay,
         )
         if model.n != args.n:
             print(f"loaded_n={model.n}; overriding --n={args.n}")
@@ -342,6 +345,7 @@ def run_addition_training(
         "task": "addition",
         "number_base": int(args.number_base),
         "addend_digits": int(addend_digits),
+        "momentum_decay": float(args.momentum_decay),
         "current_update_weight": float(args.current_update_weight),
     }
 
@@ -401,6 +405,7 @@ def run_addition_training(
         log_every=args.log_every,
         eval_every=args.eval_every,
         update_orthogonalize_steps=args.update_orthogonalize_steps,
+        current_update_weight=args.current_update_weight,
         checkpoint_every=args.checkpoint_every,
         checkpoint_callback=checkpoint_callback if args.checkpoint_every > 0 else None,
     )
@@ -436,7 +441,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--token-learning-rate", type=float, default=1.0, help="Step size for token matrices")
     p.add_argument("--base-learning-rate", type=float, default=1.0, help="Step size for the base matrix")
     p.add_argument("--target-randomize-scale", type=float, default=0.0, help="Gaussian noise scale added to target vectors during training updates")
-    p.add_argument("--current-update-weight", type=float, default=0.1, help="EMA weight for the current batch update; the remaining weight comes from previous momentum")
+    p.add_argument("--momentum-decay", type=float, default=0.9, help="EMA decay for matrix momentum buffers")
+    p.add_argument("--current-update-weight", type=float, default=0.0, help="Extra direct weight for the current batch update when applying matrix updates")
     p.add_argument("--addend-digits", type=int, default=3, help="Digits for each addend in a+b")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--log-every", type=int, default=50)

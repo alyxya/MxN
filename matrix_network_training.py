@@ -53,7 +53,7 @@ def _zeros_like_shape(shape: Sequence[int], *, device: torch.device, dtype: torc
 
 @dataclass
 class MatrixNetworkOptimizerState:
-    current_update_weight: float
+    momentum_decay: float
     base_momentum: torch.Tensor | None = None
     token_momentum: torch.Tensor | None = None
 
@@ -72,7 +72,7 @@ class MatrixNetworkOptimizerState:
         self.token_momentum = self.token_momentum.to(device=device, dtype=dtype)
 
     def state_dict(self) -> Dict[str, torch.Tensor | float]:
-        result: Dict[str, torch.Tensor | float] = {"current_update_weight": float(self.current_update_weight)}
+        result: Dict[str, torch.Tensor | float] = {"momentum_decay": float(self.momentum_decay)}
         if self.base_momentum is not None:
             result["base_momentum"] = self.base_momentum
         if self.token_momentum is not None:
@@ -84,16 +84,16 @@ class MatrixNetworkOptimizerState:
         cls,
         state_dict: Dict[str, Any] | None,
         *,
-        current_update_weight: float,
+        momentum_decay: float,
         device: torch.device,
     ) -> "MatrixNetworkOptimizerState":
-        state = cls(current_update_weight=current_update_weight)
+        state = cls(momentum_decay=momentum_decay)
         if not state_dict:
             return state
-        if "current_update_weight" in state_dict:
-            state.current_update_weight = float(state_dict["current_update_weight"])
-        elif "momentum_decay" in state_dict:
-            state.current_update_weight = 1.0 - float(state_dict["momentum_decay"])
+        if "momentum_decay" in state_dict:
+            state.momentum_decay = float(state_dict["momentum_decay"])
+        elif "current_update_weight" in state_dict:
+            state.momentum_decay = 1.0 - float(state_dict["current_update_weight"])
         for attr in ("base_momentum", "token_momentum"):
             value = state_dict.get(attr)
             if isinstance(value, torch.Tensor):
@@ -175,13 +175,13 @@ def load_training_checkpoint(
     path: str,
     device: torch.device,
     *,
-    current_update_weight: float,
+    momentum_decay: float,
 ) -> Tuple[MatrixNetwork, MatrixNetworkOptimizerState, int, Dict[str, Any]]:
     ckpt = load_checkpoint_dict(path, device)
     model = model_from_checkpoint_dict(ckpt, device)
     optimizer_state = MatrixNetworkOptimizerState.from_state_dict(
         ckpt.get("optimizer_state"),
-        current_update_weight=current_update_weight,
+        momentum_decay=momentum_decay,
         device=device,
     )
     optimizer_state.ensure_initialized(model)
@@ -326,6 +326,7 @@ def apply_batch_update(
     base_learning_rate: float,
     target_randomize_scale: float,
     update_orthogonalize_steps: int,
+    current_update_weight: float,
 ) -> Tuple[float, float]:
     n = model.n
     workspace.prepare(model)
@@ -337,8 +338,8 @@ def apply_batch_update(
     mean_target_score = 0.0
 
     optimizer_state.ensure_initialized(model)
-    current_update_weight = optimizer_state.current_update_weight
-    momentum_weight = 1.0 - current_update_weight
+    momentum_decay = optimizer_state.momentum_decay
+    momentum_update_weight = 1.0 - momentum_decay
 
     assert optimizer_state.base_momentum is not None
     assert optimizer_state.token_momentum is not None
@@ -456,22 +457,26 @@ def apply_batch_update(
         total += total_count
 
     update_scale = 1.0 / float(max(mistake_weight, 1.0))
-    optimizer_state.base_momentum.mul_(momentum_weight).add_(base_delta * (update_scale * current_update_weight))
-    if float(optimizer_state.base_momentum.abs().amax().item()) > EPS:
+    mean_base_delta = base_delta * update_scale
+    optimizer_state.base_momentum.mul_(momentum_decay).add_(mean_base_delta * momentum_update_weight)
+    base_update = optimizer_state.base_momentum + mean_base_delta * current_update_weight
+    if float(base_update.abs().amax().item()) > EPS:
         model.base_mat = apply_matrix_rotation(
             model.base_mat,
-            optimizer_state.base_momentum,
+            base_update,
             base_learning_rate,
             update_orthogonalize_steps,
         )
         model.reset_state()
 
-    optimizer_state.token_momentum.mul_(momentum_weight).add_(token_delta * (update_scale * current_update_weight))
-    token_hist_active = optimizer_state.token_momentum.abs().amax(dim=(1, 2)) > EPS
+    mean_token_delta = token_delta * update_scale
+    optimizer_state.token_momentum.mul_(momentum_decay).add_(mean_token_delta * momentum_update_weight)
+    token_update = optimizer_state.token_momentum + mean_token_delta * current_update_weight
+    token_hist_active = token_update.abs().amax(dim=(1, 2)) > EPS
     if token_hist_active.any():
         model.token_mats[token_hist_active] = apply_matrix_rotation(
             model.token_mats[token_hist_active],
-            optimizer_state.token_momentum[token_hist_active],
+            token_update[token_hist_active],
             token_learning_rate,
             update_orthogonalize_steps,
         )
@@ -496,6 +501,7 @@ def train(
     log_every: int,
     eval_every: int,
     update_orthogonalize_steps: int,
+    current_update_weight: float,
     checkpoint_every: int = 0,
     checkpoint_callback: Callable[[int, MatrixNetwork, MatrixNetworkOptimizerState], None] | None = None,
 ) -> Tuple[MatrixNetwork, MatrixNetworkOptimizerState]:
@@ -513,6 +519,7 @@ def train(
             base_learning_rate=base_learning_rate,
             target_randomize_scale=target_randomize_scale,
             update_orthogonalize_steps=update_orthogonalize_steps,
+            current_update_weight=current_update_weight,
         )
 
         if iter_idx % log_every == 0 or iter_idx == 1:
