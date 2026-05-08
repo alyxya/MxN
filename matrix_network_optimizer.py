@@ -1,33 +1,10 @@
 #!/usr/bin/env python3
-import math
 from typing import Any, Dict
 
 import torch
 
 from matrix_network import MatrixNetwork
-
-
-def skew(update_terms: torch.Tensor) -> torch.Tensor:
-    return update_terms - update_terms.transpose(-1, -2)
-
-
-def exp_rotation(generator: torch.Tensor, lr: float, max_step_norm: float = 0.001) -> torch.Tensor:
-    a = generator * lr
-    norm = torch.linalg.matrix_norm(a, ord="fro", dim=(-2, -1)).max()
-    norm_ratio = float((norm / max_step_norm).item())
-    squarings = 0 if norm_ratio <= 1.0 else math.ceil(math.log2(norm_ratio))
-
-    eye = torch.eye(a.shape[-1], device=a.device, dtype=a.dtype)
-    while eye.ndim < a.ndim:
-        eye = eye.unsqueeze(0)
-    r = eye + a / (2 ** squarings)
-    for _ in range(squarings):
-        r = r @ r
-    return r
-
-
-def apply_rotation(current: torch.Tensor, update_terms: torch.Tensor, lr: float) -> torch.Tensor:
-    return exp_rotation(skew(update_terms), lr) @ current
+from matrix_network_utils import apply_rotation
 
 
 class MatrixNetworkOptimizer:

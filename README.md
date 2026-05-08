@@ -114,7 +114,8 @@ batch update on top of the momentum term.
 - `matrix_network_addition.py`: addition task data generation, evaluation, and
   the CLI training entrypoint.
 - `matrix_network_modal.py`: Modal remote training/checkpoint utilities.
-- `matrix_network_utils.py`: miscellaneous diagnostics such as subspace stats.
+- `matrix_network_utils.py`: miscellaneous tensor helpers for rotations and
+  diagnostics such as subspace stats.
 
 ## Example
 
