@@ -8,11 +8,8 @@ import torch
 from matrix_network import MatrixNetwork
 
 
-EPS = 1e-12
-
-
 def normalize(x: torch.Tensor) -> torch.Tensor:
-    return x / (x.norm(dim=-1, keepdim=True) + EPS)
+    return x / (x.norm(dim=-1, keepdim=True) + 1e-12)
 
 
 def orthogonalize(w: torch.Tensor, steps: int) -> torch.Tensor:
@@ -172,17 +169,10 @@ def apply_batch_update(
     optimizer.token_momentum.mul_(decay).add_(token_d * (1.0 - decay))
 
     base_update = optimizer.base_momentum + base_d * current_update_weight
-    if float(base_update.abs().amax().item()) > EPS:
-        model.base_mat = rotate_matrix(model.base_mat, base_update, base_lr, ortho_steps)
-        model.reset_state()
-
     token_update = optimizer.token_momentum + token_d * current_update_weight
-    active = token_update.abs().amax(dim=(1, 2)) > EPS
-    if active.any():
-        model.token_mats[active] = rotate_matrix(
-            model.token_mats[active], token_update[active], token_lr, ortho_steps
-        )
-        model.reset_state()
+    model.base_mat = rotate_matrix(model.base_mat, base_update, base_lr, ortho_steps)
+    model.token_mats = rotate_matrix(model.token_mats, token_update, token_lr, ortho_steps)
+    model.reset_state()
 
     return target_score_sum / max(total, 1), correct / max(total, 1)
 
