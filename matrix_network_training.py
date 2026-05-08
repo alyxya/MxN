@@ -86,7 +86,7 @@ def apply_batch_update(
 
         for pos in range(prompt_len, len(full_ids)):
             target_id = full_ids[pos]
-            state = (prefix_op @ model.base_mat).T @ model.query
+            state = model.query @ (prefix_op @ model.base_mat)
             scores = model.unembed_vectors @ state
 
             total += 1
@@ -99,7 +99,7 @@ def apply_batch_update(
                 if target_noise > 0.0:
                     target = normalize(target + torch.randn_like(target) * target_noise)
 
-                base_query = (prefix_op.T @ model.query).unsqueeze(1)
+                base_query = (model.query @ prefix_op).unsqueeze(1)
                 base_target = (model.base_mat @ target).unsqueeze(1)
                 base_update_terms.add_(base_query @ base_target.T)
 
@@ -114,7 +114,7 @@ def apply_batch_update(
                 earlier_op = eye
                 target_base = model.base_mat @ target
                 for tid, later_op in zip(prior_ids, later_ops):
-                    token_query = (later_op.T @ model.query).unsqueeze(1)
+                    token_query = (model.query @ later_op).unsqueeze(1)
                     token_target = (model.token_mats[tid] @ (earlier_op @ target_base)).unsqueeze(1)
                     token_update_terms[tid].add_(token_query @ token_target.T)
                     earlier_op = model.token_mats[tid] @ earlier_op

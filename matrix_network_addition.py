@@ -98,7 +98,7 @@ def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, 
         for tid in prompt_ids:
             prefix_op = model.token_mats[tid] @ prefix_op
         for tid in target_ids:
-            state = (prefix_op @ model.base_mat).T @ model.query
+            state = model.query @ (prefix_op @ model.base_mat)
             states.append(state.detach().cpu())
             target_vec = model.unembed_vectors[tid]
             targets.append(target_vec.detach().cpu())

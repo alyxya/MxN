@@ -42,7 +42,7 @@ state_mat = token_mat[token_1] @ state_mat
 Prediction is:
 
 ```text
-state = state_mat.T @ query
+state = query.T @ state_mat
 scores = unembed_vectors @ state
 prediction = argmax(scores)
 ```
