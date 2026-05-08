@@ -48,7 +48,6 @@ class MatrixNetwork:
         self.state_mat = self.base_mat.clone()
 
     def apply_context(self, token_ids: Sequence[int]) -> None:
-        self.reset_state()
         for token_id in token_ids:
             self.state_mat = self.state_mat @ self.token_mats[token_id]
 
