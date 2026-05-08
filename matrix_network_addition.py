@@ -80,7 +80,7 @@ def generate(model: MatrixNetwork, prompt: str, stop: str, max_len: int) -> Tupl
 
 def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, base: int) -> None:
     rng = random.Random(seed)
-    eye = torch.eye(model.n, device=model.device, dtype=model.base_mat.dtype)
+    eye = torch.eye(model.n, device=model.base_mat.device, dtype=model.base_mat.dtype)
     exact = stopped = tf_correct = tf_total = 0
     states: List[torch.Tensor] = []
     targets: List[torch.Tensor] = []

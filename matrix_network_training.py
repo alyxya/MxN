@@ -77,7 +77,7 @@ def apply_batch_update(
     token_update_terms = torch.zeros_like(model.token_mats)
     correct = total = mistakes = 0
     target_score_sum = 0.0
-    eye = torch.eye(model.n, device=model.device, dtype=model.base_mat.dtype)
+    eye = torch.eye(model.n, device=model.base_mat.device, dtype=model.base_mat.dtype)
 
     for full_ids, prompt_len in zip(sequences, prompt_lens):
         prefix_op = eye

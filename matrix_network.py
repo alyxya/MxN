@@ -54,7 +54,3 @@ class MatrixNetwork(torch.nn.Module):
             state = self.state_mat[0]
             # Equivalent to scoring against the one-hot unembedding vectors.
             return int(state[: self.vocab_size].argmax().item())
-
-    @property
-    def device(self) -> torch.device:
-        return self.base_mat.device

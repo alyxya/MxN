@@ -89,10 +89,10 @@ class MatrixNetworkOptimizer:
 
         base_momentum = state.get("base_momentum")
         if isinstance(base_momentum, torch.Tensor):
-            loaded = base_momentum.to(self.model.device)
+            loaded = base_momentum.to(self.model.base_mat.device)
             self.base_momentum.copy_(loaded * 0.5 if legacy_skew_momentum else loaded)
 
         token_momentum = state.get("token_momentum")
         if isinstance(token_momentum, torch.Tensor):
-            loaded = token_momentum.to(self.model.device)
+            loaded = token_momentum.to(self.model.base_mat.device)
             self.token_momentum.copy_(loaded * 0.5 if legacy_skew_momentum else loaded)
