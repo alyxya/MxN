@@ -117,7 +117,10 @@ def apply_batch_update(
 
             prefix_op = model.token_mats[target_id] @ prefix_op
 
-    optimizer.step(base_update_terms, token_update_terms, mistakes)
+    if mistakes > 0:
+        base_update_terms = base_update_terms / mistakes
+        token_update_terms = token_update_terms / mistakes
+    optimizer.step(base_update_terms, token_update_terms)
 
     return target_score_sum / max(total, 1), correct / max(total, 1)
 

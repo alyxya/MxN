@@ -26,11 +26,7 @@ class MatrixNetworkOptimizer:
         self.token_momentum = torch.zeros_like(model.token_mats)
 
     @torch.no_grad()
-    def step(self, base_update_terms: torch.Tensor, token_update_terms: torch.Tensor, update_count: int) -> None:
-        scale = 1.0 / max(update_count, 1)
-        base_update_terms = base_update_terms * scale
-        token_update_terms = token_update_terms * scale
-
+    def step(self, base_update_terms: torch.Tensor, token_update_terms: torch.Tensor) -> None:
         self.base_momentum.mul_(self.momentum_decay).add_(base_update_terms * (1.0 - self.momentum_decay))
         self.token_momentum.mul_(self.momentum_decay).add_(token_update_terms * (1.0 - self.momentum_decay))
 
