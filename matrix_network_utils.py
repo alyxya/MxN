@@ -9,6 +9,8 @@ if TYPE_CHECKING:
     from matrix_network import MatrixNetwork
     from matrix_network_optimizer import MatrixNetworkOptimizer
 
+CheckpointState = Dict[str, Any]
+
 
 def skew(update_terms: torch.Tensor) -> torch.Tensor:
     return update_terms - update_terms.transpose(-1, -2)
@@ -62,32 +64,14 @@ def save_checkpoint(
     tmp.replace(save_path)
 
 
-def load_checkpoint(
-    path: str,
-    device: torch.device | str | None,
-    *,
-    momentum_decay: float,
-    base_lr: float,
-    token_lr: float,
-    current_update_weight: float,
-) -> Tuple["MatrixNetwork", "MatrixNetworkOptimizer", int, Dict[str, Any]]:
+def load_checkpoint(path: str, device: torch.device | str | None) -> Tuple["MatrixNetwork", CheckpointState, int, Dict[str, Any]]:
     from matrix_network import MatrixNetwork
-    from matrix_network_optimizer import MatrixNetworkOptimizer
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model = MatrixNetwork(n=int(ckpt["n"]), vocab=ckpt["vocab"], device=device)
     model.load_state_dict(ckpt["model_state"])
     model.reset_state()
-
-    optimizer = MatrixNetworkOptimizer(
-        model,
-        momentum_decay=momentum_decay,
-        base_lr=base_lr,
-        token_lr=token_lr,
-        current_update_weight=current_update_weight,
-    )
-    optimizer.load_state_dict(ckpt["optimizer_state"])
-    return model, optimizer, int(ckpt["completed_iters"]), dict(ckpt["metadata"])
+    return model, ckpt["optimizer_state"], int(ckpt["completed_iters"]), dict(ckpt["metadata"])
 
 
 def subspace_summary(label: str, vectors: torch.Tensor) -> str:

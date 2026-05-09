@@ -154,14 +154,15 @@ def run_training(
     print(f"device={device}")
 
     if args.load_path:
-        model, optimizer, prev_iters, loaded_meta = load_checkpoint(
-            args.load_path,
-            device,
+        model, optimizer_state, prev_iters, loaded_meta = load_checkpoint(args.load_path, device)
+        optimizer = MatrixNetworkOptimizer(
+            model,
             momentum_decay=args.momentum_decay,
             base_lr=args.base_learning_rate,
             token_lr=args.token_learning_rate,
             current_update_weight=args.current_update_weight,
         )
+        optimizer.load_state_dict(optimizer_state)
         if model.n != args.n:
             print(f"loaded_n={model.n}; overriding --n={args.n}")
             args.n = model.n
