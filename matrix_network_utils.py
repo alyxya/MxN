@@ -44,7 +44,6 @@ def save_checkpoint(
     optimizer: "MatrixNetworkOptimizer",
     path: str,
     *,
-    completed_iters: int = 0,
     metadata: Dict[str, Any] | None = None,
 ) -> None:
     save_path = Path(path)
@@ -56,7 +55,6 @@ def save_checkpoint(
             "vocab": model.vocab,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
-            "completed_iters": completed_iters,
             "metadata": metadata or {},
         },
         tmp,
@@ -64,14 +62,14 @@ def save_checkpoint(
     tmp.replace(save_path)
 
 
-def load_checkpoint(path: str, device: torch.device | str | None) -> Tuple["MatrixNetwork", CheckpointState, int, Dict[str, Any]]:
+def load_checkpoint(path: str, device: torch.device | str | None) -> Tuple["MatrixNetwork", CheckpointState, Dict[str, Any]]:
     from matrix_network import MatrixNetwork
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model = MatrixNetwork(n=int(ckpt["n"]), vocab=ckpt["vocab"], device=device)
     model.load_state_dict(ckpt["model_state"])
     model.reset_state()
-    return model, ckpt["optimizer_state"], int(ckpt["completed_iters"]), dict(ckpt["metadata"])
+    return model, ckpt["optimizer_state"], dict(ckpt["metadata"])
 
 
 def subspace_summary(label: str, vectors: torch.Tensor) -> str:

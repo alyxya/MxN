@@ -154,7 +154,7 @@ def run_training(
     print(f"device={device}")
 
     if args.load_path:
-        model, optimizer_state, prev_iters, loaded_meta = load_checkpoint(args.load_path, device)
+        model, optimizer_state, loaded_meta = load_checkpoint(args.load_path, device)
         optimizer = MatrixNetworkOptimizer(
             model,
             momentum_decay=args.momentum_decay,
@@ -183,7 +183,6 @@ def run_training(
             token_lr=args.token_learning_rate,
             current_update_weight=args.current_update_weight,
         )
-        prev_iters = 0
 
     save_path = args.save_path or str(default_save_dir / default_save_filename(args))
     args.save_path = save_path
@@ -196,13 +195,10 @@ def run_training(
         "task": "addition",
         "number_base": int(args.number_base),
         "addend_digits": int(args.addend_digits),
-        "momentum_decay": float(args.momentum_decay),
-        "current_update_weight": float(args.current_update_weight),
     }
 
     def save(it: int) -> None:
-        save_checkpoint(model, optimizer, save_path,
-                        completed_iters=prev_iters + it, metadata=metadata)
+        save_checkpoint(model, optimizer, save_path, metadata=metadata)
         if on_checkpoint_saved is not None:
             on_checkpoint_saved(save_path)
 
