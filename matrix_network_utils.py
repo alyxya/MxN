@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from matrix_network import MatrixNetwork
     from matrix_network_optimizer import MatrixNetworkOptimizer
 
-CheckpointState = Dict[str, Any]
+OptimizerState = Dict[str, Any]
 
 
 def skew(update_terms: torch.Tensor) -> torch.Tensor:
@@ -62,7 +62,7 @@ def save_checkpoint(
     tmp.replace(save_path)
 
 
-def load_checkpoint(path: str, device: torch.device | str | None) -> Tuple["MatrixNetwork", CheckpointState, Dict[str, Any]]:
+def load_checkpoint(path: str, device: torch.device | str | None) -> Tuple["MatrixNetwork", OptimizerState, Dict[str, Any]]:
     from matrix_network import MatrixNetwork
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
