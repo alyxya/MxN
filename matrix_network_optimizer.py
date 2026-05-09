@@ -35,6 +35,7 @@ class MatrixNetworkOptimizer:
         token_update = token_update_terms * self.current_update_weight + self.token_momentum * momentum_weight
         self.model.base_mat.copy_(apply_rotation(self.model.base_mat, base_update, self.base_lr))
         self.model.token_mats.copy_(apply_rotation(self.model.token_mats, token_update, self.token_lr))
+        # The learned matrices changed, so the cached inference state is stale.
         self.model.reset_state()
 
     def state_dict(self) -> Dict[str, Any]:
