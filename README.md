@@ -98,11 +98,12 @@ momentum = momentum_decay * previous_momentum
 The applied update is:
 
 ```text
-applied_update = momentum + current_update_weight * current_update
+applied_update = current_update_weight * current_update
+               + (1 - current_update_weight) * momentum
 ```
 
-`current_update_weight` is an optional direct contribution from the current
-batch update on top of the momentum term.
+`current_update_weight` controls the fraction of the applied update that comes
+directly from the current batch update instead of the momentum update.
 
 ## Files
 

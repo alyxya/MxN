@@ -30,8 +30,9 @@ class MatrixNetworkOptimizer:
         self.base_momentum.mul_(self.momentum_decay).add_(base_update_terms * (1.0 - self.momentum_decay))
         self.token_momentum.mul_(self.momentum_decay).add_(token_update_terms * (1.0 - self.momentum_decay))
 
-        base_update = self.base_momentum + base_update_terms * self.current_update_weight
-        token_update = self.token_momentum + token_update_terms * self.current_update_weight
+        momentum_weight = 1.0 - self.current_update_weight
+        base_update = base_update_terms * self.current_update_weight + self.base_momentum * momentum_weight
+        token_update = token_update_terms * self.current_update_weight + self.token_momentum * momentum_weight
         self.model.base_mat.copy_(apply_rotation(self.model.base_mat, base_update, self.base_lr))
         self.model.token_mats.copy_(apply_rotation(self.model.token_mats, token_update, self.token_lr))
         self.model.reset_state()
