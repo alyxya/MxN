@@ -50,20 +50,18 @@ class MatrixNetworkOptimizer:
             "token_momentum": self.token_momentum,
         }
 
-    def load_state_dict(self, state: Dict[str, Any] | None) -> None:
-        if not state:
-            return
-        self.momentum_decay = float(state.get("momentum_decay", self.momentum_decay))
-        self.base_lr = float(state.get("base_lr", self.base_lr))
-        self.token_lr = float(state.get("token_lr", self.token_lr))
-        self.current_update_weight = float(state.get("current_update_weight", self.current_update_weight))
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        self.momentum_decay = float(state["momentum_decay"])
+        self.base_lr = float(state["base_lr"])
+        self.token_lr = float(state["token_lr"])
+        self.current_update_weight = float(state["current_update_weight"])
 
-        base_momentum = state.get("base_momentum")
-        if isinstance(base_momentum, torch.Tensor):
-            loaded = base_momentum.to(self.model.base_mat.device)
-            self.base_momentum.copy_(loaded)
+        base_momentum = state["base_momentum"]
+        if not isinstance(base_momentum, torch.Tensor):
+            raise TypeError("base_momentum must be a torch.Tensor")
+        self.base_momentum.copy_(base_momentum.to(self.model.base_mat.device))
 
-        token_momentum = state.get("token_momentum")
-        if isinstance(token_momentum, torch.Tensor):
-            loaded = token_momentum.to(self.model.base_mat.device)
-            self.token_momentum.copy_(loaded)
+        token_momentum = state["token_momentum"]
+        if not isinstance(token_momentum, torch.Tensor):
+            raise TypeError("token_momentum must be a torch.Tensor")
+        self.token_momentum.copy_(token_momentum.to(self.model.base_mat.device))

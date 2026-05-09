@@ -55,9 +55,9 @@ def load_checkpoint(
         token_lr=token_lr,
         current_update_weight=current_update_weight,
     )
-    optimizer.load_state_dict(ckpt.get("optimizer_state"))
-    completed_iters = int(ckpt.get("completed_iters") or 0)
-    metadata = dict(ckpt.get("metadata") or {})
+    optimizer.load_state_dict(ckpt["optimizer_state"])
+    completed_iters = int(ckpt["completed_iters"])
+    metadata = dict(ckpt["metadata"])
     return model, optimizer, completed_iters, metadata
 
 
