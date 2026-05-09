@@ -42,20 +42,11 @@ class MatrixNetworkOptimizer:
 
     def state_dict(self) -> Dict[str, Any]:
         return {
-            "momentum_decay": self.momentum_decay,
-            "base_lr": self.base_lr,
-            "token_lr": self.token_lr,
-            "current_update_weight": self.current_update_weight,
             "base_momentum": self.base_momentum,
             "token_momentum": self.token_momentum,
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
-        self.momentum_decay = float(state["momentum_decay"])
-        self.base_lr = float(state["base_lr"])
-        self.token_lr = float(state["token_lr"])
-        self.current_update_weight = float(state["current_update_weight"])
-
         base_momentum = state["base_momentum"]
         if not isinstance(base_momentum, torch.Tensor):
             raise TypeError("base_momentum must be a torch.Tensor")
