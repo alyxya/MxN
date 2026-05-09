@@ -8,10 +8,6 @@ from matrix_network import MatrixNetwork
 from matrix_network_optimizer import MatrixNetworkOptimizer
 
 
-def normalize(x: torch.Tensor) -> torch.Tensor:
-    return x / (x.norm(dim=-1, keepdim=True) + 1e-12)
-
-
 def save_checkpoint(
     model: MatrixNetwork,
     optimizer: MatrixNetworkOptimizer,
@@ -93,7 +89,8 @@ def apply_batch_update(
                 mistakes += 1
                 target = model.unembed_vectors[target_id]
                 if target_noise > 0.0:
-                    target = normalize(target + torch.randn_like(target) * target_noise)
+                    target = target + torch.randn_like(target) * target_noise
+                    target = target / (target.norm() + 1e-12)
 
                 base_query = (model.query @ prefix_op).unsqueeze(1)
                 base_target = (model.base_mat @ target).unsqueeze(1)
