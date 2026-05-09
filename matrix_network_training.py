@@ -37,7 +37,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     path: str,
-    device: torch.device,
+    device: torch.device | str | None,
     *,
     momentum_decay: float,
     base_lr: float,

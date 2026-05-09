@@ -150,7 +150,7 @@ def run_training(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    device = torch.device(args.device)
+    device = None if args.device is None else torch.device(args.device)
     print(f"device={device}")
 
     if args.load_path:
@@ -260,7 +260,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint-every", type=int, default=0)
     p.add_argument("--load-path", type=str, default=None)
     p.add_argument("--save-path", type=str, default=None)
-    p.add_argument("--device", type=str, default="cpu", choices=["cpu", "mps", "cuda"])
+    p.add_argument("--device", type=str, default=None, choices=["cpu", "mps", "cuda"])
     return p.parse_args()
 
 
