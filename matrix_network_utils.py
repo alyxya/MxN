@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 import math
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, Tuple
 
 import torch
+
+if TYPE_CHECKING:
+    from matrix_network import MatrixNetwork
+    from matrix_network_optimizer import MatrixNetworkOptimizer
 
 
 def skew(update_terms: torch.Tensor) -> torch.Tensor:
@@ -29,6 +35,59 @@ def exp_rotation(generator: torch.Tensor, lr: float, max_step_norm: float = 0.00
 
 def apply_rotation(current: torch.Tensor, update_terms: torch.Tensor, lr: float) -> torch.Tensor:
     return exp_rotation(skew(update_terms), lr) @ current
+
+
+def save_checkpoint(
+    model: "MatrixNetwork",
+    optimizer: "MatrixNetworkOptimizer",
+    path: str,
+    *,
+    completed_iters: int = 0,
+    metadata: Dict[str, Any] | None = None,
+) -> None:
+    save_path = Path(path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = save_path.with_suffix(save_path.suffix + ".tmp")
+    torch.save(
+        {
+            "n": model.n,
+            "vocab": model.vocab,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "completed_iters": completed_iters,
+            "metadata": metadata or {},
+        },
+        tmp,
+    )
+    tmp.replace(save_path)
+
+
+def load_checkpoint(
+    path: str,
+    device: torch.device | str | None,
+    *,
+    momentum_decay: float,
+    base_lr: float,
+    token_lr: float,
+    current_update_weight: float,
+) -> Tuple["MatrixNetwork", "MatrixNetworkOptimizer", int, Dict[str, Any]]:
+    from matrix_network import MatrixNetwork
+    from matrix_network_optimizer import MatrixNetworkOptimizer
+
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model = MatrixNetwork(n=int(ckpt["n"]), vocab=ckpt["vocab"], device=device)
+    model.load_state_dict(ckpt["model_state"])
+    model.reset_state()
+
+    optimizer = MatrixNetworkOptimizer(
+        model,
+        momentum_decay=momentum_decay,
+        base_lr=base_lr,
+        token_lr=token_lr,
+        current_update_weight=current_update_weight,
+    )
+    optimizer.load_state_dict(ckpt["optimizer_state"])
+    return model, optimizer, int(ckpt["completed_iters"]), dict(ckpt["metadata"])
 
 
 def subspace_summary(label: str, vectors: torch.Tensor) -> str:

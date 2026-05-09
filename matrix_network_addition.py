@@ -9,12 +9,12 @@ import torch
 
 from matrix_network import MatrixNetwork
 from matrix_network_optimizer import MatrixNetworkOptimizer
-from matrix_network_training import (
+from matrix_network_training import train
+from matrix_network_utils import (
     load_checkpoint,
     save_checkpoint,
-    train,
+    subspace_summary,
 )
-from matrix_network_utils import subspace_summary
 
 
 EOS = "~"

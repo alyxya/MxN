@@ -1,60 +1,10 @@
 #!/usr/bin/env python3
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Sequence, Tuple
+from typing import Callable, List, Sequence, Tuple
 
 import torch
 
 from matrix_network import MatrixNetwork
 from matrix_network_optimizer import MatrixNetworkOptimizer
-
-
-def save_checkpoint(
-    model: MatrixNetwork,
-    optimizer: MatrixNetworkOptimizer,
-    path: str,
-    *,
-    completed_iters: int = 0,
-    metadata: Dict[str, Any] | None = None,
-) -> None:
-    save_path = Path(path)
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "n": model.n,
-        "vocab": model.vocab,
-        "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "completed_iters": completed_iters,
-        "metadata": metadata or {},
-    }
-    tmp = save_path.with_suffix(save_path.suffix + ".tmp")
-    torch.save(payload, tmp)
-    tmp.replace(save_path)
-
-
-def load_checkpoint(
-    path: str,
-    device: torch.device | str | None,
-    *,
-    momentum_decay: float,
-    base_lr: float,
-    token_lr: float,
-    current_update_weight: float,
-) -> Tuple[MatrixNetwork, MatrixNetworkOptimizer, int, Dict[str, Any]]:
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    model = MatrixNetwork(n=int(ckpt["n"]), vocab=ckpt["vocab"], device=device)
-    model.load_state_dict(ckpt["model_state"])
-    model.reset_state()
-    optimizer = MatrixNetworkOptimizer(
-        model,
-        momentum_decay=momentum_decay,
-        base_lr=base_lr,
-        token_lr=token_lr,
-        current_update_weight=current_update_weight,
-    )
-    optimizer.load_state_dict(ckpt["optimizer_state"])
-    completed_iters = int(ckpt["completed_iters"])
-    metadata = dict(ckpt["metadata"])
-    return model, optimizer, completed_iters, metadata
 
 
 @torch.no_grad()
