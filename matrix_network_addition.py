@@ -154,7 +154,10 @@ def run_training(
     print(f"device={device}")
 
     if args.load_path:
-        model, optimizer_state, loaded_meta = load_checkpoint(args.load_path, device)
+        ckpt = load_checkpoint(args.load_path, device)
+        model = MatrixNetwork(n=int(ckpt["n"]), vocab=ckpt["vocab"], device=device)
+        model.load_state_dict(ckpt["model_state"])
+        model.reset_state()
         optimizer = MatrixNetworkOptimizer(
             model,
             momentum_decay=args.momentum_decay,
@@ -162,10 +165,11 @@ def run_training(
             token_lr=args.token_learning_rate,
             current_update_weight=args.current_update_weight,
         )
-        optimizer.load_state_dict(optimizer_state)
+        optimizer.load_state_dict(ckpt["optimizer_state"])
         if model.n != args.n:
             print(f"loaded_n={model.n}; overriding --n={args.n}")
             args.n = model.n
+        loaded_meta = dict(ckpt["metadata"])
         loaded_base = int(loaded_meta.get("number_base", args.number_base))
         if loaded_base != args.number_base:
             print(f"loaded_number_base={loaded_base}; overriding --number-base={args.number_base}")

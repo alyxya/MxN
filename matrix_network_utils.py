@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from matrix_network import MatrixNetwork
     from matrix_network_optimizer import MatrixNetworkOptimizer
 
-OptimizerState = Dict[str, Any]
+Checkpoint = Dict[str, Any]
 
 
 def skew(update_terms: torch.Tensor) -> torch.Tensor:
@@ -62,14 +62,8 @@ def save_checkpoint(
     tmp.replace(save_path)
 
 
-def load_checkpoint(path: str, device: torch.device | str | None) -> Tuple["MatrixNetwork", OptimizerState, Dict[str, Any]]:
-    from matrix_network import MatrixNetwork
-
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    model = MatrixNetwork(n=int(ckpt["n"]), vocab=ckpt["vocab"], device=device)
-    model.load_state_dict(ckpt["model_state"])
-    model.reset_state()
-    return model, ckpt["optimizer_state"], dict(ckpt["metadata"])
+def load_checkpoint(path: str, device: torch.device | str | None) -> Checkpoint:
+    return torch.load(path, map_location=device, weights_only=False)
 
 
 def subspace_summary(label: str, vectors: torch.Tensor) -> str:
