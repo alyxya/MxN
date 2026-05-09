@@ -46,11 +46,7 @@ def load_checkpoint(
 ) -> Tuple[MatrixNetwork, MatrixNetworkOptimizer, int, Dict[str, Any]]:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model = MatrixNetwork(n=int(ckpt["n"]), vocab=ckpt["vocab"], device=device)
-    if "model_state" in ckpt:
-        model.load_state_dict(ckpt["model_state"])
-    else:
-        model.base_mat.copy_(ckpt["base_mat"].to(device))
-        model.token_mats.copy_(ckpt["token_mats"].to(device))
+    model.load_state_dict(ckpt["model_state"])
     model.reset_state()
     optimizer = MatrixNetworkOptimizer(
         model,

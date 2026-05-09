@@ -42,7 +42,6 @@ class MatrixNetworkOptimizer:
 
     def state_dict(self) -> Dict[str, Any]:
         return {
-            "update_format": "outer_product_terms",
             "momentum_decay": self.momentum_decay,
             "base_lr": self.base_lr,
             "token_lr": self.token_lr,
@@ -58,14 +57,13 @@ class MatrixNetworkOptimizer:
         self.base_lr = float(state.get("base_lr", self.base_lr))
         self.token_lr = float(state.get("token_lr", self.token_lr))
         self.current_update_weight = float(state.get("current_update_weight", self.current_update_weight))
-        legacy_skew_momentum = state.get("update_format") != "outer_product_terms"
 
         base_momentum = state.get("base_momentum")
         if isinstance(base_momentum, torch.Tensor):
             loaded = base_momentum.to(self.model.base_mat.device)
-            self.base_momentum.copy_(loaded * 0.5 if legacy_skew_momentum else loaded)
+            self.base_momentum.copy_(loaded)
 
         token_momentum = state.get("token_momentum")
         if isinstance(token_momentum, torch.Tensor):
             loaded = token_momentum.to(self.model.base_mat.device)
-            self.token_momentum.copy_(loaded * 0.5 if legacy_skew_momentum else loaded)
+            self.token_momentum.copy_(loaded)
