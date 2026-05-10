@@ -67,6 +67,7 @@ def apply_batch_update(
     model: MatrixNetwork,
     optimizer: MatrixNetworkOptimizer,
     sequences: Sequence[Sequence[int]],
+    target_starts: Sequence[int],
     target_noise: float,
     update_decay: float,
 ) -> None:
@@ -79,7 +80,7 @@ def apply_batch_update(
         dtype=model.base_mat.dtype,
     )
 
-    for token_ids in sequences:
+    for token_ids, target_start in zip(sequences, target_starts):
         context_ids = token_ids[:-1]
         query_triangle_rows = _query_triangle_rows(model, context_ids)
 
@@ -98,6 +99,7 @@ def apply_batch_update(
         distances = positions.unsqueeze(1) - positions.unsqueeze(0)
         decay = torch.tensor(update_decay, device=model.base_mat.device, dtype=model.base_mat.dtype)
         update_weights = torch.tril(torch.pow(decay, distances.clamp_min(0)))
+        update_weights[:target_start] = 0.0
 
         position_updates = torch.bmm(
             query_triangle_rows.permute(1, 2, 0),
@@ -130,9 +132,9 @@ def train(
     on_checkpoint: Callable[[MatrixNetwork, MatrixNetworkOptimizer, int], None] | None = None,
 ) -> None:
     for it in range(1, iters + 1):
-        sequences, _prompt_lens = sample_batch()
+        sequences, prompt_lens = sample_batch()
         apply_batch_update(
-            model, optimizer, sequences,
+            model, optimizer, sequences, prompt_lens,
             target_noise=target_noise,
             update_decay=update_decay,
         )
