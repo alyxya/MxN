@@ -16,8 +16,10 @@ def skew(update_terms: torch.Tensor) -> torch.Tensor:
     return update_terms - update_terms.transpose(-1, -2)
 
 
-def newton_schulz_orthogonalize_step(x: torch.Tensor) -> torch.Tensor:
-    return 1.5 * x - 0.5 * (x @ x.transpose(-1, -2) @ x)
+def newton_schulz_orthogonalize(x: torch.Tensor, *, steps: int = 1) -> torch.Tensor:
+    for _ in range(max(steps, 0)):
+        x = 1.5 * x - 0.5 * (x @ x.transpose(-1, -2) @ x)
+    return x
 
 
 def exp_rotation(generator: torch.Tensor, lr: float, max_step_norm: float = 0.001) -> torch.Tensor:
