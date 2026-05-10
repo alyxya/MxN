@@ -63,39 +63,18 @@ def _target_triangle_rows(
 
 
 @torch.no_grad()
-def _token_update_terms(
-    model: MatrixNetwork,
-    context_ids: Sequence[int],
+def _matrix_update_terms(
+    token_ids: torch.Tensor,
     query_triangle_rows: torch.Tensor,
     target_triangle_rows: torch.Tensor,
-) -> torch.Tensor:
-    context_len = len(context_ids)
-    update_terms = torch.zeros_like(model.token_mats)
-    token_positions = torch.arange(context_len, device=model.base_mat.device)
-    offsets = token_positions.unsqueeze(0)
-    target_positions = token_positions.unsqueeze(1) + offsets + 1
-    valid = target_positions <= context_len
-    valid_token_positions, valid_offsets = valid.nonzero(as_tuple=True)
-    valid_target_positions = target_positions[valid]
-    valid_columns = valid_token_positions + 1
-
-    query_rows = torch.zeros(
-        (context_len, context_len, model.n),
-        device=model.base_mat.device,
-        dtype=model.base_mat.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    query_by_matrix = query_triangle_rows.transpose(0, 1)
+    target_by_matrix = target_triangle_rows.transpose(0, 1)
+    position_updates = torch.bmm(
+        query_by_matrix.transpose(1, 2),
+        target_by_matrix,
     )
-    target_rows = torch.zeros_like(query_rows)
-    query_rows[valid_token_positions, valid_offsets] = query_triangle_rows[
-        valid_target_positions, valid_columns
-    ]
-    target_rows[valid_token_positions, valid_offsets] = target_triangle_rows[
-        valid_target_positions, valid_columns
-    ]
-    position_updates = torch.bmm(query_rows.transpose(1, 2), target_rows)
-
-    token_ids = torch.tensor(context_ids, device=model.base_mat.device, dtype=torch.long)
-    update_terms.index_add_(0, token_ids, position_updates)
-    return update_terms
+    return position_updates[0], position_updates[1:]
 
 
 @torch.no_grad()
@@ -110,19 +89,21 @@ def sequence_update_terms(
     context_ids = token_ids[:-1]
     query_triangle_rows = _query_triangle_rows(model, context_ids)
 
-    target_ids = torch.tensor(token_ids, device=model.base_mat.device, dtype=torch.long)
-    targets = model.unembed_vectors[target_ids]
+    token_id_tensor = torch.tensor(token_ids, device=model.base_mat.device, dtype=torch.long)
+    targets = model.unembed_vectors[token_id_tensor]
     if target_noise > 0.0:
         noise = torch.randn_like(targets) / (model.n ** 0.5)
         targets = targets + noise * target_noise
         targets = targets / targets.norm(dim=1, keepdim=True).clamp_min(1e-12)
     target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
 
-    # Base learns target @ base.T -> q @ prefix.
-    base_update_terms.add_(query_triangle_rows[:, 0].T @ target_triangle_rows[:, 0])
-    token_update_terms.add_(
-        _token_update_terms(model, context_ids, query_triangle_rows, target_triangle_rows)
+    base_update, token_updates = _matrix_update_terms(
+        token_id_tensor,
+        query_triangle_rows,
+        target_triangle_rows,
     )
+    base_update_terms.add_(base_update)
+    token_update_terms.index_add_(0, token_id_tensor[:-1], token_updates)
 
     return base_update_terms, token_update_terms
 
