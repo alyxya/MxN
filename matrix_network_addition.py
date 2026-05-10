@@ -224,7 +224,7 @@ def run_training(
         sample_batch=sample_batch,
         iters=args.iters,
         target_noise=args.target_randomize_scale,
-        update_decay=args.update_decay,
+        context_decay=args.context_decay,
         eval_every=args.eval_every,
         evaluate=evaluate_cb,
         checkpoint_every=args.checkpoint_every,
@@ -254,7 +254,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--token-learning-rate", type=float, default=1.0)
     p.add_argument("--base-learning-rate", type=float, default=1.0)
     p.add_argument("--target-randomize-scale", type=float, default=0.0)
-    p.add_argument("--update-decay", type=float, default=1.0)
+    p.add_argument("--context-decay", type=float, default=1.0)
     p.add_argument("--momentum-decay", type=float, default=0.9)
     p.add_argument("--current-update-weight", type=float, default=0.0)
     p.add_argument("--update-orthogonalize-period", type=int, default=100)
