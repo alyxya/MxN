@@ -67,41 +67,27 @@ def sequence_update_terms(
     model: MatrixNetwork,
     token_ids: Sequence[int],
     target_noise: float,
-) -> Tuple[torch.Tensor, torch.Tensor, float, int]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     base_update_terms = torch.zeros_like(model.base_mat)
     token_update_terms = torch.zeros_like(model.token_mats)
-    total = 0
-    target_score_sum = 0.0
+    if not token_ids:
+        return base_update_terms, token_update_terms
 
     context_ids = token_ids[:-1]
     query_rows = _query_triangle_rows(model, context_ids)
     prefix_rows = query_rows[:, 0]
-    states = prefix_rows @ model.base_mat
-    score_rows = states @ model.unembed_vectors.T
-
-    for row, target_id in zip(score_rows, token_ids):
-        total += 1
-        target_score_sum += float(row[target_id].item())
-
-    if not token_ids:
-        return base_update_terms, token_update_terms, target_score_sum, total
 
     target_ids = torch.tensor(token_ids, device=model.base_mat.device)
     targets = model.unembed_vectors[target_ids]
     if target_noise > 0.0:
         targets = targets + torch.randn_like(targets) * target_noise
         targets = targets / targets.norm(dim=1, keepdim=True).clamp_min(1e-12)
-    target_triangle_rows = _target_triangle_rows(
-        model,
-        context_ids,
-        targets,
-    )
+    target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
+
     # Base learns target @ base.T -> q @ prefix.
     base_update_terms.add_(prefix_rows.T @ target_triangle_rows[:, 0])
 
     for token_pos, token_id in enumerate(context_ids):
-        if token_pos + 1 >= len(token_ids):
-            break
         later_rows_for_token = query_rows[token_pos + 1 :, token_pos + 1]
         target_rows_for_token = target_triangle_rows[token_pos + 1 :, token_pos + 1]
         # Each token learns target @ base.T @ earlier.T -> q @ later.
@@ -109,7 +95,7 @@ def sequence_update_terms(
             later_rows_for_token.T @ target_rows_for_token
         )
 
-    return base_update_terms, token_update_terms, target_score_sum, total
+    return base_update_terms, token_update_terms
 
 
 @torch.no_grad()
@@ -118,16 +104,11 @@ def apply_sequence_update(
     optimizer: MatrixNetworkOptimizer,
     token_ids: Sequence[int],
     target_noise: float,
-) -> float:
-    base_update_terms, token_update_terms, target_score_sum, total = (
-        sequence_update_terms(model, token_ids, target_noise)
+) -> None:
+    base_update_terms, token_update_terms = sequence_update_terms(
+        model, token_ids, target_noise
     )
-    if total > 0:
-        base_update_terms = base_update_terms / total
-        token_update_terms = token_update_terms / total
     optimizer.step(base_update_terms, token_update_terms)
-
-    return target_score_sum / max(total, 1)
 
 
 @torch.no_grad()
@@ -136,30 +117,18 @@ def apply_batch_update(
     optimizer: MatrixNetworkOptimizer,
     sequences: Sequence[Sequence[int]],
     target_noise: float,
-) -> float:
+) -> None:
     base_update_terms = torch.zeros_like(model.base_mat)
     token_update_terms = torch.zeros_like(model.token_mats)
-    total = 0
-    target_score_sum = 0.0
 
     for token_ids in sequences:
-        (
-            sequence_base_terms,
-            sequence_token_terms,
-            sequence_target_score_sum,
-            sequence_total,
-        ) = sequence_update_terms(model, token_ids, target_noise)
+        sequence_base_terms, sequence_token_terms = sequence_update_terms(
+            model, token_ids, target_noise
+        )
         base_update_terms.add_(sequence_base_terms)
         token_update_terms.add_(sequence_token_terms)
-        target_score_sum += sequence_target_score_sum
-        total += sequence_total
 
-    if total > 0:
-        base_update_terms = base_update_terms / total
-        token_update_terms = token_update_terms / total
     optimizer.step(base_update_terms, token_update_terms)
-
-    return target_score_sum / max(total, 1)
 
 
 def train(
@@ -177,12 +146,12 @@ def train(
 ) -> None:
     for it in range(1, iters + 1):
         sequences, _prompt_lens = sample_batch()
-        score = apply_batch_update(
+        apply_batch_update(
             model, optimizer, sequences,
             target_noise=target_noise,
         )
         if it == 1 or it % log_every == 0:
-            print(f"iter={it:5d} mean_target_score={score:.4f}")
+            print(f"iter={it:5d}")
         if evaluate is not None and eval_every > 0 and (it % eval_every == 0 or it == iters):
             evaluate(model, it)
         if on_checkpoint is not None and checkpoint_every > 0 and it % checkpoint_every == 0:
