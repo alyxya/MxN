@@ -84,7 +84,7 @@ def sequence_update_terms(
 
     position_updates = torch.bmm(
         query_triangle_rows.permute(1, 2, 0),
-        target_triangle_rows,
+        target_triangle_rows.permute(1, 0, 2),
     )
     base_update_terms.add_(position_updates[0])
     token_update_terms.index_add_(0, token_id_tensor[:-1], position_updates[1:])
