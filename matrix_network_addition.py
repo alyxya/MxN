@@ -50,7 +50,14 @@ def random_problem(rng: random.Random, addend_digits: int, base: int) -> Tuple[s
     return prompt, answer
 
 
-def make_sampler(model: MatrixNetwork, rng: random.Random, batch_size: int, addend_digits: int, base: int):
+def make_sampler(
+    model: MatrixNetwork,
+    rng: random.Random,
+    batch_size: int,
+    addend_digits: int,
+    base: int,
+    train_full_sequence: bool,
+):
     def sample_batch() -> Tuple[List[List[int]], List[int]]:
         sequences: List[List[int]] = []
         prompt_lens: List[int] = []
@@ -59,7 +66,7 @@ def make_sampler(model: MatrixNetwork, rng: random.Random, batch_size: int, adde
             prompt_ids = model.encode(prompt)
             target_ids = model.encode(answer)
             sequences.append(prompt_ids + target_ids)
-            prompt_lens.append(len(prompt_ids))
+            prompt_lens.append(0 if train_full_sequence else len(prompt_ids))
         return sequences, prompt_lens
     return sample_batch
 
@@ -83,7 +90,6 @@ def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, 
     eye = torch.eye(model.n, device=model.base_mat.device, dtype=model.base_mat.dtype)
     exact = stopped = tf_correct = tf_total = 0
     states: List[torch.Tensor] = []
-    targets: List[torch.Tensor] = []
 
     for _ in range(samples):
         prompt, answer = random_problem(rng, addend_digits, base)
@@ -100,8 +106,6 @@ def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, 
         for tid in target_ids:
             state = model.query @ (prefix_op @ model.base_mat)
             states.append(state.detach().cpu())
-            target_vec = model.unembed_vectors[tid]
-            targets.append(target_vec.detach().cpu())
             pred_id = int((model.unembed_vectors @ state).argmax().item())
             tf_correct += int(pred_id == tid)
             tf_total += 1
@@ -113,12 +117,7 @@ def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, 
         f"stop_rate={stopped / max(samples, 1):.3f}"
     )
     if states:
-        print(
-            "  "
-            + subspace_summary("state", torch.stack(states))
-            + " "
-            + subspace_summary("target", torch.stack(targets))
-        )
+        print("  " + subspace_summary("state", torch.stack(states)))
 
 
 def show_samples(model: MatrixNetwork, seed: int, addend_digits: int, base: int, count: int = 10) -> None:
@@ -209,7 +208,14 @@ def run_training(
             on_checkpoint_saved(save_path)
 
     rng = random.Random(args.seed)
-    sample_batch = make_sampler(model, rng, args.batch_size, args.addend_digits, args.number_base)
+    sample_batch = make_sampler(
+        model,
+        rng,
+        args.batch_size,
+        args.addend_digits,
+        args.number_base,
+        args.train_full_sequence,
+    )
 
     def evaluate_cb(_: MatrixNetwork, it: int) -> None:
         evaluate(model, args.eval_samples, args.seed + it, args.addend_digits, args.number_base, it)
@@ -254,6 +260,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--token-learning-rate", type=float, default=1.0)
     p.add_argument("--base-learning-rate", type=float, default=1.0)
     p.add_argument("--target-randomize-scale", type=float, default=0.0)
+    p.add_argument("--train-full-sequence", action="store_true")
     p.add_argument("--recency-decay", type=float, default=1.0)
     p.add_argument("--momentum-decay", type=float, default=0.9)
     p.add_argument("--momentum-weight", type=float, default=1.0)
