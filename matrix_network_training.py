@@ -8,47 +8,33 @@ from matrix_network_optimizer import MatrixNetworkOptimizer
 
 
 @torch.no_grad()
-def _prefix_query_rows(
+def _query_triangle_rows(
     model: MatrixNetwork,
     context_ids: Sequence[int],
-    positions: Sequence[int] | None = None,
 ) -> torch.Tensor:
-    if positions is None:
-        positions = range(len(context_ids) + 1)
-
+    context_len = len(context_ids)
     rows = torch.empty(
-        (len(positions), model.n),
+        (context_len + 1, context_len + 1, model.n),
         device=model.base_mat.device,
         dtype=model.base_mat.dtype,
     )
-    if not positions:
-        return rows
-
-    position_to_row = {pos: i for i, pos in enumerate(positions)}
+    diagonal = torch.arange(context_len + 1, device=model.base_mat.device)
+    rows[diagonal, diagonal] = model.query
     active_rows = torch.empty(
-        (len(positions), model.n),
+        (context_len, model.n),
         device=model.base_mat.device,
         dtype=model.base_mat.dtype,
     )
-    active_positions: List[int] = []
+    ends = torch.arange(context_len, 0, -1, device=model.base_mat.device)
     active_count = 0
 
-    if 0 in position_to_row:
-        rows[position_to_row[0]].copy_(model.query)
-
-    for token_pos in range(len(context_ids) - 1, -1, -1):
-        position = token_pos + 1
-        if position in position_to_row:
-            active_rows[active_count].copy_(model.query)
-            active_positions.append(position)
-            active_count += 1
-        if active_count > 0:
-            active_rows[:active_count] = active_rows[:active_count] @ model.token_mats[
-                context_ids[token_pos]
-            ]
-
-    for row, position in zip(active_rows[:active_count], active_positions):
-        rows[position_to_row[position]].copy_(row)
+    for token_pos in range(context_len - 1, -1, -1):
+        active_rows[active_count].copy_(model.query)
+        active_count += 1
+        active_rows[:active_count] = active_rows[:active_count] @ model.token_mats[
+            context_ids[token_pos]
+        ]
+        rows[ends[:active_count], token_pos] = active_rows[:active_count]
     return rows
 
 
@@ -66,7 +52,8 @@ def sequence_update_terms(
 
     prediction_positions = list(range(prompt_len, len(token_ids)))
     context_ids = token_ids[:-1]
-    prefix_rows = _prefix_query_rows(model, context_ids, prediction_positions)
+    query_rows = _query_triangle_rows(model, context_ids)
+    prefix_rows = query_rows[prediction_positions, 0]
     states = prefix_rows @ model.base_mat
     score_rows = states @ model.unembed_vectors.T
 
@@ -91,7 +78,7 @@ def sequence_update_terms(
     if not mistake_positions:
         return base_update_terms, token_update_terms, target_score_sum, correct, total, mistakes
 
-    mistake_prefix_rows = _prefix_query_rows(model, context_ids, mistake_positions)
+    mistake_prefix_rows = query_rows[mistake_positions, 0]
     targets = torch.stack(target_rows)
     base_target_rows = targets @ model.base_mat.T
     # Base learns target @ base.T -> q @ prefix.
@@ -111,42 +98,13 @@ def sequence_update_terms(
         active_target_rows = active_target_rows[keep] @ model.token_mats[token_id].T
         target_rows_by_token[token_pos] = (active_target_positions, active_target_rows)
 
-    active_later_positions = torch.empty(
-        len(mistake_positions),
-        device=model.base_mat.device,
-        dtype=torch.long,
-    )
-    active_later_rows = torch.empty(
-        (len(mistake_positions), model.n),
-        device=model.base_mat.device,
-        dtype=model.base_mat.dtype,
-    )
-    active_later_count = 0
-    mistake_position_set = set(mistake_positions)
-    for token_pos in range(len(context_ids) - 1, -1, -1):
-        position = token_pos + 1
-        if position in mistake_position_set:
-            active_later_positions[active_later_count] = position
-            active_later_rows[active_later_count].copy_(model.query)
-            active_later_count += 1
-
-        token_targets = target_rows_by_token[token_pos]
+    for token_pos, token_targets in enumerate(target_rows_by_token):
         if token_targets is not None:
             target_positions_for_token, target_rows_for_token = token_targets
-            order = torch.argsort(active_later_positions[:active_later_count])
-            later_positions_for_token = active_later_positions[:active_later_count][order]
-            later_rows_for_token = active_later_rows[:active_later_count][order]
-            if not torch.equal(later_positions_for_token, target_positions_for_token):
-                raise RuntimeError("internal token update position mismatch")
+            later_rows_for_token = query_rows[target_positions_for_token, token_pos + 1]
             # Each token learns target @ base.T @ earlier.T -> q @ later.
             token_update_terms[context_ids[token_pos]].add_(
                 later_rows_for_token.T @ target_rows_for_token
-            )
-
-        if active_later_count > 0:
-            active_later_rows[:active_later_count] = (
-                active_later_rows[:active_later_count]
-                @ model.token_mats[context_ids[token_pos]]
             )
 
     return base_update_terms, token_update_terms, target_score_sum, correct, total, mistakes
