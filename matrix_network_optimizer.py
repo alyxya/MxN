@@ -15,14 +15,14 @@ class MatrixNetworkOptimizer:
         momentum_decay: float,
         base_lr: float,
         token_lr: float,
-        current_update_weight: float = 0.0,
+        momentum_weight: float = 1.0,
         orthogonalize_period: int = 0,
     ):
         self.model = model
         self.momentum_decay = momentum_decay
         self.base_lr = base_lr
         self.token_lr = token_lr
-        self.current_update_weight = current_update_weight
+        self.momentum_weight = momentum_weight
         self.orthogonalize_period = orthogonalize_period
         self.update_count = 0
         self.base_momentum = torch.zeros_like(model.base_mat)
@@ -33,9 +33,9 @@ class MatrixNetworkOptimizer:
         self.base_momentum.mul_(self.momentum_decay).add_(base_update_terms * (1.0 - self.momentum_decay))
         self.token_momentum.mul_(self.momentum_decay).add_(token_update_terms * (1.0 - self.momentum_decay))
 
-        momentum_weight = 1.0 - self.current_update_weight
-        base_update = base_update_terms * self.current_update_weight + self.base_momentum * momentum_weight
-        token_update = token_update_terms * self.current_update_weight + self.token_momentum * momentum_weight
+        current_update_weight = 1.0 - self.momentum_weight
+        base_update = base_update_terms * current_update_weight + self.base_momentum * self.momentum_weight
+        token_update = token_update_terms * current_update_weight + self.token_momentum * self.momentum_weight
         self.model.base_mat.copy_(apply_rotation(self.model.base_mat, base_update, self.base_lr))
         self.model.token_mats.copy_(apply_rotation(self.model.token_mats, token_update, self.token_lr))
         self.update_count += 1

@@ -98,12 +98,12 @@ momentum = momentum_decay * previous_momentum
 The applied update is:
 
 ```text
-applied_update = current_update_weight * current_update
-               + (1 - current_update_weight) * momentum
+applied_update = (1 - momentum_weight) * current_update
+               + momentum_weight * momentum
 ```
 
-`current_update_weight` controls the fraction of the applied update that comes
-directly from the current batch update instead of the momentum update.
+`momentum_weight` controls the fraction of the applied update that comes from
+the momentum update instead of directly from the current batch update.
 
 ## Files
 
@@ -135,4 +135,4 @@ Useful training knobs:
 - `--target-randomize-scale`: adds noise to target vectors during rotation
   update construction.
 - `--momentum-decay`: EMA decay for base/token matrix update momentum.
-- `--current-update-weight`: extra direct weight for the current batch update.
+- `--momentum-weight`: fraction of the applied update from momentum.
