@@ -43,26 +43,23 @@ def _target_triangle_rows(
     model: MatrixNetwork,
     context_ids: Sequence[int],
     targets: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     context_len = len(context_ids)
-    base_rows = targets @ model.base_mat.T
     rows = torch.empty(
-        (len(targets), context_len, model.n),
+        (len(targets), context_len + 1, model.n),
         device=model.base_mat.device,
         dtype=model.base_mat.dtype,
     )
-    if context_len == 0 or len(targets) == 0:
-        return base_rows, rows
-
-    active_rows = base_rows.clone()
+    rows[:, 0] = targets @ model.base_mat.T
+    active_rows = rows[:, 0].clone()
     for token_pos, token_id in enumerate(context_ids):
         if token_pos + 1 >= len(targets):
             break
         active_rows[token_pos + 1 :] = (
             active_rows[token_pos + 1 :] @ model.token_mats[token_id].T
         )
-        rows[token_pos + 1 :, token_pos] = active_rows[token_pos + 1 :]
-    return base_rows, rows
+        rows[token_pos + 1 :, token_pos + 1] = active_rows[token_pos + 1 :]
+    return rows
 
 
 @torch.no_grad()
@@ -94,19 +91,19 @@ def sequence_update_terms(
     if target_noise > 0.0:
         targets = targets + torch.randn_like(targets) * target_noise
         targets = targets / targets.norm(dim=1, keepdim=True).clamp_min(1e-12)
-    base_target_rows, token_target_rows = _target_triangle_rows(
+    target_triangle_rows = _target_triangle_rows(
         model,
         context_ids,
         targets,
     )
     # Base learns target @ base.T -> q @ prefix.
-    base_update_terms.add_(prefix_rows.T @ base_target_rows)
+    base_update_terms.add_(prefix_rows.T @ target_triangle_rows[:, 0])
 
     for token_pos, token_id in enumerate(context_ids):
         if token_pos + 1 >= len(token_ids):
             break
         later_rows_for_token = query_rows[token_pos + 1 :, token_pos + 1]
-        target_rows_for_token = token_target_rows[token_pos + 1 :, token_pos]
+        target_rows_for_token = target_triangle_rows[token_pos + 1 :, token_pos + 1]
         # Each token learns target @ base.T @ earlier.T -> q @ later.
         token_update_terms[token_id].add_(
             later_rows_for_token.T @ target_rows_for_token
