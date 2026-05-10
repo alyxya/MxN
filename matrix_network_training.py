@@ -72,8 +72,7 @@ def sequence_update_terms(
     token_update_terms = torch.zeros_like(model.token_mats)
 
     context_ids = token_ids[:-1]
-    query_rows = _query_triangle_rows(model, context_ids)
-    prefix_rows = query_rows[: len(token_ids), 0]
+    query_triangle_rows = _query_triangle_rows(model, context_ids)
 
     target_ids = torch.tensor(token_ids, device=model.base_mat.device, dtype=torch.long)
     targets = model.unembed_vectors[target_ids]
@@ -84,10 +83,10 @@ def sequence_update_terms(
     target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
 
     # Base learns target @ base.T -> q @ prefix.
-    base_update_terms.add_(prefix_rows.T @ target_triangle_rows[:, 0])
+    base_update_terms.add_(query_triangle_rows[:, 0].T @ target_triangle_rows[:, 0])
 
     for token_pos, token_id in enumerate(context_ids):
-        later_rows_for_token = query_rows[token_pos + 1 :, token_pos + 1]
+        later_rows_for_token = query_triangle_rows[token_pos + 1 :, token_pos + 1]
         target_rows_for_token = target_triangle_rows[token_pos + 1 :, token_pos + 1]
         # Each token learns target @ base.T @ earlier.T -> q @ later.
         token_update_terms[token_id].add_(
