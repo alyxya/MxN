@@ -8,6 +8,167 @@ from matrix_network_optimizer import MatrixNetworkOptimizer
 
 
 @torch.no_grad()
+def _prefix_query_rows(
+    model: MatrixNetwork,
+    context_ids: Sequence[int],
+    positions: Sequence[int],
+) -> torch.Tensor:
+    rows = torch.empty(
+        (len(positions), model.n),
+        device=model.base_mat.device,
+        dtype=model.base_mat.dtype,
+    )
+    if not positions:
+        return rows
+
+    position_to_row = {pos: i for i, pos in enumerate(positions)}
+    active_rows = torch.empty(
+        (len(positions), model.n),
+        device=model.base_mat.device,
+        dtype=model.base_mat.dtype,
+    )
+    active_positions: List[int] = []
+    active_count = 0
+
+    if 0 in position_to_row:
+        rows[position_to_row[0]].copy_(model.query)
+
+    for token_pos in range(len(context_ids) - 1, -1, -1):
+        position = token_pos + 1
+        if position in position_to_row:
+            active_rows[active_count].copy_(model.query)
+            active_positions.append(position)
+            active_count += 1
+        if active_count > 0:
+            active_rows[:active_count] = active_rows[:active_count] @ model.token_mats[
+                context_ids[token_pos]
+            ]
+
+    for row, position in zip(active_rows[:active_count], active_positions):
+        rows[position_to_row[position]].copy_(row)
+    return rows
+
+
+@torch.no_grad()
+def sequence_update_terms(
+    model: MatrixNetwork,
+    token_ids: Sequence[int],
+    prompt_len: int,
+    target_noise: float,
+) -> Tuple[torch.Tensor, torch.Tensor, float, int, int, int]:
+    base_update_terms = torch.zeros_like(model.base_mat)
+    token_update_terms = torch.zeros_like(model.token_mats)
+    correct = total = mistakes = 0
+    target_score_sum = 0.0
+
+    prediction_positions = list(range(prompt_len, len(token_ids)))
+    context_ids = token_ids[:-1]
+    prefix_rows = _prefix_query_rows(model, context_ids, prediction_positions)
+    states = prefix_rows @ model.base_mat
+    score_rows = states @ model.unembed_vectors.T
+
+    mistake_positions: List[int] = []
+    target_rows: List[torch.Tensor] = []
+    for row, pos in zip(score_rows, prediction_positions):
+        target_id = token_ids[pos]
+        total += 1
+        target_score_sum += float(row[target_id].item())
+        if int(row.argmax().item()) == target_id:
+            correct += 1
+            continue
+
+        mistakes += 1
+        mistake_positions.append(pos)
+        target = model.unembed_vectors[target_id]
+        if target_noise > 0.0:
+            target = target + torch.randn_like(target) * target_noise
+            target = target / (target.norm() + 1e-12)
+        target_rows.append(target)
+
+    if not mistake_positions:
+        return base_update_terms, token_update_terms, target_score_sum, correct, total, mistakes
+
+    mistake_prefix_rows = _prefix_query_rows(model, context_ids, mistake_positions)
+    targets = torch.stack(target_rows)
+    base_target_rows = targets @ model.base_mat.T
+    # Base learns target @ base.T -> q @ prefix.
+    base_update_terms.add_(mistake_prefix_rows.T @ base_target_rows)
+
+    target_positions = torch.tensor(mistake_positions, device=model.base_mat.device)
+    active_target_positions = target_positions
+    active_target_rows = base_target_rows
+    target_rows_by_token: List[Tuple[torch.Tensor, torch.Tensor] | None] = [
+        None for _ in context_ids
+    ]
+    for token_pos, token_id in enumerate(context_ids):
+        keep = active_target_positions > token_pos
+        if not bool(keep.any().item()):
+            break
+        active_target_positions = active_target_positions[keep]
+        active_target_rows = active_target_rows[keep] @ model.token_mats[token_id].T
+        target_rows_by_token[token_pos] = (active_target_positions, active_target_rows)
+
+    active_later_positions = torch.empty(
+        len(mistake_positions),
+        device=model.base_mat.device,
+        dtype=torch.long,
+    )
+    active_later_rows = torch.empty(
+        (len(mistake_positions), model.n),
+        device=model.base_mat.device,
+        dtype=model.base_mat.dtype,
+    )
+    active_later_count = 0
+    mistake_position_set = set(mistake_positions)
+    for token_pos in range(len(context_ids) - 1, -1, -1):
+        position = token_pos + 1
+        if position in mistake_position_set:
+            active_later_positions[active_later_count] = position
+            active_later_rows[active_later_count].copy_(model.query)
+            active_later_count += 1
+
+        token_targets = target_rows_by_token[token_pos]
+        if token_targets is not None:
+            target_positions_for_token, target_rows_for_token = token_targets
+            order = torch.argsort(active_later_positions[:active_later_count])
+            later_positions_for_token = active_later_positions[:active_later_count][order]
+            later_rows_for_token = active_later_rows[:active_later_count][order]
+            if not torch.equal(later_positions_for_token, target_positions_for_token):
+                raise RuntimeError("internal token update position mismatch")
+            # Each token learns target @ base.T @ earlier.T -> q @ later.
+            token_update_terms[context_ids[token_pos]].add_(
+                later_rows_for_token.T @ target_rows_for_token
+            )
+
+        if active_later_count > 0:
+            active_later_rows[:active_later_count] = (
+                active_later_rows[:active_later_count]
+                @ model.token_mats[context_ids[token_pos]]
+            )
+
+    return base_update_terms, token_update_terms, target_score_sum, correct, total, mistakes
+
+
+@torch.no_grad()
+def apply_sequence_update(
+    model: MatrixNetwork,
+    optimizer: MatrixNetworkOptimizer,
+    token_ids: Sequence[int],
+    prompt_len: int,
+    target_noise: float,
+) -> Tuple[float, float]:
+    base_update_terms, token_update_terms, target_score_sum, correct, total, mistakes = (
+        sequence_update_terms(model, token_ids, prompt_len, target_noise)
+    )
+    if mistakes > 0:
+        base_update_terms = base_update_terms / mistakes
+        token_update_terms = token_update_terms / mistakes
+    optimizer.step(base_update_terms, token_update_terms)
+
+    return target_score_sum / max(total, 1), correct / max(total, 1)
+
+
+@torch.no_grad()
 def apply_batch_update(
     model: MatrixNetwork,
     optimizer: MatrixNetworkOptimizer,
@@ -19,50 +180,22 @@ def apply_batch_update(
     token_update_terms = torch.zeros_like(model.token_mats)
     correct = total = mistakes = 0
     target_score_sum = 0.0
-    eye = torch.eye(model.n, device=model.base_mat.device, dtype=model.base_mat.dtype)
 
-    for full_ids, prompt_len in zip(sequences, prompt_lens):
-        prefix_op = eye
-        for tid in full_ids[:prompt_len]:
-            prefix_op = model.token_mats[tid] @ prefix_op
-
-        for pos in range(prompt_len, len(full_ids)):
-            target_id = full_ids[pos]
-            state = model.query @ (prefix_op @ model.base_mat)
-            scores = model.unembed_vectors @ state
-
-            total += 1
-            target_score_sum += float(scores[target_id].item())
-            if int(scores.argmax().item()) == target_id:
-                correct += 1
-            else:
-                mistakes += 1
-                target = model.unembed_vectors[target_id]
-                if target_noise > 0.0:
-                    target = target + torch.randn_like(target) * target_noise
-                    target = target / (target.norm() + 1e-12)
-
-                base_query = (model.query @ prefix_op).unsqueeze(1)
-                base_target = (model.base_mat @ target).unsqueeze(1)
-                base_update_terms.add_(base_query @ base_target.T)
-
-                prior_ids = full_ids[:pos]
-                later_ops: List[torch.Tensor] = []
-                later_op = eye
-                for tid in reversed(prior_ids):
-                    later_ops.append(later_op)
-                    later_op = later_op @ model.token_mats[tid]
-                later_ops.reverse()
-
-                earlier_op = eye
-                target_base = model.base_mat @ target
-                for tid, later_op in zip(prior_ids, later_ops):
-                    token_query = (model.query @ later_op).unsqueeze(1)
-                    token_target = (model.token_mats[tid] @ (earlier_op @ target_base)).unsqueeze(1)
-                    token_update_terms[tid].add_(token_query @ token_target.T)
-                    earlier_op = model.token_mats[tid] @ earlier_op
-
-            prefix_op = model.token_mats[target_id] @ prefix_op
+    for token_ids, prompt_len in zip(sequences, prompt_lens):
+        (
+            sequence_base_terms,
+            sequence_token_terms,
+            sequence_target_score_sum,
+            sequence_correct,
+            sequence_total,
+            sequence_mistakes,
+        ) = sequence_update_terms(model, token_ids, prompt_len, target_noise)
+        base_update_terms.add_(sequence_base_terms)
+        token_update_terms.add_(sequence_token_terms)
+        target_score_sum += sequence_target_score_sum
+        correct += sequence_correct
+        total += sequence_total
+        mistakes += sequence_mistakes
 
     if mistakes > 0:
         base_update_terms = base_update_terms / mistakes
