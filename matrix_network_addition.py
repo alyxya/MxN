@@ -223,7 +223,6 @@ def run_training(
         iters=args.iters,
         target_noise=args.target_randomize_scale,
         update_decay=args.update_decay,
-        log_every=args.log_every,
         eval_every=args.eval_every,
         evaluate=evaluate_cb,
         checkpoint_every=args.checkpoint_every,
@@ -257,7 +256,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--momentum-decay", type=float, default=0.9)
     p.add_argument("--current-update-weight", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
     p.add_argument("--checkpoint-every", type=int, default=0)

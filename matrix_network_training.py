@@ -124,7 +124,6 @@ def train(
     iters: int,
     target_noise: float,
     update_decay: float,
-    log_every: int,
     eval_every: int = 0,
     evaluate: Callable[[MatrixNetwork, int], None] | None = None,
     checkpoint_every: int = 0,
@@ -137,8 +136,6 @@ def train(
             target_noise=target_noise,
             update_decay=update_decay,
         )
-        if it == 1 or it % log_every == 0:
-            print(f"iter={it:5d}")
         if evaluate is not None and eval_every > 0 and (it % eval_every == 0 or it == iters):
             evaluate(model, it)
         if on_checkpoint is not None and checkpoint_every > 0 and it % checkpoint_every == 0:
