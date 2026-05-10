@@ -88,22 +88,22 @@ def sequence_update_terms(
     states = prefix_rows @ model.base_mat
     score_rows = states @ model.unembed_vectors.T
 
-    target_rows: List[torch.Tensor] = []
     for row, pos in zip(score_rows, prediction_positions):
         target_id = token_ids[pos]
         total += 1
         target_score_sum += float(row[target_id].item())
 
-        target = model.unembed_vectors[target_id]
-        if target_noise > 0.0:
-            target = target + torch.randn_like(target) * target_noise
-            target = target / (target.norm() + 1e-12)
-        target_rows.append(target)
-
     if not prediction_positions:
         return base_update_terms, token_update_terms, target_score_sum, total
 
-    targets = torch.stack(target_rows)
+    target_ids = torch.tensor(
+        [token_ids[pos] for pos in prediction_positions],
+        device=model.base_mat.device,
+    )
+    targets = model.unembed_vectors[target_ids]
+    if target_noise > 0.0:
+        targets = targets + torch.randn_like(targets) * target_noise
+        targets = targets / targets.norm(dim=1, keepdim=True).clamp_min(1e-12)
     target_positions = torch.tensor(prediction_positions, device=model.base_mat.device)
     base_target_rows, token_target_rows = _target_triangle_rows(
         model,
