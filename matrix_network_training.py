@@ -78,7 +78,8 @@ def sequence_update_terms(
     target_ids = torch.tensor(token_ids, device=model.base_mat.device, dtype=torch.long)
     targets = model.unembed_vectors[target_ids]
     if target_noise > 0.0:
-        targets = targets + torch.randn_like(targets) * target_noise
+        noise = torch.randn_like(targets) / (model.n ** 0.5)
+        targets = targets + noise * target_noise
         targets = targets / targets.norm(dim=1, keepdim=True).clamp_min(1e-12)
     target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
 
