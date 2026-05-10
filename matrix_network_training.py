@@ -68,11 +68,9 @@ def _matrix_update_terms(
     query_triangle_rows: torch.Tensor,
     target_triangle_rows: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    query_by_matrix = query_triangle_rows.transpose(0, 1)
-    target_by_matrix = target_triangle_rows.transpose(0, 1)
     position_updates = torch.bmm(
-        query_by_matrix.transpose(1, 2),
-        target_by_matrix,
+        query_triangle_rows.permute(1, 2, 0),
+        target_triangle_rows.permute(1, 0, 2),
     )
     return position_updates[0], position_updates[1:]
 
