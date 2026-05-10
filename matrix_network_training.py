@@ -11,8 +11,11 @@ from matrix_network_optimizer import MatrixNetworkOptimizer
 def _prefix_query_rows(
     model: MatrixNetwork,
     context_ids: Sequence[int],
-    positions: Sequence[int],
+    positions: Sequence[int] | None = None,
 ) -> torch.Tensor:
+    if positions is None:
+        positions = range(len(context_ids) + 1)
+
     rows = torch.empty(
         (len(positions), model.n),
         device=model.base_mat.device,
