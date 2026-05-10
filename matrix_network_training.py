@@ -68,9 +68,16 @@ def apply_batch_update(
     optimizer: MatrixNetworkOptimizer,
     sequences: Sequence[Sequence[int]],
     target_noise: float,
+    update_decay: float,
 ) -> None:
     base_update_terms = torch.zeros_like(model.base_mat)
     token_update_terms = torch.zeros_like(model.token_mats)
+    base_update_weight = torch.zeros((), device=model.base_mat.device, dtype=model.base_mat.dtype)
+    token_update_weights = torch.zeros(
+        model.vocab_size,
+        device=model.base_mat.device,
+        dtype=model.base_mat.dtype,
+    )
 
     for token_ids in sequences:
         context_ids = token_ids[:-1]
@@ -87,14 +94,25 @@ def apply_batch_update(
             targets = targets + noise * target_noise
             targets = targets / targets.norm(dim=1, keepdim=True).clamp_min(1e-12)
         target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
+        positions = torch.arange(len(token_ids), device=model.base_mat.device)
+        distances = positions.unsqueeze(1) - positions.unsqueeze(0)
+        decay = torch.tensor(update_decay, device=model.base_mat.device, dtype=model.base_mat.dtype)
+        update_weights = torch.tril(torch.pow(decay, distances.clamp_min(0)))
 
         position_updates = torch.bmm(
             query_triangle_rows.permute(1, 2, 0),
-            target_triangle_rows.permute(1, 0, 2),
+            (target_triangle_rows * update_weights.unsqueeze(2)).permute(1, 0, 2),
         )
         base_update_terms.add_(position_updates[0])
         token_update_terms.index_add_(0, token_id_tensor[:-1], position_updates[1:])
+        base_update_weight.add_(update_weights[:, 0].sum())
+        token_update_weights.index_add_(0, token_id_tensor[:-1], update_weights[:, 1:].sum(dim=0))
 
+    base_update_terms.div_(base_update_weight.clamp_min(1e-12))
+    used_tokens = token_update_weights > 0.0
+    token_update_terms[used_tokens] = (
+        token_update_terms[used_tokens] / token_update_weights[used_tokens, None, None]
+    )
     optimizer.step(base_update_terms, token_update_terms)
 
 
@@ -105,6 +123,7 @@ def train(
     sample_batch: Callable[[], Tuple[List[List[int]], List[int]]],
     iters: int,
     target_noise: float,
+    update_decay: float,
     log_every: int,
     eval_every: int = 0,
     evaluate: Callable[[MatrixNetwork, int], None] | None = None,
@@ -116,6 +135,7 @@ def train(
         apply_batch_update(
             model, optimizer, sequences,
             target_noise=target_noise,
+            update_decay=update_decay,
         )
         if it == 1 or it % log_every == 0:
             print(f"iter={it:5d}")
