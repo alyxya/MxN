@@ -63,19 +63,6 @@ def _target_triangle_rows(
 
 
 @torch.no_grad()
-def _matrix_update_terms(
-    token_ids: torch.Tensor,
-    query_triangle_rows: torch.Tensor,
-    target_triangle_rows: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    position_updates = torch.bmm(
-        query_triangle_rows.permute(1, 2, 0),
-        target_triangle_rows.permute(1, 0, 2),
-    )
-    return position_updates[0], position_updates[1:]
-
-
-@torch.no_grad()
 def sequence_update_terms(
     model: MatrixNetwork,
     token_ids: Sequence[int],
@@ -95,13 +82,12 @@ def sequence_update_terms(
         targets = targets / targets.norm(dim=1, keepdim=True).clamp_min(1e-12)
     target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
 
-    base_update, token_updates = _matrix_update_terms(
-        token_id_tensor,
-        query_triangle_rows,
+    position_updates = torch.bmm(
+        query_triangle_rows.permute(1, 2, 0),
         target_triangle_rows,
     )
-    base_update_terms.add_(base_update)
-    token_update_terms.index_add_(0, token_id_tensor[:-1], token_updates)
+    base_update_terms.add_(position_updates[0])
+    token_update_terms.index_add_(0, token_id_tensor[:-1], position_updates[1:])
 
     return base_update_terms, token_update_terms
 
