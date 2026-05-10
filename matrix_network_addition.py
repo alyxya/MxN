@@ -78,7 +78,7 @@ def generate(model: MatrixNetwork, prompt: str, stop: str, max_len: int) -> Tupl
     return "".join(model.decode(t) for t in out), False
 
 
-def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, base: int) -> None:
+def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, base: int, it: int) -> None:
     rng = random.Random(seed)
     eye = torch.eye(model.n, device=model.base_mat.device, dtype=model.base_mat.dtype)
     exact = stopped = tf_correct = tf_total = 0
@@ -108,7 +108,7 @@ def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, 
             prefix_op = model.token_mats[tid] @ prefix_op
 
     print(
-        f"  eval exact_match={exact / max(samples, 1):.3f} "
+        f"  eval_iter={it} exact_match={exact / max(samples, 1):.3f} "
         f"teacher_forced_token_acc={tf_correct / max(tf_total, 1):.3f} "
         f"stop_rate={stopped / max(samples, 1):.3f}"
     )
@@ -210,9 +210,9 @@ def run_training(
     sample_batch = make_sampler(model, rng, args.batch_size, args.addend_digits, args.number_base)
 
     def evaluate_cb(_: MatrixNetwork, it: int) -> None:
-        evaluate(model, args.eval_samples, args.seed + it, args.addend_digits, args.number_base)
+        evaluate(model, args.eval_samples, args.seed + it, args.addend_digits, args.number_base, it)
 
-    def checkpoint_cb(it: int, _model: MatrixNetwork, _opt: MatrixNetworkOptimizer) -> None:
+    def checkpoint_cb(_model: MatrixNetwork, _opt: MatrixNetworkOptimizer, it: int) -> None:
         save(it)
         print(f"checkpoint_iter={it} save_path={save_path}")
 

@@ -127,7 +127,7 @@ def train(
     eval_every: int = 0,
     evaluate: Callable[[MatrixNetwork, int], None] | None = None,
     checkpoint_every: int = 0,
-    on_checkpoint: Callable[[int, MatrixNetwork, MatrixNetworkOptimizer], None] | None = None,
+    on_checkpoint: Callable[[MatrixNetwork, MatrixNetworkOptimizer, int], None] | None = None,
 ) -> None:
     for it in range(1, iters + 1):
         sequences, _prompt_lens = sample_batch()
@@ -139,4 +139,4 @@ def train(
         if evaluate is not None and eval_every > 0 and (it % eval_every == 0 or it == iters):
             evaluate(model, it)
         if on_checkpoint is not None and checkpoint_every > 0 and it % checkpoint_every == 0:
-            on_checkpoint(it, model, optimizer)
+            on_checkpoint(model, optimizer, it)
