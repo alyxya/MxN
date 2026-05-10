@@ -70,14 +70,12 @@ def sequence_update_terms(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     base_update_terms = torch.zeros_like(model.base_mat)
     token_update_terms = torch.zeros_like(model.token_mats)
-    if not token_ids:
-        return base_update_terms, token_update_terms
 
     context_ids = token_ids[:-1]
     query_rows = _query_triangle_rows(model, context_ids)
-    prefix_rows = query_rows[:, 0]
+    prefix_rows = query_rows[: len(token_ids), 0]
 
-    target_ids = torch.tensor(token_ids, device=model.base_mat.device)
+    target_ids = torch.tensor(token_ids, device=model.base_mat.device, dtype=torch.long)
     targets = model.unembed_vectors[target_ids]
     if target_noise > 0.0:
         targets = targets + torch.randn_like(targets) * target_noise
