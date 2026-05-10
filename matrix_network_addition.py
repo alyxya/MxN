@@ -164,6 +164,7 @@ def run_training(
             base_lr=args.base_learning_rate,
             token_lr=args.token_learning_rate,
             current_update_weight=args.current_update_weight,
+            orthogonalize_period=args.update_orthogonalize_period,
         )
         optimizer.load_state_dict(ckpt["optimizer_state"])
         if model.n != args.n:
@@ -186,6 +187,7 @@ def run_training(
             base_lr=args.base_learning_rate,
             token_lr=args.token_learning_rate,
             current_update_weight=args.current_update_weight,
+            orthogonalize_period=args.update_orthogonalize_period,
         )
 
     save_path = args.save_path or str(default_save_dir / default_save_filename(args))
@@ -255,6 +257,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--update-decay", type=float, default=1.0)
     p.add_argument("--momentum-decay", type=float, default=0.9)
     p.add_argument("--current-update-weight", type=float, default=0.0)
+    p.add_argument("--update-orthogonalize-period", type=int, default=100)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--eval-every", type=int, default=250)
     p.add_argument("--eval-samples", type=int, default=300)
