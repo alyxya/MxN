@@ -69,7 +69,7 @@ def apply_batch_update(
     sequences: Sequence[Sequence[int]],
     target_starts: Sequence[int],
     target_noise: float,
-    context_decay: float,
+    recency_decay: float,
 ) -> None:
     base_update_terms = torch.zeros_like(model.base_mat)
     token_update_terms = torch.zeros_like(model.token_mats)
@@ -97,7 +97,7 @@ def apply_batch_update(
         target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
         positions = torch.arange(len(token_ids), device=model.base_mat.device)
         distances = positions.unsqueeze(1) - positions.unsqueeze(0)
-        decay = torch.tensor(context_decay, device=model.base_mat.device, dtype=model.base_mat.dtype)
+        decay = torch.tensor(recency_decay, device=model.base_mat.device, dtype=model.base_mat.dtype)
         update_weights = torch.tril(torch.pow(decay, distances.clamp_min(0)))
         update_weights[:target_start] = 0.0
 
@@ -125,7 +125,7 @@ def train(
     sample_batch: Callable[[], Tuple[List[List[int]], List[int]]],
     iters: int,
     target_noise: float,
-    context_decay: float,
+    recency_decay: float,
     eval_every: int = 0,
     evaluate: Callable[[MatrixNetwork, int], None] | None = None,
     checkpoint_every: int = 0,
@@ -136,7 +136,7 @@ def train(
         apply_batch_update(
             model, optimizer, sequences, prompt_lens,
             target_noise=target_noise,
-            context_decay=context_decay,
+            recency_decay=recency_decay,
         )
         if evaluate is not None and eval_every > 0 and (it % eval_every == 0 or it == iters):
             evaluate(model, it)
