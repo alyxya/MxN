@@ -68,7 +68,6 @@ def apply_batch_update(
     optimizer: MatrixNetworkOptimizer,
     sequences: Sequence[Sequence[int]],
     target_starts: Sequence[int],
-    target_noise: float,
     recency_decay: float,
 ) -> None:
     base_update_terms = torch.zeros_like(model.base_mat)
@@ -90,10 +89,6 @@ def apply_batch_update(
             dtype=torch.long,
         )
         targets = model.unembed_vectors[token_id_tensor]
-        if target_noise > 0.0:
-            noise = torch.randn_like(targets) / (model.n ** 0.5)
-            targets = targets + noise * target_noise
-            targets = targets / targets.norm(dim=1, keepdim=True).clamp_min(1e-12)
         target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
         positions = torch.arange(len(token_ids), device=model.base_mat.device)
         distances = positions.unsqueeze(1) - positions.unsqueeze(0)
@@ -124,7 +119,6 @@ def train(
     optimizer: MatrixNetworkOptimizer,
     sample_batch: Callable[[], Tuple[List[List[int]], List[int]]],
     iters: int,
-    target_noise: float,
     recency_decay: float,
     eval_every: int = 0,
     evaluate: Callable[[MatrixNetwork, int], None] | None = None,
@@ -135,7 +129,6 @@ def train(
         sequences, prompt_lens = sample_batch()
         apply_batch_update(
             model, optimizer, sequences, prompt_lens,
-            target_noise=target_noise,
             recency_decay=recency_decay,
         )
         if evaluate is not None and eval_every > 0 and (it % eval_every == 0 or it == iters):

@@ -229,7 +229,6 @@ def run_training(
         optimizer=optimizer,
         sample_batch=sample_batch,
         iters=args.iters,
-        target_noise=args.target_randomize_scale,
         recency_decay=args.recency_decay,
         eval_every=args.eval_every,
         evaluate=evaluate_cb,
@@ -259,7 +258,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--token-learning-rate", type=float, default=1.0)
     p.add_argument("--base-learning-rate", type=float, default=1.0)
-    p.add_argument("--target-randomize-scale", type=float, default=0.0)
     p.add_argument("--train-full-sequence", action="store_true")
     p.add_argument("--recency-decay", type=float, default=1.0)
     p.add_argument("--momentum-decay", type=float, default=0.9)

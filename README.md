@@ -58,14 +58,13 @@ Training does not use backpropagation. For each target token position:
 
 1. Build the matrix state for the prefix.
 2. Predict the next token.
-3. If the prediction is wrong, choose the target vector.
-4. Optionally add noise to the target vector.
-5. Build learned rotation update terms that rotate the current state toward
+3. Choose the target vector.
+4. Build learned rotation update terms that rotate the current state toward
    that target.
-6. Accumulate updates for both `base_mat` and all token matrices that appear in
+5. Accumulate updates for both `base_mat` and all token matrices that appear in
    the prefix.
-7. Apply momentum to those learned update terms.
-8. Convert the resulting terms to a skew-symmetric generator, exponentiate it,
+6. Apply momentum to those learned update terms.
+7. Convert the resulting terms to a skew-symmetric generator, exponentiate it,
    and apply the resulting rotation to the matrices.
 
 Each learned update term is:
@@ -132,7 +131,5 @@ python3 matrix_network_addition.py \
 
 Useful training knobs:
 
-- `--target-randomize-scale`: adds noise to target vectors during rotation
-  update construction.
 - `--momentum-decay`: EMA decay for base/token matrix update momentum.
 - `--momentum-weight`: fraction of the applied update from momentum.
