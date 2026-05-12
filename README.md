@@ -133,3 +133,5 @@ Useful training knobs:
 
 - `--momentum-decay`: EMA decay for base/token matrix update momentum.
 - `--momentum-weight`: fraction of the applied update from momentum.
+- `--update-noise-scale`: skew-symmetric optimizer noise scaled relative to the
+  learned skew update RMS.

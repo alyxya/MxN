@@ -37,8 +37,24 @@ def exp_rotation(generator: torch.Tensor, lr: float, max_step_norm: float = 0.00
     return r
 
 
-def apply_rotation(current: torch.Tensor, update_terms: torch.Tensor, lr: float) -> torch.Tensor:
-    return exp_rotation(skew(update_terms), lr) @ current
+def add_generator_noise(generator: torch.Tensor, scale: float) -> torch.Tensor:
+    if scale == 0.0:
+        return generator
+
+    noise = skew(torch.empty_like(generator).normal_())
+    generator_rms = generator.square().mean(dim=(-2, -1), keepdim=True).sqrt()
+    noise_rms = noise.square().mean(dim=(-2, -1), keepdim=True).sqrt().clamp_min(1e-12)
+    return generator + noise * (generator_rms / noise_rms) * scale
+
+
+def apply_rotation(
+    current: torch.Tensor,
+    update_terms: torch.Tensor,
+    lr: float,
+    update_noise_scale: float = 0.0,
+) -> torch.Tensor:
+    generator = add_generator_noise(skew(update_terms), update_noise_scale)
+    return exp_rotation(generator, lr) @ current
 
 
 def save_checkpoint(

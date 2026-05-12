@@ -16,6 +16,7 @@ class MatrixNetworkOptimizer:
         base_lr: float,
         token_lr: float,
         momentum_weight: float = 1.0,
+        update_noise_scale: float = 1.0,
         orthogonalize_period: int = 0,
     ):
         self.model = model
@@ -23,6 +24,7 @@ class MatrixNetworkOptimizer:
         self.base_lr = base_lr
         self.token_lr = token_lr
         self.momentum_weight = momentum_weight
+        self.update_noise_scale = update_noise_scale
         self.orthogonalize_period = orthogonalize_period
         self.update_count = 0
         self.base_momentum = torch.zeros_like(model.base_mat)
@@ -36,8 +38,22 @@ class MatrixNetworkOptimizer:
         current_update_weight = 1.0 - self.momentum_weight
         base_update = base_update_terms * current_update_weight + self.base_momentum * self.momentum_weight
         token_update = token_update_terms * current_update_weight + self.token_momentum * self.momentum_weight
-        self.model.base_mat.copy_(apply_rotation(self.model.base_mat, base_update, self.base_lr))
-        self.model.token_mats.copy_(apply_rotation(self.model.token_mats, token_update, self.token_lr))
+        self.model.base_mat.copy_(
+            apply_rotation(
+                self.model.base_mat,
+                base_update,
+                self.base_lr,
+                self.update_noise_scale,
+            )
+        )
+        self.model.token_mats.copy_(
+            apply_rotation(
+                self.model.token_mats,
+                token_update,
+                self.token_lr,
+                self.update_noise_scale,
+            )
+        )
         self.update_count += 1
         if self.orthogonalize_period > 0 and self.update_count % self.orthogonalize_period == 0:
             self.model.base_mat.copy_(newton_schulz_orthogonalize(self.model.base_mat))
