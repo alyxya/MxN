@@ -72,14 +72,20 @@ def apply_batch_update(
 ) -> None:
     base_update_terms = torch.zeros_like(model.base_mat)
     token_update_terms = torch.zeros_like(model.token_mats)
-    base_update_weight = torch.zeros((), device=model.base_mat.device, dtype=model.base_mat.dtype)
-    token_update_weights = torch.zeros(
-        model.vocab_size,
-        device=model.base_mat.device,
-        dtype=model.base_mat.dtype,
-    )
+    trained_output_count = 0
+    max_contribution_mass = 0.0
 
     for token_ids, target_start in zip(sequences, target_starts):
+        target_count = len(token_ids) - target_start
+        if target_count <= 0:
+            continue
+        trained_output_count += target_count
+        terms = len(token_ids)
+        if recency_decay == 1.0:
+            contribution_mass = float(terms)
+        else:
+            contribution_mass = (1.0 - recency_decay ** terms) / (1.0 - recency_decay)
+        max_contribution_mass = max(max_contribution_mass, contribution_mass)
         context_ids = token_ids[:-1]
         query_triangle_rows = _query_triangle_rows(model, context_ids)
 
@@ -102,14 +108,13 @@ def apply_batch_update(
         )
         base_update_terms.add_(position_updates[0])
         token_update_terms.index_add_(0, token_id_tensor[:-1], position_updates[1:])
-        base_update_weight.add_(update_weights[:, 0].sum())
-        token_update_weights.index_add_(0, token_id_tensor[:-1], update_weights[:, 1:].sum(dim=0))
 
-    base_update_terms.div_(base_update_weight.clamp_min(1e-12))
-    used_tokens = token_update_weights > 0.0
-    token_update_terms[used_tokens] = (
-        token_update_terms[used_tokens] / token_update_weights[used_tokens, None, None]
-    )
+    if trained_output_count == 0:
+        return
+
+    batch_update_scale = 1.0 / (trained_output_count * max_contribution_mass)
+    base_update_terms.mul_(batch_update_scale)
+    token_update_terms.mul_(batch_update_scale)
     optimizer.step(base_update_terms, token_update_terms)
 
 
