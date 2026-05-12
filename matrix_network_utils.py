@@ -41,10 +41,12 @@ def add_generator_noise(generator: torch.Tensor, scale: float) -> torch.Tensor:
     if scale == 0.0:
         return generator
 
-    noise = skew(torch.empty_like(generator).normal_())
-    generator_rms = generator.square().mean(dim=(-2, -1), keepdim=True).sqrt()
-    noise_rms = noise.square().mean(dim=(-2, -1), keepdim=True).sqrt().clamp_min(1e-12)
-    return generator + noise * (generator_rms / noise_rms) * scale
+    n = generator.shape[-1]
+    off_diagonal_count = n * (n - 1)
+    generator_mean_square = generator.square().sum(dim=(-2, -1), keepdim=True) / off_diagonal_count
+    noise_std = (generator_mean_square / 2.0).sqrt() * scale
+    noise = skew(torch.empty_like(generator).normal_() * noise_std)
+    return generator + noise
 
 
 def apply_rotation(
