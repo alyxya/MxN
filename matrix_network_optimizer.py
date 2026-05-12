@@ -19,6 +19,9 @@ class MatrixNetworkOptimizer:
         update_noise_scale: float = 1.0,
         orthogonalize_period: int = 0,
     ):
+        if not 0.0 <= momentum_decay < 1.0:
+            raise ValueError("momentum_decay must be >= 0 and < 1")
+
         self.model = model
         self.momentum_decay = momentum_decay
         self.base_lr = base_lr
