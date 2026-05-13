@@ -95,7 +95,6 @@ def apply_batch_update(
             dtype=torch.long,
         )
         targets = query_triangle_rows[:, 0] @ model.base_mat
-        decode_norm_squared = targets[:, : model.vocab_size].square().sum(dim=1, keepdim=True)
         decode_target_scale = (model.vocab_size / model.n) ** 0.5
         target_one_hot = torch.zeros(
             (len(token_ids), model.vocab_size),
@@ -108,8 +107,7 @@ def apply_batch_update(
         ] = decode_target_scale
         targets = targets.clone()
         targets[:, : model.vocab_size] = target_one_hot
-        target_norm = (1.0 - decode_norm_squared + model.vocab_size / model.n).sqrt()
-        targets.mul_(1.0 / target_norm.clamp_min(1e-12))
+        targets = targets / targets.norm(dim=1, keepdim=True).clamp_min(1e-12)
         target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
         positions = torch.arange(len(token_ids), device=model.base_mat.device)
         distances = positions.unsqueeze(1) - positions.unsqueeze(0)
