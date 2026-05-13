@@ -117,7 +117,17 @@ def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, 
         f"stop_rate={stopped / max(samples, 1):.3f}"
     )
     if states:
-        print("  " + subspace_summary("state", torch.stack(states)))
+        state_rows = torch.stack(states)
+        decode_norms = state_rows[:, : model.vocab_size].norm(dim=1)
+        print(
+            "  "
+            + subspace_summary("state", state_rows)
+            + (
+                f" decode_norm[mean={decode_norms.mean().item():.3f} "
+                f"min={decode_norms.min().item():.3f} "
+                f"max={decode_norms.max().item():.3f}]"
+            )
+        )
 
 
 def show_samples(model: MatrixNetwork, seed: int, addend_digits: int, base: int, count: int = 10) -> None:
