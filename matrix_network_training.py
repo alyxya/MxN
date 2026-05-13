@@ -95,22 +95,21 @@ def apply_batch_update(
             dtype=torch.long,
         )
         targets = query_triangle_rows[:, 0] @ model.base_mat
-        decode_targets = targets[:, : model.vocab_size].clone()
-        decode_norms = decode_targets.norm(dim=1, keepdim=True)
-        decode_norm_floor = (model.vocab_size / model.n) ** 0.5
-        target_decode_norms = decode_norms.clamp_min(decode_norm_floor)
-        decode_delta = -torch.softmax(decode_targets, dim=1)
-        decode_delta[
+        decode_norm_squared = targets[:, : model.vocab_size].square().sum(dim=1, keepdim=True)
+        decode_target_scale = (model.vocab_size / model.n) ** 0.5
+        target_one_hot = torch.zeros(
+            (len(token_ids), model.vocab_size),
+            device=model.base_mat.device,
+            dtype=model.base_mat.dtype,
+        )
+        target_one_hot[
             torch.arange(len(token_ids), device=model.base_mat.device),
             token_id_tensor,
-        ] += 1.0
-        decode_targets.add_(decode_delta)
+        ] = decode_target_scale
         targets = targets.clone()
-        targets[:, : model.vocab_size] = (
-            decode_targets
-            * target_decode_norms
-            / decode_targets.norm(dim=1, keepdim=True).clamp_min(1e-12)
-        )
+        targets[:, : model.vocab_size] = target_one_hot
+        target_norm = (1.0 - decode_norm_squared + model.vocab_size / model.n).sqrt()
+        targets.mul_(1.0 / target_norm.clamp_min(1e-12))
         target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
         positions = torch.arange(len(token_ids), device=model.base_mat.device)
         distances = positions.unsqueeze(1) - positions.unsqueeze(0)
