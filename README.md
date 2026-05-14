@@ -125,8 +125,7 @@ Run a short local addition experiment:
 python3 matrix_network_addition.py \
   --n 32 \
   --addend-digits 3 \
-  --iters 5000 \
-  --batch-size 32
+  --iters 5000
 ```
 
 Useful training knobs:

@@ -21,6 +21,8 @@ class MatrixNetworkOptimizer:
     ):
         if not 0.0 <= momentum_decay < 1.0:
             raise ValueError("momentum_decay must be >= 0 and < 1")
+        if not 0.0 <= momentum_weight <= 1.0:
+            raise ValueError("momentum_weight must be >= 0 and <= 1")
 
         self.model = model
         self.momentum_decay = momentum_decay
@@ -30,17 +32,24 @@ class MatrixNetworkOptimizer:
         self.update_noise_scale = update_noise_scale
         self.orthogonalize_period = orthogonalize_period
         self.update_count = 0
-        self.base_momentum = torch.zeros_like(model.base_mat)
-        self.token_momentum = torch.zeros_like(model.token_mats)
+        self.base_momentum = None
+        self.token_momentum = None
+        if self.momentum_weight > 0.0:
+            self.base_momentum = torch.zeros_like(model.base_mat)
+            self.token_momentum = torch.zeros_like(model.token_mats)
 
     @torch.no_grad()
     def step(self, base_update_terms: torch.Tensor, token_update_terms: torch.Tensor) -> None:
-        self.base_momentum.mul_(self.momentum_decay).add_(base_update_terms * (1.0 - self.momentum_decay))
-        self.token_momentum.mul_(self.momentum_decay).add_(token_update_terms * (1.0 - self.momentum_decay))
+        if self.base_momentum is None or self.token_momentum is None:
+            base_update = base_update_terms
+            token_update = token_update_terms
+        else:
+            self.base_momentum.mul_(self.momentum_decay).add_(base_update_terms * (1.0 - self.momentum_decay))
+            self.token_momentum.mul_(self.momentum_decay).add_(token_update_terms * (1.0 - self.momentum_decay))
 
-        current_update_weight = 1.0 - self.momentum_weight
-        base_update = base_update_terms * current_update_weight + self.base_momentum * self.momentum_weight
-        token_update = token_update_terms * current_update_weight + self.token_momentum * self.momentum_weight
+            current_update_weight = 1.0 - self.momentum_weight
+            base_update = base_update_terms * current_update_weight + self.base_momentum * self.momentum_weight
+            token_update = token_update_terms * current_update_weight + self.token_momentum * self.momentum_weight
         self.model.base_mat.copy_(
             apply_rotation(
                 self.model.base_mat,
@@ -65,12 +74,18 @@ class MatrixNetworkOptimizer:
         self.model.reset_state()
 
     def state_dict(self) -> Dict[str, Any]:
+        if self.base_momentum is None or self.token_momentum is None:
+            return {}
         return {
             "base_momentum": self.base_momentum,
             "token_momentum": self.token_momentum,
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
+        if self.base_momentum is None or self.token_momentum is None:
+            return
+        if not state:
+            return
         base_momentum = state["base_momentum"]
         if not isinstance(base_momentum, torch.Tensor):
             raise TypeError("base_momentum must be a torch.Tensor")
