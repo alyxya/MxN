@@ -63,33 +63,19 @@ def _target_triangle_rows(
 
 
 @torch.no_grad()
-def _target_states_for_tokens(
-    model: MatrixNetwork,
-    states: torch.Tensor,
-    token_ids: torch.Tensor,
-) -> torch.Tensor:
-    targets = states.clone()
-    targets[:, : model.vocab_size] = 0.0
-    targets[
-        torch.arange(len(token_ids), device=states.device),
-        token_ids,
-    ] = (model.vocab_size / model.n) ** 0.5
-    return targets / targets.norm(dim=1, keepdim=True).clamp_min(1e-12)
-
-
-@torch.no_grad()
 def apply_batch_update(
     model: MatrixNetwork,
     optimizer: MatrixNetworkOptimizer,
     sequences: Sequence[Sequence[int]],
     target_starts: Sequence[int],
     recency_decay: float,
-    train_wrong_only: bool = False,
+    correct_margin: float | None = None,
 ) -> None:
     base_update_terms = torch.zeros_like(model.base_mat)
     token_update_terms = torch.zeros_like(model.token_mats)
     trained_output_count = 0
     max_contribution_mass = 0.0
+    has_update = False
 
     for token_ids, target_start in zip(sequences, target_starts):
         target_count = len(token_ids) - target_start
@@ -112,18 +98,30 @@ def apply_batch_update(
         )
         states = query_triangle_rows[:, 0] @ model.base_mat
         train_mask = torch.arange(len(token_ids), device=model.base_mat.device) >= target_start
-        if train_wrong_only:
+        row_scales = torch.ones(
+            len(token_ids),
+            device=model.base_mat.device,
+            dtype=model.base_mat.dtype,
+        )
+        if correct_margin is not None:
             scores = states @ model.unembed_vectors.T
-            train_mask &= scores.argmax(dim=1) != token_id_tensor
+            correct_scores = scores.gather(1, token_id_tensor.unsqueeze(1)).squeeze(1)
+            wrong_scores = scores.clone()
+            wrong_scores.scatter_(1, token_id_tensor.unsqueeze(1), -torch.inf)
+            desired_scores = wrong_scores.max(dim=1).values + correct_margin
+            row_scales = (desired_scores - correct_scores).clamp_min(0.0)
+            train_mask &= row_scales > 0.0
             if not bool(train_mask.any().item()):
                 continue
+        has_update = True
 
-        targets = _target_states_for_tokens(model, states, token_id_tensor)
+        targets = model.unembed_vectors[token_id_tensor]
         target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
         positions = torch.arange(len(token_ids), device=model.base_mat.device)
         distances = positions.unsqueeze(1) - positions.unsqueeze(0)
         decay = torch.tensor(recency_decay, device=model.base_mat.device, dtype=model.base_mat.dtype)
         update_weights = torch.tril(torch.pow(decay, distances.clamp_min(0)))
+        update_weights = update_weights * row_scales.unsqueeze(1)
         update_weights[~train_mask] = 0.0
 
         position_updates = torch.bmm(
@@ -133,7 +131,7 @@ def apply_batch_update(
         base_update_terms.add_(position_updates[0])
         token_update_terms.index_add_(0, token_id_tensor[:-1], position_updates[1:])
 
-    if trained_output_count == 0:
+    if trained_output_count == 0 or not has_update:
         return
 
     batch_update_scale = 1.0 / (trained_output_count * max_contribution_mass)
@@ -149,7 +147,7 @@ def train(
     sample_batch: Callable[[], Tuple[List[List[int]], List[int]]],
     iters: int,
     recency_decay: float,
-    train_wrong_only: bool = False,
+    correct_margin: float | None = None,
     eval_every: int = 0,
     evaluate: Callable[[MatrixNetwork, int], None] | None = None,
     checkpoint_every: int = 0,
@@ -160,7 +158,7 @@ def train(
         apply_batch_update(
             model, optimizer, sequences, prompt_lens,
             recency_decay=recency_decay,
-            train_wrong_only=train_wrong_only,
+            correct_margin=correct_margin,
         )
         if evaluate is not None and eval_every > 0 and (it % eval_every == 0 or it == iters):
             evaluate(model, it)
