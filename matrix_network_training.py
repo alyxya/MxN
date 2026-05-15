@@ -84,6 +84,7 @@ def apply_batch_update(
     sequences: Sequence[Sequence[int]],
     target_starts: Sequence[int],
     recency_decay: float,
+    train_wrong_only: bool = False,
 ) -> None:
     base_update_terms = torch.zeros_like(model.base_mat)
     token_update_terms = torch.zeros_like(model.token_mats)
@@ -91,16 +92,11 @@ def apply_batch_update(
     max_contribution_mass = 0.0
 
     for token_ids, target_start in zip(sequences, target_starts):
-        target_count = len(token_ids) - target_start
-        if target_count <= 0:
-            continue
-        trained_output_count += target_count
         terms = len(token_ids)
         if recency_decay == 1.0:
             contribution_mass = float(terms)
         else:
             contribution_mass = (1.0 - recency_decay ** terms) / (1.0 - recency_decay)
-        max_contribution_mass = max(max_contribution_mass, contribution_mass)
         context_ids = token_ids[:-1]
         query_triangle_rows = _query_triangle_rows(model, context_ids)
 
@@ -110,13 +106,23 @@ def apply_batch_update(
             dtype=torch.long,
         )
         states = query_triangle_rows[:, 0] @ model.base_mat
+        train_mask = torch.arange(len(token_ids), device=model.base_mat.device) >= target_start
+        if train_wrong_only:
+            scores = states @ model.unembed_vectors.T
+            train_mask &= scores.argmax(dim=1) != token_id_tensor
+        target_count = int(train_mask.sum().item())
+        if target_count <= 0:
+            continue
+        trained_output_count += target_count
+        max_contribution_mass = max(max_contribution_mass, contribution_mass)
+
         targets = _target_states_for_tokens(model, states, token_id_tensor)
         target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
         positions = torch.arange(len(token_ids), device=model.base_mat.device)
         distances = positions.unsqueeze(1) - positions.unsqueeze(0)
         decay = torch.tensor(recency_decay, device=model.base_mat.device, dtype=model.base_mat.dtype)
         update_weights = torch.tril(torch.pow(decay, distances.clamp_min(0)))
-        update_weights[:target_start] = 0.0
+        update_weights[~train_mask] = 0.0
 
         position_updates = torch.bmm(
             query_triangle_rows.permute(1, 2, 0),
@@ -141,6 +147,7 @@ def train(
     sample_batch: Callable[[], Tuple[List[List[int]], List[int]]],
     iters: int,
     recency_decay: float,
+    train_wrong_only: bool = False,
     eval_every: int = 0,
     evaluate: Callable[[MatrixNetwork, int], None] | None = None,
     checkpoint_every: int = 0,
@@ -151,6 +158,7 @@ def train(
         apply_batch_update(
             model, optimizer, sequences, prompt_lens,
             recency_decay=recency_decay,
+            train_wrong_only=train_wrong_only,
         )
         if evaluate is not None and eval_every > 0 and (it % eval_every == 0 or it == iters):
             evaluate(model, it)
