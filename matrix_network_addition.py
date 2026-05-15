@@ -137,10 +137,6 @@ def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, 
     margins: List[float] = []
     wrong_gaps: List[float] = []
     nlls: List[float] = []
-    correct_target_distances: List[float] = []
-    wrong_target_distances: List[float] = []
-    correct_rotation_angles: List[float] = []
-    wrong_rotation_angles: List[float] = []
 
     for _ in range(samples):
         prompt, answer = random_problem(rng, addend_digits, base)
@@ -167,38 +163,13 @@ def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, 
             wrong_gaps.append(float(torch.clamp(-margin, min=0.0).item()))
             nlls.append(float((-torch.log_softmax(scores, dim=0)[tid]).item()))
             pred_id = int(scores.argmax().item())
-            is_correct = pred_id == tid
-            tf_correct += int(is_correct)
+            tf_correct += int(pred_id == tid)
             tf_total += 1
-            target = state.clone()
-            target[: model.vocab_size] = 0.0
-            target[tid] = (model.vocab_size / model.n) ** 0.5
-            target = target / target.norm().clamp_min(1e-12)
-            target_distance = float((target - state).norm().item())
-            rotation_angle = float(torch.acos((target @ state).clamp(-1.0, 1.0)).item())
-            if is_correct:
-                correct_target_distances.append(target_distance)
-                correct_rotation_angles.append(rotation_angle)
-            else:
-                wrong_target_distances.append(target_distance)
-                wrong_rotation_angles.append(rotation_angle)
             prefix_op = model.token_mats[tid] @ prefix_op
 
     margin_rows = torch.tensor(margins) if margins else torch.tensor([0.0])
     wrong_gap_rows = torch.tensor(wrong_gaps) if wrong_gaps else torch.tensor([0.0])
     nll_rows = torch.tensor(nlls) if nlls else torch.tensor([0.0])
-    correct_distance_rows = (
-        torch.tensor(correct_target_distances) if correct_target_distances else torch.tensor([0.0])
-    )
-    wrong_distance_rows = (
-        torch.tensor(wrong_target_distances) if wrong_target_distances else torch.tensor([0.0])
-    )
-    correct_angle_rows = (
-        torch.tensor(correct_rotation_angles) if correct_rotation_angles else torch.tensor([0.0])
-    )
-    wrong_angle_rows = (
-        torch.tensor(wrong_rotation_angles) if wrong_rotation_angles else torch.tensor([0.0])
-    )
     print(
         f"  eval_iter={it} exact_match={exact / max(samples, 1):.3f} "
         f"teacher_forced_token_acc={tf_correct / max(tf_total, 1):.3f} "
@@ -219,12 +190,6 @@ def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, 
                 f"max={decode_norms.max().item():.3f}]"
             )
         )
-    print(
-        f"  target_delta[correct={correct_distance_rows.mean().item():.3f} "
-        f"wrong={wrong_distance_rows.mean().item():.3f}] "
-        f"target_angle[correct={correct_angle_rows.mean().item():.3f} "
-        f"wrong={wrong_angle_rows.mean().item():.3f}]"
-    )
 
 
 def show_samples(model: MatrixNetwork, seed: int, addend_digits: int, base: int, count: int = 10) -> None:
