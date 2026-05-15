@@ -134,6 +134,9 @@ def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, 
     eye = torch.eye(model.n, device=model.base_mat.device, dtype=model.base_mat.dtype)
     exact = stopped = tf_correct = tf_total = 0
     states: List[torch.Tensor] = []
+    margins: List[float] = []
+    wrong_gaps: List[float] = []
+    nlls: List[float] = []
 
     for _ in range(samples):
         prompt, answer = random_problem(rng, addend_digits, base)
@@ -150,15 +153,30 @@ def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, 
         for tid in target_ids:
             state = model.query @ (prefix_op @ model.base_mat)
             states.append(state.detach().cpu())
-            pred_id = int((model.unembed_vectors @ state).argmax().item())
+            scores = model.unembed_vectors @ state
+            correct_score = scores[tid]
+            wrong_scores = scores.clone()
+            wrong_scores[tid] = -torch.inf
+            best_wrong_score = wrong_scores.max()
+            margin = correct_score - best_wrong_score
+            margins.append(float(margin.item()))
+            wrong_gaps.append(float(torch.clamp(-margin, min=0.0).item()))
+            nlls.append(float((-torch.log_softmax(scores, dim=0)[tid]).item()))
+            pred_id = int(scores.argmax().item())
             tf_correct += int(pred_id == tid)
             tf_total += 1
             prefix_op = model.token_mats[tid] @ prefix_op
 
+    margin_rows = torch.tensor(margins) if margins else torch.tensor([0.0])
+    wrong_gap_rows = torch.tensor(wrong_gaps) if wrong_gaps else torch.tensor([0.0])
+    nll_rows = torch.tensor(nlls) if nlls else torch.tensor([0.0])
     print(
         f"  eval_iter={it} exact_match={exact / max(samples, 1):.3f} "
         f"teacher_forced_token_acc={tf_correct / max(tf_total, 1):.3f} "
-        f"stop_rate={stopped / max(samples, 1):.3f}"
+        f"stop_rate={stopped / max(samples, 1):.3f} "
+        f"score_nll={nll_rows.mean().item():.3f} "
+        f"wrong_gap={wrong_gap_rows.mean().item():.3f} "
+        f"margin[mean={margin_rows.mean().item():.3f} min={margin_rows.min().item():.3f}]"
     )
     if states:
         state_rows = torch.stack(states)
