@@ -134,3 +134,6 @@ Useful training knobs:
 - `--momentum-weight`: fraction of the applied update from momentum.
 - `--update-noise-scale`: skew-symmetric optimizer noise scaled relative to the
   learned skew update RMS.
+- `--curriculum-every`: groups training into N-batch curriculum blocks; each
+  block samples one digit position plus left/right digits and fixes those for
+  every example in the block. `0` disables this curriculum.
