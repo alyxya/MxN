@@ -16,7 +16,7 @@ class MatrixNetworkOptimizer:
         base_lr: float,
         token_lr: float,
         momentum_weight: float = 1.0,
-        update_noise_scale: float = 1.0,
+        update_noise_scale: float = 0.0,
         orthogonalize_period: int = 0,
     ):
         if not 0.0 <= momentum_decay < 1.0:
