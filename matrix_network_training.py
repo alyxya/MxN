@@ -92,11 +92,16 @@ def apply_batch_update(
     max_contribution_mass = 0.0
 
     for token_ids, target_start in zip(sequences, target_starts):
+        target_count = len(token_ids) - target_start
+        if target_count <= 0:
+            continue
+        trained_output_count += target_count
         terms = len(token_ids)
         if recency_decay == 1.0:
             contribution_mass = float(terms)
         else:
             contribution_mass = (1.0 - recency_decay ** terms) / (1.0 - recency_decay)
+        max_contribution_mass = max(max_contribution_mass, contribution_mass)
         context_ids = token_ids[:-1]
         query_triangle_rows = _query_triangle_rows(model, context_ids)
 
@@ -110,11 +115,8 @@ def apply_batch_update(
         if train_wrong_only:
             scores = states @ model.unembed_vectors.T
             train_mask &= scores.argmax(dim=1) != token_id_tensor
-        target_count = int(train_mask.sum().item())
-        if target_count <= 0:
-            continue
-        trained_output_count += target_count
-        max_contribution_mass = max(max_contribution_mass, contribution_mass)
+            if not bool(train_mask.any().item()):
+                continue
 
         targets = _target_states_for_tokens(model, states, token_id_tensor)
         target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
