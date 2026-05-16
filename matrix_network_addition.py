@@ -262,6 +262,8 @@ def run_training(
         raise ValueError("--curriculum-every must be >= 0")
     if args.correct_margin is not None and args.correct_margin < 0.0:
         raise ValueError("--correct-margin must be >= 0")
+    if not 0.0 <= args.decode_norm_pressure <= 1.0:
+        raise ValueError("--decode-norm-pressure must be between 0 and 1")
 
     def save(it: int) -> None:
         save_checkpoint(model, optimizer, save_path, metadata=metadata)
@@ -293,7 +295,7 @@ def run_training(
         iters=args.iters,
         recency_decay=args.recency_decay,
         correct_margin=args.correct_margin,
-        preserve_decode_norm=args.preserve_decode_norm,
+        decode_norm_pressure=args.decode_norm_pressure,
         eval_every=args.eval_every,
         evaluate=evaluate_cb,
         checkpoint_every=args.checkpoint_every,
@@ -324,7 +326,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base-learning-rate", type=float, default=0.1)
     p.add_argument("--train-full-sequence", action="store_true")
     p.add_argument("--correct-margin", type=float, default=None)
-    p.add_argument("--preserve-decode-norm", action="store_true")
+    p.add_argument("--decode-norm-pressure", type=float, default=1.0)
     p.add_argument("--curriculum-every", type=int, default=0)
     p.add_argument("--recency-decay", type=float, default=1.0)
     p.add_argument("--momentum-decay", type=float, default=0.0)

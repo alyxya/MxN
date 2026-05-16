@@ -137,8 +137,8 @@ Useful training knobs:
 - `--correct-margin`: train only targets below this decode-score margin, adding
   the missing margin to the correct decode dimension before target normalization.
   Omit it to train every target.
-- `--preserve-decode-norm`: keep each target state's current decode norm instead
-  of forcing the decode slice to `sqrt(vocab_size / n)`.
+- `--decode-norm-pressure`: target decode norm interpolation. `0` preserves
+  each state's current decode norm; `1` forces `sqrt(vocab_size / n)`.
 - `--curriculum-every`: groups training into N-batch curriculum blocks; each
   block samples one digit position plus left/right digits and fixes those for
   every example in the block. `0` disables this curriculum.
