@@ -72,17 +72,21 @@ def _target_states(
     states: torch.Tensor,
     token_ids: torch.Tensor,
     correct_margin: float | None,
+    preserve_decode_norm: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     train_mask = torch.ones(len(token_ids), device=states.device, dtype=torch.bool)
     targets = states.clone()
     decode_scale = (model.vocab_size / model.n) ** 0.5
+    decode_norms = targets[:, : model.vocab_size].norm(dim=1, keepdim=True)
 
     if correct_margin is None:
         targets[:, : model.vocab_size] = 0.0
         targets[
             torch.arange(len(token_ids), device=states.device),
             token_ids,
-        ] = decode_scale
+        ] = decode_norms[:, 0] if preserve_decode_norm else decode_scale
+        if preserve_decode_norm:
+            return targets, train_mask
         return _normalize_rows(targets), train_mask
 
     scores = states @ model.unembed_vectors.T
@@ -97,6 +101,9 @@ def _target_states(
         torch.arange(len(token_ids), device=states.device),
         token_ids,
     ] += missing_margin
+    if preserve_decode_norm:
+        targets[:, : model.vocab_size] = _normalize_rows(decode_dims) * decode_norms
+        return targets, train_mask
     targets[:, : model.vocab_size] = _normalize_rows(decode_dims) * decode_scale
     return _normalize_rows(targets), train_mask
 
@@ -109,6 +116,7 @@ def apply_batch_update(
     target_starts: Sequence[int],
     recency_decay: float,
     correct_margin: float | None = None,
+    preserve_decode_norm: bool = False,
 ) -> None:
     base_update_terms = torch.zeros_like(model.base_mat)
     token_update_terms = torch.zeros_like(model.token_mats)
@@ -142,6 +150,7 @@ def apply_batch_update(
             states,
             token_id_tensor,
             correct_margin,
+            preserve_decode_norm,
         )
         train_mask &= target_mask
         if not bool(train_mask.any().item()):
@@ -179,6 +188,7 @@ def train(
     iters: int,
     recency_decay: float,
     correct_margin: float | None = None,
+    preserve_decode_norm: bool = False,
     eval_every: int = 0,
     evaluate: Callable[[MatrixNetwork, int], None] | None = None,
     checkpoint_every: int = 0,
@@ -190,6 +200,7 @@ def train(
             model, optimizer, sequences, prompt_lens,
             recency_decay=recency_decay,
             correct_margin=correct_margin,
+            preserve_decode_norm=preserve_decode_norm,
         )
         if evaluate is not None and eval_every > 0 and (it % eval_every == 0 or it == iters):
             evaluate(model, it)
