@@ -50,27 +50,6 @@ def random_problem(rng: random.Random, addend_digits: int, base: int) -> Tuple[s
     return prompt, answer
 
 
-def random_problem_with_digits(
-    rng: random.Random,
-    addend_digits: int,
-    base: int,
-    *,
-    place: int,
-    left_digit: int,
-    right_digit: int,
-) -> Tuple[str, str]:
-    a_digits = [rng.randrange(base) for _ in range(addend_digits)]
-    b_digits = [rng.randrange(base) for _ in range(addend_digits)]
-    digit_index = addend_digits - place - 1
-    a_digits[digit_index] = left_digit
-    b_digits[digit_index] = right_digit
-    a = sum(digit * (base ** pos) for pos, digit in enumerate(reversed(a_digits)))
-    b = sum(digit * (base ** pos) for pos, digit in enumerate(reversed(b_digits)))
-    prompt = f"{format_in_base(a, base, addend_digits)}{PLUS}{format_in_base(b, base, addend_digits)}{EQUALS}"
-    answer = format_in_base(a + b, base) + EOS
-    return prompt, answer
-
-
 def make_sampler(
     model: MatrixNetwork,
     rng: random.Random,
@@ -78,35 +57,12 @@ def make_sampler(
     addend_digits: int,
     base: int,
     train_full_sequence: bool,
-    curriculum_every: int,
 ):
-    batch_count = 0
-    curriculum_place = 0
-    curriculum_left_digit = 0
-    curriculum_right_digit = 0
-
     def sample_batch() -> Tuple[List[List[int]], List[int]]:
-        nonlocal batch_count, curriculum_place, curriculum_left_digit, curriculum_right_digit
-        use_curriculum = curriculum_every > 0
-        if use_curriculum and batch_count % curriculum_every == 0:
-            curriculum_place = rng.randrange(addend_digits)
-            curriculum_left_digit = rng.randrange(base)
-            curriculum_right_digit = rng.randrange(base)
-        batch_count += 1
         sequences: List[List[int]] = []
         prompt_lens: List[int] = []
         for _ in range(batch_size):
-            if use_curriculum:
-                prompt, answer = random_problem_with_digits(
-                    rng,
-                    addend_digits,
-                    base,
-                    place=curriculum_place,
-                    left_digit=curriculum_left_digit,
-                    right_digit=curriculum_right_digit,
-                )
-            else:
-                prompt, answer = random_problem(rng, addend_digits, base)
+            prompt, answer = random_problem(rng, addend_digits, base)
             prompt_ids = model.encode(prompt)
             target_ids = model.encode(answer)
             sequences.append(prompt_ids + target_ids)
@@ -258,8 +214,6 @@ def run_training(
         "number_base": int(args.number_base),
         "addend_digits": int(args.addend_digits),
     }
-    if args.curriculum_every < 0:
-        raise ValueError("--curriculum-every must be >= 0")
     if args.correct_margin is not None and args.correct_margin < 0.0:
         raise ValueError("--correct-margin must be >= 0")
 
@@ -276,7 +230,6 @@ def run_training(
         args.addend_digits,
         args.number_base,
         args.train_full_sequence,
-        args.curriculum_every,
     )
 
     def evaluate_cb(_: MatrixNetwork, it: int) -> None:
@@ -323,7 +276,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base-learning-rate", type=float, default=0.1)
     p.add_argument("--train-full-sequence", action="store_true")
     p.add_argument("--correct-margin", type=float, default=None)
-    p.add_argument("--curriculum-every", type=int, default=0)
     p.add_argument("--recency-decay", type=float, default=1.0)
     p.add_argument("--momentum-decay", type=float, default=0.0)
     p.add_argument("--momentum-weight", type=float, default=0.0)

@@ -136,6 +136,3 @@ Useful training knobs:
   learned skew update RMS.
 - `--correct-margin`: train only targets below this decode-score margin, scaling
   each one-hot target update by the missing margin. Omit it to train every target.
-- `--curriculum-every`: groups training into N-batch curriculum blocks; each
-  block samples one digit position plus left/right digits and fixes those for
-  every example in the block. `0` disables this curriculum.
