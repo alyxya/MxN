@@ -134,11 +134,8 @@ Useful training knobs:
 - `--momentum-weight`: fraction of the applied update from momentum.
 - `--update-noise-scale`: skew-symmetric optimizer noise scaled relative to the
   learned skew update RMS.
-- `--correct-margin`: train only targets below this decode-score margin, adding
-  the missing margin to the correct decode dimension before target normalization.
-  Omit it to train every target.
-- `--decode-norm-pressure`: target decode norm interpolation. `0` preserves
-  each state's current decode norm; `1` forces `sqrt(vocab_size / n)`.
+- `--correct-margin`: train only targets below this decode-score margin, scaling
+  each one-hot target update by the missing margin. Omit it to train every target.
 - `--curriculum-every`: groups training into N-batch curriculum blocks; each
   block samples one digit position plus left/right digits and fixes those for
   every example in the block. `0` disables this curriculum.
