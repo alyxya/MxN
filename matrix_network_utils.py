@@ -22,31 +22,29 @@ def newton_schulz_orthogonalize(x: torch.Tensor, *, steps: int = 1) -> torch.Ten
     return x
 
 
-def exp_rotation(generator: torch.Tensor, lr: float, max_step_norm: float = 0.001) -> torch.Tensor:
-    a = generator * lr
-    norm = torch.linalg.matrix_norm(a, ord="fro", dim=(-2, -1)).max()
+def exp_rotation(generator: torch.Tensor, max_step_norm: float = 0.001) -> torch.Tensor:
+    norm = torch.linalg.matrix_norm(generator, ord="fro", dim=(-2, -1)).max()
     norm_ratio = float((norm / max_step_norm).item())
     squarings = 0 if norm_ratio <= 1.0 else math.ceil(math.log2(norm_ratio))
 
-    eye = torch.eye(a.shape[-1], device=a.device, dtype=a.dtype)
-    while eye.ndim < a.ndim:
+    eye = torch.eye(generator.shape[-1], device=generator.device, dtype=generator.dtype)
+    while eye.ndim < generator.ndim:
         eye = eye.unsqueeze(0)
-    r = eye + a / (2 ** squarings)
+    r = eye + generator / (2 ** squarings)
     for _ in range(squarings):
         r = r @ r
     return r
 
 
-def add_generator_noise(generator: torch.Tensor, scale: float) -> torch.Tensor:
+def generator_noise(generator: torch.Tensor, scale: float) -> torch.Tensor:
     if scale == 0.0:
-        return generator
+        return torch.zeros_like(generator)
 
     n = generator.shape[-1]
     off_diagonal_count = n * (n - 1)
     generator_mean_square = generator.square().sum(dim=(-2, -1), keepdim=True) / off_diagonal_count
     noise_std = (generator_mean_square / 2.0).sqrt() * scale
-    noise = skew(torch.empty_like(generator).normal_() * noise_std)
-    return generator + noise
+    return skew(torch.empty_like(generator).normal_() * noise_std)
 
 
 def apply_rotation(
@@ -55,8 +53,9 @@ def apply_rotation(
     lr: float,
     update_noise_scale: float = 0.0,
 ) -> torch.Tensor:
-    generator = add_generator_noise(skew(update_terms), update_noise_scale)
-    return exp_rotation(generator, lr) @ current
+    learned_generator = skew(update_terms)
+    generator = learned_generator * lr + generator_noise(learned_generator, update_noise_scale)
+    return exp_rotation(generator) @ current
 
 
 def save_checkpoint(
