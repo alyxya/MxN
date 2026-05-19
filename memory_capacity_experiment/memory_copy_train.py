@@ -132,7 +132,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n", type=int, default=64)
     parser.add_argument("--number-base", type=int, default=10)
     parser.add_argument("--copy-digits", type=int, default=10)
-    parser.add_argument("--update-side", choices=["left", "right", "double-query"], default="left")
+    parser.add_argument(
+        "--update-side",
+        choices=["left", "right", "double-query", "double-right"],
+        default="left",
+    )
     parser.add_argument("--iters", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--token-learning-rate", type=float, default=1.0)

@@ -186,24 +186,104 @@ def _right_update_sequence(
             continue
         has_update = True
         target = model.unembed_vectors[target_id]
-
-        full_mat = _right_state_matrix(model, context_ids)
-        base_weight = row_scale * (recency_decay ** target_pos)
-        base_update_terms.add_(base_weight * _row_outer(model.query, target @ full_mat.T))
-
-        left_row = model.query @ model.base_mat
-        for token_pos, token_id in enumerate(context_ids):
-            suffix_mat = torch.eye(model.n, device=model.base_mat.device, dtype=model.base_mat.dtype)
-            suffix_mat = model.token_mats[token_id] @ suffix_mat
-            for later_token_id in context_ids[token_pos + 1 :]:
-                suffix_mat = suffix_mat @ model.token_mats[later_token_id]
-            desired_row = target @ suffix_mat.T
-            distance = target_pos - token_pos
-            weight = row_scale * (recency_decay ** distance)
-            token_update_terms[token_id].add_(weight * _row_outer(left_row, desired_row))
-            left_row = left_row @ model.token_mats[token_id]
+        _add_right_update_terms(
+            model,
+            context_ids,
+            query_row=model.query,
+            target_row=target,
+            row_scale=row_scale,
+            recency_decay=recency_decay,
+            target_pos=target_pos,
+            base_update_terms=base_update_terms,
+            token_update_terms=token_update_terms,
+        )
 
     return base_update_terms, token_update_terms, trained_output_count, max_contribution_mass, has_update
+
+
+@torch.no_grad()
+def _double_right_update_sequence(
+    model: MemoryMatrixNetwork,
+    token_ids: Sequence[int],
+    target_start: int,
+    recency_decay: float,
+    correct_margin: float | None,
+) -> Tuple[torch.Tensor, torch.Tensor, int, float, bool]:
+    base_update_terms = torch.zeros_like(model.base_mat)
+    token_update_terms = torch.zeros_like(model.token_mats)
+    trained_output_count = max(len(token_ids) - target_start, 0)
+    max_contribution_mass = 0.0
+    has_update = False
+
+    for target_pos in range(target_start, len(token_ids)):
+        context_ids = token_ids[:target_pos]
+        target_id = token_ids[target_pos]
+        contribution_mass = _contribution_mass(len(token_ids), recency_decay)
+        max_contribution_mass = max(max_contribution_mass, contribution_mass)
+
+        state_mat = _right_state_matrix(model, context_ids)
+        second_query = state_mat[0]
+        state = second_query @ state_mat
+        row_scale = _row_scale(model, state, target_id, correct_margin)
+        if row_scale <= 0.0:
+            continue
+        has_update = True
+
+        target = model.unembed_vectors[target_id]
+        half_scale = row_scale * 0.5
+        _add_right_update_terms(
+            model,
+            context_ids,
+            query_row=second_query,
+            target_row=target,
+            row_scale=half_scale,
+            recency_decay=recency_decay,
+            target_pos=target_pos,
+            base_update_terms=base_update_terms,
+            token_update_terms=token_update_terms,
+        )
+        _add_right_update_terms(
+            model,
+            context_ids,
+            query_row=model.query,
+            target_row=target @ state_mat.T,
+            row_scale=half_scale,
+            recency_decay=recency_decay,
+            target_pos=target_pos,
+            base_update_terms=base_update_terms,
+            token_update_terms=token_update_terms,
+        )
+
+    return base_update_terms, token_update_terms, trained_output_count, max_contribution_mass, has_update
+
+
+def _add_right_update_terms(
+    model: MemoryMatrixNetwork,
+    context_ids: Sequence[int],
+    *,
+    query_row: torch.Tensor,
+    target_row: torch.Tensor,
+    row_scale: float,
+    recency_decay: float,
+    target_pos: int,
+    base_update_terms: torch.Tensor,
+    token_update_terms: torch.Tensor,
+) -> None:
+    full_mat = _right_state_matrix(model, context_ids)
+    base_weight = row_scale * (recency_decay ** target_pos)
+    base_update_terms.add_(base_weight * _row_outer(query_row, target_row @ full_mat.T))
+
+    left_row = query_row @ model.base_mat
+    for token_pos, token_id in enumerate(context_ids):
+        suffix_mat = torch.eye(model.n, device=model.base_mat.device, dtype=model.base_mat.dtype)
+        suffix_mat = model.token_mats[token_id] @ suffix_mat
+        for later_token_id in context_ids[token_pos + 1 :]:
+            suffix_mat = suffix_mat @ model.token_mats[later_token_id]
+        desired_row = target_row @ suffix_mat.T
+        distance = target_pos - token_pos
+        weight = row_scale * (recency_decay ** distance)
+        token_update_terms[token_id].add_(weight * _row_outer(left_row, desired_row))
+        left_row = left_row @ model.token_mats[token_id]
 
 
 def _row_scale(
@@ -245,6 +325,8 @@ def apply_batch_update(
 
     if model.update_side == "right":
         update_sequence = _right_update_sequence
+    elif model.update_side == "double-right":
+        update_sequence = _double_right_update_sequence
     elif model.update_side == "double-query":
         update_sequence = _double_query_update_sequence
     else:
