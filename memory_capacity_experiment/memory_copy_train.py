@@ -134,7 +134,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--copy-digits", type=int, default=10)
     parser.add_argument(
         "--update-side",
-        choices=["left", "right", "double-query", "double-right"],
+        choices=["left", "right", "double-left", "double-right"],
         default="left",
     )
     parser.add_argument("--iters", type=int, default=5000)

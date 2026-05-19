@@ -14,8 +14,8 @@ class MemoryMatrixNetwork(torch.nn.Module):
         device: torch.device | str | None = None,
     ):
         super().__init__()
-        if update_side not in {"left", "right", "double-query", "double-right"}:
-            raise ValueError("update_side must be 'left', 'right', 'double-query', or 'double-right'")
+        if update_side not in {"left", "right", "double-left", "double-right"}:
+            raise ValueError("update_side must be 'left', 'right', 'double-left', or 'double-right'")
         self.update_side = update_side
         self.vocab = tuple(vocab)
         self.vocab_size = len(self.vocab)
@@ -50,7 +50,7 @@ class MemoryMatrixNetwork(torch.nn.Module):
     def apply_context(self, token_ids: Sequence[int]) -> None:
         with torch.no_grad():
             for token_id in token_ids:
-                if self.update_side in {"left", "double-query"}:
+                if self.update_side in {"left", "double-left"}:
                     self.state_mat.copy_(self.token_mats[token_id] @ self.state_mat)
                 else:
                     self.state_mat.copy_(self.state_mat @ self.token_mats[token_id])
@@ -63,7 +63,7 @@ class MemoryMatrixNetwork(torch.nn.Module):
     def query_state(self) -> torch.Tensor:
         with torch.no_grad():
             state = self.state_mat[0]
-            if self.update_side in {"double-query", "double-right"}:
+            if self.update_side in {"double-left", "double-right"}:
                 state = state @ self.state_mat
             return state
 

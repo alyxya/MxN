@@ -70,7 +70,7 @@ def _left_update_sequence(
 
 
 @torch.no_grad()
-def _double_query_update_sequence(
+def _double_left_update_sequence(
     model: MemoryMatrixNetwork,
     token_ids: Sequence[int],
     target_start: int,
@@ -327,8 +327,8 @@ def apply_batch_update(
         update_sequence = _right_update_sequence
     elif model.update_side == "double-right":
         update_sequence = _double_right_update_sequence
-    elif model.update_side == "double-query":
-        update_sequence = _double_query_update_sequence
+    elif model.update_side == "double-left":
+        update_sequence = _double_left_update_sequence
     else:
         update_sequence = _left_update_sequence
     for token_ids, target_start in zip(sequences, target_starts):
