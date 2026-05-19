@@ -15,11 +15,10 @@ from memory_utils import subspace_summary
 EOS = "~"
 EQUALS = "="
 DIGITS = "0123456789"
-VOCAB = tuple(EOS + DIGITS + EQUALS)
 
 
-def random_copy_problem(rng: random.Random, copy_digits: int) -> Tuple[str, str]:
-    left = "".join(rng.choice(DIGITS) for _ in range(copy_digits))
+def random_copy_problem(rng: random.Random, digits: str, copy_digits: int) -> Tuple[str, str]:
+    left = "".join(rng.choice(digits) for _ in range(copy_digits))
     return left + EQUALS, left + EOS
 
 
@@ -27,13 +26,14 @@ def make_sampler(
     model: MemoryMatrixNetwork,
     rng: random.Random,
     batch_size: int,
+    digits: str,
     copy_digits: int,
 ):
     def sample_batch() -> Tuple[List[List[int]], List[int]]:
         sequences: List[List[int]] = []
         target_starts: List[int] = []
         for _ in range(batch_size):
-            prompt, answer = random_copy_problem(rng, copy_digits)
+            prompt, answer = random_copy_problem(rng, digits, copy_digits)
             prompt_ids = model.encode(prompt)
             target_ids = model.encode(answer)
             sequences.append(prompt_ids + target_ids)
@@ -67,6 +67,7 @@ def evaluate(
     model: MemoryMatrixNetwork,
     samples: int,
     seed: int,
+    digits: str,
     copy_digits: int,
     it: int,
 ) -> None:
@@ -75,7 +76,7 @@ def evaluate(
     states: List[torch.Tensor] = []
 
     for _ in range(samples):
-        prompt, answer = random_copy_problem(rng, copy_digits)
+        prompt, answer = random_copy_problem(rng, digits, copy_digits)
         pred, did_stop = generate(model, prompt, EOS, len(answer) + 1)
         stopped += int(did_stop)
         exact += int(did_stop and pred == answer[:-1])
@@ -109,10 +110,16 @@ def evaluate(
         )
 
 
-def show_samples(model: MemoryMatrixNetwork, seed: int, copy_digits: int, count: int = 10) -> None:
+def show_samples(
+    model: MemoryMatrixNetwork,
+    seed: int,
+    digits: str,
+    copy_digits: int,
+    count: int = 10,
+) -> None:
     rng = random.Random(seed)
     for _ in range(count):
-        prompt, answer = random_copy_problem(rng, copy_digits)
+        prompt, answer = random_copy_problem(rng, digits, copy_digits)
         target = answer[:-1]
         pred, did_stop = generate(model, prompt, EOS, len(answer) + 1)
         ok = "OK" if did_stop and pred == target else "XX"
@@ -123,6 +130,7 @@ def show_samples(model: MemoryMatrixNetwork, seed: int, copy_digits: int, count:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Matrix network memory-copy capacity trainer")
     parser.add_argument("--n", type=int, default=64)
+    parser.add_argument("--number-base", type=int, default=10)
     parser.add_argument("--copy-digits", type=int, default=10)
     parser.add_argument("--update-side", choices=["left", "right", "double-query"], default="left")
     parser.add_argument("--iters", type=int, default=5000)
@@ -145,6 +153,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if not 2 <= args.number_base <= len(DIGITS):
+        raise ValueError(f"--number-base must be between 2 and {len(DIGITS)}")
     if args.correct_margin is not None and args.correct_margin < 0.0:
         raise ValueError("--correct-margin must be >= 0")
 
@@ -153,9 +163,11 @@ def main() -> None:
         torch.cuda.manual_seed_all(args.seed)
 
     device = None if args.device is None else torch.device(args.device)
+    digits = DIGITS[: args.number_base]
+    vocab = tuple(EOS + digits + EQUALS)
     model = MemoryMatrixNetwork(
         n=args.n,
-        vocab=VOCAB,
+        vocab=vocab,
         update_side=args.update_side,
         device=device,
     )
@@ -175,10 +187,10 @@ def main() -> None:
         print(f"{key}={value}")
 
     rng = random.Random(args.seed)
-    sample_batch = make_sampler(model, rng, args.batch_size, args.copy_digits)
+    sample_batch = make_sampler(model, rng, args.batch_size, digits, args.copy_digits)
 
     def evaluate_cb(eval_model: MemoryMatrixNetwork, it: int) -> None:
-        evaluate(eval_model, args.eval_samples, args.seed + it, args.copy_digits, it)
+        evaluate(eval_model, args.eval_samples, args.seed + it, digits, args.copy_digits, it)
 
     train(
         model=model,
@@ -199,6 +211,7 @@ def main() -> None:
                 "n": model.n,
                 "vocab": model.vocab,
                 "update_side": model.update_side,
+                "number_base": args.number_base,
                 "copy_digits": args.copy_digits,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
@@ -208,7 +221,7 @@ def main() -> None:
         print(f"saved_checkpoint={save_path}")
 
     print("\nSample predictions:")
-    show_samples(model, seed=args.seed + 999, copy_digits=args.copy_digits)
+    show_samples(model, seed=args.seed + 999, digits=digits, copy_digits=args.copy_digits)
 
 
 if __name__ == "__main__":
