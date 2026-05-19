@@ -27,6 +27,16 @@ def _right_state_matrix(model: MemoryMatrixNetwork, context_ids: Sequence[int]) 
     return state_mat
 
 
+def _right_suffix_mats(model: MemoryMatrixNetwork, context_ids: Sequence[int]) -> List[torch.Tensor]:
+    suffix_mats: List[torch.Tensor] = []
+    suffix_mat = torch.eye(model.n, device=model.base_mat.device, dtype=model.base_mat.dtype)
+    for token_pos in reversed(range(len(context_ids))):
+        suffix_mat = model.token_mats[context_ids[token_pos]] @ suffix_mat
+        suffix_mats.append(suffix_mat)
+    suffix_mats.reverse()
+    return suffix_mats
+
+
 @torch.no_grad()
 def _left_update_sequence(
     model: MemoryMatrixNetwork,
@@ -180,7 +190,9 @@ def _right_update_sequence(
         contribution_mass = _contribution_mass(len(token_ids), recency_decay)
         max_contribution_mass = max(max_contribution_mass, contribution_mass)
 
-        state = _right_state_matrix(model, context_ids)[0]
+        suffix_mats = _right_suffix_mats(model, context_ids)
+        state_mat = model.base_mat @ suffix_mats[0] if suffix_mats else model.base_mat
+        state = state_mat[0]
         row_scale = _row_scale(model, state, target_id, correct_margin)
         if row_scale <= 0.0:
             continue
@@ -196,6 +208,8 @@ def _right_update_sequence(
             target_pos=target_pos,
             base_update_terms=base_update_terms,
             token_update_terms=token_update_terms,
+            state_mat=state_mat,
+            suffix_mats=suffix_mats,
         )
 
     return base_update_terms, token_update_terms, trained_output_count, max_contribution_mass, has_update
@@ -221,7 +235,8 @@ def _double_right_update_sequence(
         contribution_mass = _contribution_mass(len(token_ids), recency_decay)
         max_contribution_mass = max(max_contribution_mass, contribution_mass)
 
-        state_mat = _right_state_matrix(model, context_ids)
+        suffix_mats = _right_suffix_mats(model, context_ids)
+        state_mat = model.base_mat @ suffix_mats[0] if suffix_mats else model.base_mat
         second_query = state_mat[0]
         state = second_query @ state_mat
         row_scale = _row_scale(model, state, target_id, correct_margin)
@@ -241,6 +256,8 @@ def _double_right_update_sequence(
             target_pos=target_pos,
             base_update_terms=base_update_terms,
             token_update_terms=token_update_terms,
+            state_mat=state_mat,
+            suffix_mats=suffix_mats,
         )
         _add_right_update_terms(
             model,
@@ -252,6 +269,8 @@ def _double_right_update_sequence(
             target_pos=target_pos,
             base_update_terms=base_update_terms,
             token_update_terms=token_update_terms,
+            state_mat=state_mat,
+            suffix_mats=suffix_mats,
         )
 
     return base_update_terms, token_update_terms, trained_output_count, max_contribution_mass, has_update
@@ -268,18 +287,15 @@ def _add_right_update_terms(
     target_pos: int,
     base_update_terms: torch.Tensor,
     token_update_terms: torch.Tensor,
+    state_mat: torch.Tensor,
+    suffix_mats: Sequence[torch.Tensor],
 ) -> None:
-    full_mat = _right_state_matrix(model, context_ids)
     base_weight = row_scale * (recency_decay ** target_pos)
-    base_update_terms.add_(base_weight * _row_outer(query_row, target_row @ full_mat.T))
+    base_update_terms.add_(base_weight * _row_outer(query_row, target_row @ state_mat.T))
 
     left_row = query_row @ model.base_mat
     for token_pos, token_id in enumerate(context_ids):
-        suffix_mat = torch.eye(model.n, device=model.base_mat.device, dtype=model.base_mat.dtype)
-        suffix_mat = model.token_mats[token_id] @ suffix_mat
-        for later_token_id in context_ids[token_pos + 1 :]:
-            suffix_mat = suffix_mat @ model.token_mats[later_token_id]
-        desired_row = target_row @ suffix_mat.T
+        desired_row = target_row @ suffix_mats[token_pos].T
         distance = target_pos - token_pos
         weight = row_scale * (recency_decay ** distance)
         token_update_terms[token_id].add_(weight * _row_outer(left_row, desired_row))
