@@ -35,14 +35,38 @@ def _left_update_sequence(
     recency_decay: float,
     correct_margin: float | None,
 ) -> Tuple[torch.Tensor, torch.Tensor, int, float, bool]:
-    return _left_update_sequence_from_query(
-        model,
-        token_ids,
-        target_start,
-        recency_decay,
-        correct_margin,
-        use_double_query=False,
-    )
+    base_update_terms = torch.zeros_like(model.base_mat)
+    token_update_terms = torch.zeros_like(model.token_mats)
+    trained_output_count = max(len(token_ids) - target_start, 0)
+    max_contribution_mass = 0.0
+    has_update = False
+
+    for target_pos in range(target_start, len(token_ids)):
+        context_ids = token_ids[:target_pos]
+        target_id = token_ids[target_pos]
+        contribution_mass = _contribution_mass(len(token_ids), recency_decay)
+        max_contribution_mass = max(max_contribution_mass, contribution_mass)
+
+        state_mat = _left_state_matrix(model, context_ids)
+        state = state_mat[0]
+        row_scale = _row_scale(model, state, target_id, correct_margin)
+        if row_scale <= 0.0:
+            continue
+        has_update = True
+        target = model.unembed_vectors[target_id]
+        _add_left_update_terms(
+            model,
+            context_ids,
+            query_row=model.query,
+            target_row=target,
+            row_scale=row_scale,
+            recency_decay=recency_decay,
+            target_pos=target_pos,
+            base_update_terms=base_update_terms,
+            token_update_terms=token_update_terms,
+        )
+
+    return base_update_terms, token_update_terms, trained_output_count, max_contribution_mass, has_update
 
 
 @torch.no_grad()
@@ -52,26 +76,6 @@ def _double_query_update_sequence(
     target_start: int,
     recency_decay: float,
     correct_margin: float | None,
-) -> Tuple[torch.Tensor, torch.Tensor, int, float, bool]:
-    return _left_update_sequence_from_query(
-        model,
-        token_ids,
-        target_start,
-        recency_decay,
-        correct_margin,
-        use_double_query=True,
-    )
-
-
-@torch.no_grad()
-def _left_update_sequence_from_query(
-    model: MemoryMatrixNetwork,
-    token_ids: Sequence[int],
-    target_start: int,
-    recency_decay: float,
-    correct_margin: float | None,
-    *,
-    use_double_query: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, int, float, bool]:
     base_update_terms = torch.zeros_like(model.base_mat)
     token_update_terms = torch.zeros_like(model.token_mats)
@@ -86,39 +90,74 @@ def _left_update_sequence_from_query(
         max_contribution_mass = max(max_contribution_mass, contribution_mass)
 
         state_mat = _left_state_matrix(model, context_ids)
-        query_row = state_mat[0] if use_double_query else model.query
-        state = query_row @ state_mat
+        second_query = state_mat[0]
+        state = second_query @ state_mat
         row_scale = _row_scale(model, state, target_id, correct_margin)
         if row_scale <= 0.0:
             continue
         has_update = True
+
         target = model.unembed_vectors[target_id]
-
-        # In double-query mode, the first query output becomes the row query for
-        # this second pass. This update intentionally learns only the second pass.
-        later_input = query_row
-        later_rows: List[torch.Tensor] = []
-        for token_id in reversed(context_ids):
-            later_rows.append(later_input)
-            later_input = later_input @ model.token_mats[token_id]
-        base_input = later_input
-        base_desired = target @ model.base_mat.T
-        base_weight = row_scale * (recency_decay ** target_pos)
-        base_update_terms.add_(base_weight * _row_outer(base_input, base_desired))
-
-        prefix_mat = model.base_mat
-        desired_rows: List[torch.Tensor] = []
-        for token_id in context_ids:
-            prefix_mat = model.token_mats[token_id] @ prefix_mat
-            desired_rows.append(target @ prefix_mat.T)
-
-        for token_pos, token_id in enumerate(context_ids):
-            distance = target_pos - token_pos
-            weight = row_scale * (recency_decay ** distance)
-            input_row = later_rows[len(context_ids) - token_pos - 1]
-            token_update_terms[token_id].add_(weight * _row_outer(input_row, desired_rows[token_pos]))
+        half_scale = row_scale * 0.5
+        _add_left_update_terms(
+            model,
+            context_ids,
+            query_row=second_query,
+            target_row=target,
+            row_scale=half_scale,
+            recency_decay=recency_decay,
+            target_pos=target_pos,
+            base_update_terms=base_update_terms,
+            token_update_terms=token_update_terms,
+        )
+        _add_left_update_terms(
+            model,
+            context_ids,
+            query_row=model.query,
+            target_row=target @ state_mat.T,
+            row_scale=half_scale,
+            recency_decay=recency_decay,
+            target_pos=target_pos,
+            base_update_terms=base_update_terms,
+            token_update_terms=token_update_terms,
+        )
 
     return base_update_terms, token_update_terms, trained_output_count, max_contribution_mass, has_update
+
+
+def _add_left_update_terms(
+    model: MemoryMatrixNetwork,
+    context_ids: Sequence[int],
+    *,
+    query_row: torch.Tensor,
+    target_row: torch.Tensor,
+    row_scale: float,
+    recency_decay: float,
+    target_pos: int,
+    base_update_terms: torch.Tensor,
+    token_update_terms: torch.Tensor,
+) -> None:
+    later_input = query_row
+    later_rows: List[torch.Tensor] = []
+    for token_id in reversed(context_ids):
+        later_rows.append(later_input)
+        later_input = later_input @ model.token_mats[token_id]
+    base_input = later_input
+    base_desired = target_row @ model.base_mat.T
+    base_weight = row_scale * (recency_decay ** target_pos)
+    base_update_terms.add_(base_weight * _row_outer(base_input, base_desired))
+
+    prefix_mat = model.base_mat
+    desired_rows: List[torch.Tensor] = []
+    for token_id in context_ids:
+        prefix_mat = model.token_mats[token_id] @ prefix_mat
+        desired_rows.append(target_row @ prefix_mat.T)
+
+    for token_pos, token_id in enumerate(context_ids):
+        distance = target_pos - token_pos
+        weight = row_scale * (recency_decay ** distance)
+        input_row = later_rows[len(context_ids) - token_pos - 1]
+        token_update_terms[token_id].add_(weight * _row_outer(input_row, desired_rows[token_pos]))
 
 
 @torch.no_grad()
