@@ -17,8 +17,15 @@ EQUALS = "="
 DIGITS = "0123456789"
 
 
-def random_copy_problem(rng: random.Random, digits: str, copy_digits: int) -> Tuple[str, str]:
+def random_copy_problem(
+    rng: random.Random,
+    digits: str,
+    copy_digits: int,
+    memory_task: str,
+) -> Tuple[str, str]:
     left = "".join(rng.choice(digits) for _ in range(copy_digits))
+    if memory_task == "reverse":
+        return left + EQUALS, left[::-1] + EOS
     return left + EQUALS, left + EOS
 
 
@@ -28,12 +35,13 @@ def make_sampler(
     batch_size: int,
     digits: str,
     copy_digits: int,
+    memory_task: str,
 ):
     def sample_batch() -> Tuple[List[List[int]], List[int]]:
         sequences: List[List[int]] = []
         target_starts: List[int] = []
         for _ in range(batch_size):
-            prompt, answer = random_copy_problem(rng, digits, copy_digits)
+            prompt, answer = random_copy_problem(rng, digits, copy_digits, memory_task)
             prompt_ids = model.encode(prompt)
             target_ids = model.encode(answer)
             sequences.append(prompt_ids + target_ids)
@@ -69,6 +77,7 @@ def evaluate(
     seed: int,
     digits: str,
     copy_digits: int,
+    memory_task: str,
     it: int,
 ) -> None:
     rng = random.Random(seed)
@@ -76,7 +85,7 @@ def evaluate(
     states: List[torch.Tensor] = []
 
     for _ in range(samples):
-        prompt, answer = random_copy_problem(rng, digits, copy_digits)
+        prompt, answer = random_copy_problem(rng, digits, copy_digits, memory_task)
         pred, did_stop = generate(model, prompt, EOS, len(answer) + 1)
         stopped += int(did_stop)
         exact += int(did_stop and pred == answer[:-1])
@@ -115,11 +124,12 @@ def show_samples(
     seed: int,
     digits: str,
     copy_digits: int,
+    memory_task: str,
     count: int = 10,
 ) -> None:
     rng = random.Random(seed)
     for _ in range(count):
-        prompt, answer = random_copy_problem(rng, digits, copy_digits)
+        prompt, answer = random_copy_problem(rng, digits, copy_digits, memory_task)
         target = answer[:-1]
         pred, did_stop = generate(model, prompt, EOS, len(answer) + 1)
         ok = "OK" if did_stop and pred == target else "XX"
@@ -132,6 +142,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n", type=int, default=64)
     parser.add_argument("--number-base", type=int, default=10)
     parser.add_argument("--copy-digits", type=int, default=10)
+    parser.add_argument("--memory-task", choices=["copy", "reverse"], default="copy")
     parser.add_argument(
         "--update-side",
         choices=["left", "right", "double-left", "double-right"],
@@ -191,10 +202,25 @@ def main() -> None:
         print(f"{key}={value}")
 
     rng = random.Random(args.seed)
-    sample_batch = make_sampler(model, rng, args.batch_size, digits, args.copy_digits)
+    sample_batch = make_sampler(
+        model,
+        rng,
+        args.batch_size,
+        digits,
+        args.copy_digits,
+        args.memory_task,
+    )
 
     def evaluate_cb(eval_model: MemoryMatrixNetwork, it: int) -> None:
-        evaluate(eval_model, args.eval_samples, args.seed + it, digits, args.copy_digits, it)
+        evaluate(
+            eval_model,
+            args.eval_samples,
+            args.seed + it,
+            digits,
+            args.copy_digits,
+            args.memory_task,
+            it,
+        )
 
     train(
         model=model,
@@ -217,6 +243,7 @@ def main() -> None:
                 "update_side": model.update_side,
                 "number_base": args.number_base,
                 "copy_digits": args.copy_digits,
+                "memory_task": args.memory_task,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
             },
@@ -225,7 +252,13 @@ def main() -> None:
         print(f"saved_checkpoint={save_path}")
 
     print("\nSample predictions:")
-    show_samples(model, seed=args.seed + 999, digits=digits, copy_digits=args.copy_digits)
+    show_samples(
+        model,
+        seed=args.seed + 999,
+        digits=digits,
+        copy_digits=args.copy_digits,
+        memory_task=args.memory_task,
+    )
 
 
 if __name__ == "__main__":
