@@ -71,16 +71,27 @@ class MatrixNetwork(torch.nn.Module):
         max_len: int,
         *,
         reset_state: bool = True,
-    ) -> Tuple[str, bool]:
+        collect_states: bool = False,
+    ) -> Tuple[str, bool] | Tuple[str, bool, List[torch.Tensor]]:
         with torch.no_grad():
             if reset_state:
                 self.reset_state()
             self.apply_context(self.encode(prefix))
             out: List[int] = []
+            states: List[torch.Tensor] = []
             for _ in range(max_len):
-                token_id = self.predict()
+                state = self.query_state()
+                if collect_states:
+                    states.append(state.detach().cpu().clone())
+                token_id = int(state[: self.vocab_size].argmax().item())
                 if token_id == self.eos_id:
-                    return "".join(self.decode(token) for token in out), True
+                    generated = "".join(self.decode(token) for token in out)
+                    if collect_states:
+                        return generated, True, states
+                    return generated, True
                 out.append(token_id)
                 self.apply_context([token_id])
-            return "".join(self.decode(token) for token in out), False
+            generated = "".join(self.decode(token) for token in out)
+            if collect_states:
+                return generated, False, states
+            return generated, False
