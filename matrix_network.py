@@ -46,11 +46,16 @@ class MatrixNetwork(torch.nn.Module):
     def apply_context(self, token_ids: Sequence[int]) -> None:
         with torch.no_grad():
             for token_id in token_ids:
-                self.state_mat.copy_(self.token_mats[token_id] @ self.state_mat)
+                self.state_mat.copy_(self.state_mat @ self.token_mats[token_id])
+
+    def query_state(self) -> torch.Tensor:
+        with torch.no_grad():
+            # Equivalent to: (self.query @ self.state_mat) @ self.state_mat
+            state = self.state_mat[0]
+            return state @ self.state_mat
 
     def predict(self) -> int:
         with torch.no_grad():
-            # Equivalent to: state = self.query @ self.state_mat
-            state = self.state_mat[0]
+            state = self.query_state()
             # Equivalent to scoring against the one-hot unembedding vectors.
             return int(state[: self.vocab_size].argmax().item())
