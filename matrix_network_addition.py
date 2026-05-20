@@ -46,7 +46,7 @@ def random_problem(rng: random.Random, addend_digits: int, base: int) -> Tuple[s
     a = rng.randint(0, max_val)
     b = rng.randint(0, max_val)
     prompt = f"{format_in_base(a, base, addend_digits)}{PLUS}{format_in_base(b, base, addend_digits)}{EQUALS}"
-    answer = format_in_base(a + b, base) + EOS
+    answer = format_in_base(a + b, base)
     return prompt, answer
 
 
@@ -64,57 +64,35 @@ def make_sampler(
         for _ in range(batch_size):
             prompt, answer = random_problem(rng, addend_digits, base)
             prompt_ids = model.encode(prompt)
-            target_ids = model.encode(answer)
+            target_ids = model.encode(answer + model.eos_token)
             sequences.append(prompt_ids + target_ids)
             prompt_lens.append(0 if train_full_sequence else len(prompt_ids))
         return sequences, prompt_lens
     return sample_batch
 
 
-def generate(model: MatrixNetwork, prompt: str, stop: str, max_len: int) -> Tuple[str, bool]:
-    stop_id = model.stoi[stop]
-    model.reset_state()
-    model.apply_context(model.encode(prompt))
-    out: List[int] = []
-    for _ in range(max_len):
-        tid = model.predict()
-        if tid == stop_id:
-            return "".join(model.decode(t) for t in out), True
-        out.append(tid)
-        model.apply_context([tid])
-    return "".join(model.decode(t) for t in out), False
-
-
 def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, base: int, it: int) -> None:
     rng = random.Random(seed)
-    eye = torch.eye(model.n, device=model.base_mat.device, dtype=model.base_mat.dtype)
-    exact = stopped = tf_correct = tf_total = 0
+    exact = stopped = token_correct = token_total = 0
     states: List[torch.Tensor] = []
 
     for _ in range(samples):
         prompt, answer = random_problem(rng, addend_digits, base)
-        prompt_ids = model.encode(prompt)
-        target_ids = model.encode(answer)
-        pred, did_stop = generate(model, prompt, EOS, len(answer) + 1)
+        pred, did_stop, generated_states = model.generate(
+            prompt,
+            len(answer) + 2,
+            collect_states=True,
+        )
+        states.extend(generated_states)
         stopped += int(did_stop)
-        if did_stop and pred == answer[:-1]:
+        token_total += len(answer)
+        token_correct += sum(a == b for a, b in zip(pred, answer))
+        if did_stop and pred == answer:
             exact += 1
-
-        prefix_op = eye
-        for tid in prompt_ids:
-            prefix_op = model.token_mats[tid] @ prefix_op
-        for tid in target_ids:
-            state = model.query @ (prefix_op @ model.base_mat)
-            states.append(state.detach().cpu())
-            scores = model.unembed_vectors @ state
-            pred_id = int(scores.argmax().item())
-            tf_correct += int(pred_id == tid)
-            tf_total += 1
-            prefix_op = model.token_mats[tid] @ prefix_op
 
     print(
         f"  eval_iter={it} exact_match={exact / max(samples, 1):.3f} "
-        f"teacher_forced_token_acc={tf_correct / max(tf_total, 1):.3f} "
+        f"token_acc={token_correct / max(token_total, 1):.3f} "
         f"stop_rate={stopped / max(samples, 1):.3f}"
     )
     if states:
@@ -135,11 +113,10 @@ def show_samples(model: MatrixNetwork, seed: int, addend_digits: int, base: int,
     rng = random.Random(seed)
     for _ in range(count):
         prompt, answer = random_problem(rng, addend_digits, base)
-        target = answer[:-1]
-        pred, did_stop = generate(model, prompt, EOS, len(answer) + 1)
-        ok = "OK" if did_stop and pred == target else "XX"
+        pred, did_stop = model.generate(prompt, len(answer) + 2)
+        ok = "OK" if did_stop and pred == answer else "XX"
         stop_txt = "eos" if did_stop else "max"
-        print(f"{prompt}{target:>4s} | pred={pred:>4s} ({stop_txt}) [{ok}]")
+        print(f"{prompt}{answer:>4s} | pred={pred:>4s} ({stop_txt}) [{ok}]")
 
 
 def default_save_filename(args: argparse.Namespace) -> str:
@@ -165,7 +142,7 @@ def run_training(
 
     if args.load_path:
         ckpt = load_checkpoint(args.load_path, device)
-        model = MatrixNetwork(n=int(ckpt["n"]), vocab=ckpt["vocab"], device=device)
+        model = MatrixNetwork(n=int(ckpt["n"]), vocab=ckpt["vocab"], eos_token=EOS, device=device)
         model.load_state_dict(ckpt["model_state"])
         model.reset_state()
         optimizer = MatrixNetworkOptimizer(
@@ -191,7 +168,7 @@ def run_training(
             print(f"loaded_addend_digits={loaded_digits}; overriding --addend-digits={args.addend_digits}")
             args.addend_digits = loaded_digits
     else:
-        model = MatrixNetwork(n=args.n, vocab=vocab_for(args.number_base), device=device)
+        model = MatrixNetwork(n=args.n, vocab=vocab_for(args.number_base), eos_token=EOS, device=device)
         optimizer = MatrixNetworkOptimizer(
             model,
             momentum_decay=args.momentum_decay,
