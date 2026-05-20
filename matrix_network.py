@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Sequence, Tuple
 
 import torch
 
@@ -10,6 +10,7 @@ class MatrixNetwork(torch.nn.Module):
         *,
         n: int,
         vocab: Iterable[str],
+        eos_token: str,
         device: torch.device | str | None = None,
     ):
         super().__init__()
@@ -22,6 +23,10 @@ class MatrixNetwork(torch.nn.Module):
 
         self.n = n
         self.stoi = {token: i for i, token in enumerate(self.vocab)}
+        if eos_token not in self.stoi:
+            raise ValueError(f"eos_token {eos_token!r} is not in vocab")
+        self.eos_token = eos_token
+        self.eos_id = self.stoi[eos_token]
 
         eye = torch.eye(n, device=device)
         self.register_buffer("query", eye[0].clone())
@@ -59,3 +64,16 @@ class MatrixNetwork(torch.nn.Module):
             state = self.query_state()
             # Equivalent to scoring against the one-hot unembedding vectors.
             return int(state[: self.vocab_size].argmax().item())
+
+    def generate(self, prefix: Iterable[str], max_len: int) -> Tuple[str, bool]:
+        with torch.no_grad():
+            self.reset_state()
+            self.apply_context(self.encode(prefix))
+            out: List[int] = []
+            for _ in range(max_len):
+                token_id = self.predict()
+                if token_id == self.eos_id:
+                    return "".join(self.decode(token) for token in out), True
+                out.append(token_id)
+                self.apply_context([token_id])
+            return "".join(self.decode(token) for token in out), False
