@@ -65,9 +65,16 @@ class MatrixNetwork(torch.nn.Module):
             # Equivalent to scoring against the one-hot unembedding vectors.
             return int(state[: self.vocab_size].argmax().item())
 
-    def generate(self, prefix: Iterable[str], max_len: int) -> Tuple[str, bool]:
+    def generate(
+        self,
+        prefix: Iterable[str],
+        max_len: int,
+        *,
+        reset_state: bool = True,
+    ) -> Tuple[str, bool]:
         with torch.no_grad():
-            self.reset_state()
+            if reset_state:
+                self.reset_state()
             self.apply_context(self.encode(prefix))
             out: List[int] = []
             for _ in range(max_len):
