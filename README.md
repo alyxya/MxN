@@ -8,8 +8,8 @@ The core idea is:
 1. Start with a learned `base_mat`.
 2. Maintain a current `state_mat`, initially a copy of `base_mat`.
 3. Each token owns a learned matrix.
-4. Applying context means left-multiplying token matrices into `state_mat`.
-5. Prediction reads a fixed query row through the current state matrix and
+4. Applying context means right-multiplying token matrices into `state_mat`.
+5. Prediction reads a fixed query row through the current state matrix twice and
    chooses the output token with the largest score.
 
 In code, inference is intentionally small:
@@ -34,20 +34,22 @@ Applying context is just matrix multiplication:
 
 ```text
 state_mat = base_mat
-state_mat = token_mat[token_0] @ state_mat
-state_mat = token_mat[token_1] @ state_mat
+state_mat = state_mat @ token_mat[token_0]
+state_mat = state_mat @ token_mat[token_1]
 ...
 ```
 
 Prediction is:
 
 ```text
-state = query.T @ state_mat
+state = (query @ state_mat) @ state_mat
 scores = unembed_vectors @ state
 prediction = argmax(scores)
 ```
 
-Equivalently, the query is read as the row vector `query.T @ state_mat`.
+This is the **double-right** mode: token matrices multiply on the right, and
+the query passes through the same state twice. Since `query` is the first
+one-hot row, the implementation reads `state_mat[0] @ state_mat`.
 
 The matrices are kept near-orthogonal, so the state acts like a sequence of
 rotations/reflections in a shared vector space.
@@ -67,13 +69,17 @@ Training does not use backpropagation. For each target token position:
 7. Convert the resulting terms to a skew-symmetric generator, exponentiate it,
    and apply the resulting rotation to the matrices.
 
-Each learned update term is:
+For each factor in the state product, each learned update term is:
 
 ```text
-v @ u.T
+input_row[:, None] @ desired_row[None, :]
 ```
 
-where `u` is the current vector and `v` is the target vector. These terms can be
+The input row is propagated through the factors before that matrix; the desired
+row is pulled back through the transposed suffix, including that matrix.
+Both occurrences of the state are trained: one uses `(query @ state, target)`
+and the other uses `(query, target @ state.T)`. Their updates are averaged.
+These terms can be
 averaged and mixed linearly. When applying the update, the optimizer turns the
 terms into the skew-symmetric generator:
 
@@ -104,13 +110,19 @@ applied_update = (1 - momentum_weight) * current_update
 `momentum_weight` controls the fraction of the applied update that comes from
 the momentum update instead of directly from the current batch update.
 
+Training batches variable-length sequences with masked padding. Prefix products
+are sequential over token positions but batched over examples. A backward suffix
+sweep combines both reads and all applicable targets using batched matrix
+multiplications, without storing a target-by-position triangle of vectors.
+Temporary storage scales as `O(batch * length * n² + batch * length * n)`.
+
 ## Files
 
 - `matrix_network.py`: core inference model.
 - `matrix_network_optimizer.py`: custom non-autograd optimizer that turns
   rotation deltas into matrix updates, with momentum.
-- `matrix_network_training.py`: checkpointing, batch delta construction, the
-  generic training loop, and small tensor math helpers.
+- `matrix_network_training.py`: batched double-right update construction and the
+  generic training loop.
 - `matrix_network_addition.py`: addition task data generation, evaluation, and
   the CLI training entrypoint.
 - `matrix_network_modal.py`: Modal remote training/checkpoint utilities.
@@ -122,7 +134,7 @@ the momentum update instead of directly from the current batch update.
 Run a short local addition experiment:
 
 ```bash
-python3 matrix_network_addition.py \
+uv run --offline --python .venv/bin/python python matrix_network_addition.py \
   --n 32 \
   --addend-digits 3 \
   --iters 5000
@@ -136,3 +148,12 @@ Useful training knobs:
   learned skew update RMS.
 - `--correct-margin`: train only targets below this decode-score margin, scaling
   each one-hot target update by the missing margin. Omit it to train every target.
+
+Run the training math checks with the local environment:
+
+```bash
+uv run --offline --python .venv/bin/python python -m unittest discover -s tests -v
+```
+
+These compare batched updates against independent autograd derivatives of
+`query @ state @ state`; autograd is used only in tests.

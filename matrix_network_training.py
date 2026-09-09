@@ -8,58 +8,73 @@ from matrix_network_optimizer import MatrixNetworkOptimizer
 
 
 @torch.no_grad()
-def _query_triangle_rows(
-    model: MatrixNetwork,
-    context_ids: Sequence[int],
-) -> torch.Tensor:
-    context_len = len(context_ids)
-    rows = torch.zeros(
-        (context_len + 1, context_len + 1, model.n),
-        device=model.base_mat.device,
-        dtype=model.base_mat.dtype,
-    )
-    diagonal = torch.arange(context_len + 1, device=model.base_mat.device)
-    rows[diagonal, diagonal] = model.query
-    active_rows = torch.empty(
-        (context_len, model.n),
-        device=model.base_mat.device,
-        dtype=model.base_mat.dtype,
-    )
-    ends = torch.arange(context_len, 0, -1, device=model.base_mat.device)
-    active_count = 0
-
-    for token_pos in range(context_len - 1, -1, -1):
-        active_rows[active_count].copy_(model.query)
-        active_count += 1
-        active_rows[:active_count] = active_rows[:active_count] @ model.token_mats[
-            context_ids[token_pos]
-        ]
-        rows[ends[:active_count], token_pos] = active_rows[:active_count]
-    return rows
+def _right_prefix_mats(model: MatrixNetwork, token_ids: torch.Tensor) -> torch.Tensor:
+    """Return S_t before target t, batching the sequential products over examples."""
+    batch_size, target_count = token_ids.shape
+    prefixes = model.base_mat.new_empty((batch_size, target_count, model.n, model.n))
+    prefixes[:, 0] = model.base_mat
+    for pos in range(target_count - 1):
+        prefixes[:, pos + 1] = torch.bmm(
+            prefixes[:, pos], model.token_mats[token_ids[:, pos]]
+        )
+    return prefixes
 
 
 @torch.no_grad()
-def _target_triangle_rows(
+def _double_right_update_terms(
     model: MatrixNetwork,
-    context_ids: Sequence[int],
+    token_ids: torch.Tensor,
+    prefixes: torch.Tensor,
     targets: torch.Tensor,
-) -> torch.Tensor:
-    context_len = len(context_ids)
-    rows = torch.zeros(
-        (len(targets), context_len + 1, model.n),
-        device=model.base_mat.device,
-        dtype=model.base_mat.dtype,
-    )
-    rows[:, 0] = targets @ model.base_mat.T
-    active_rows = rows[:, 0].clone()
-    for token_pos, token_id in enumerate(context_ids):
-        if token_pos + 1 >= len(targets):
-            break
-        active_rows[token_pos + 1 :] = (
-            active_rows[token_pos + 1 :] @ model.token_mats[token_id].T
+    row_scales: torch.Tensor,
+    recency_decay: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Accumulate both occurrences of S in q S S for left-applied rotations.
+
+    For a factor M in S = L M R, its update is outer(q L, target R.T M.T).
+    The two reads use (q S, target) and (q, target S.T), respectively.
+    Reduce both reads and all targets with bmm, without materializing outer
+    products or a [batch, target, matrix-position, n] triangle.
+    """
+    batch_size, target_count = token_ids.shape
+    pulled_targets = torch.matmul(targets.unsqueeze(-2), prefixes.transpose(-1, -2)).squeeze(-2)
+    queries = torch.stack((prefixes[:, :, 0], model.query.expand_as(targets)), dim=1)
+    desired = torch.stack((targets, pulled_targets), dim=1)
+    positions = torch.arange(target_count, device=token_ids.device)
+    decay = model.base_mat.new_tensor(recency_decay)
+
+    # The base factor has L = I and M R = S_t for each target.
+    base_desired = torch.matmul(desired.unsqueeze(-2), prefixes[:, None].transpose(-1, -2)).squeeze(-2)
+    base_weights = row_scales * decay.pow(positions)
+    base_terms = torch.bmm(
+        queries.reshape(batch_size, -1, model.n).transpose(1, 2),
+        (base_desired * base_weights[:, None, :, None]).reshape(batch_size, -1, model.n),
+    ).sum(dim=0)
+    token_terms = torch.zeros_like(model.token_mats)
+
+    # Sweep suffixes backwards. Introduce target t only when reaching token t-1,
+    # so each desired row traverses exactly its own suffix (including M).
+    suffix_rows = torch.zeros_like(desired)
+    for pos in range(target_count - 2, -1, -1):
+        suffix_rows[:, :, pos + 1] = desired[:, :, pos + 1]
+        active_count = target_count - pos - 1
+        suffix_rows[:, :, pos + 1:] = torch.bmm(
+            suffix_rows[:, :, pos + 1:].reshape(batch_size, 2 * active_count, model.n),
+            model.token_mats[token_ids[:, pos]].transpose(1, 2),
+        ).reshape(batch_size, 2, active_count, model.n)
+        inputs = torch.bmm(
+            queries[:, :, pos + 1:].reshape(batch_size, 2 * active_count, model.n),
+            prefixes[:, pos],
         )
-        rows[token_pos + 1 :, token_pos + 1] = active_rows[token_pos + 1 :]
-    return rows
+        weights = row_scales[:, pos + 1:] * decay.pow(positions[pos + 1:] - pos)
+        updates = torch.bmm(
+            inputs.transpose(1, 2),
+            (suffix_rows[:, :, pos + 1:] * weights[:, None, :, None]).reshape(
+                batch_size, 2 * active_count, model.n
+            ),
+        )
+        token_terms.index_add_(0, token_ids[:, pos], updates)
+    return base_terms * 0.5, token_terms * 0.5
 
 
 @torch.no_grad()
@@ -71,73 +86,49 @@ def apply_batch_update(
     recency_decay: float,
     correct_margin: float | None = None,
 ) -> None:
-    base_update_terms = torch.zeros_like(model.base_mat)
-    token_update_terms = torch.zeros_like(model.token_mats)
-    trained_output_count = 0
-    max_contribution_mass = 0.0
-    has_update = False
-
-    for token_ids, target_start in zip(sequences, target_starts):
-        target_count = len(token_ids) - target_start
-        if target_count <= 0:
-            continue
-        trained_output_count += target_count
-        terms = len(token_ids)
-        if recency_decay == 1.0:
-            contribution_mass = float(terms)
-        else:
-            contribution_mass = (1.0 - recency_decay ** terms) / (1.0 - recency_decay)
-        max_contribution_mass = max(max_contribution_mass, contribution_mass)
-        context_ids = token_ids[:-1]
-        query_triangle_rows = _query_triangle_rows(model, context_ids)
-
-        token_id_tensor = torch.tensor(
-            token_ids,
-            device=model.base_mat.device,
-            dtype=torch.long,
-        )
-        states = query_triangle_rows[:, 0] @ model.base_mat
-        train_mask = torch.arange(len(token_ids), device=model.base_mat.device) >= target_start
-        row_scales = torch.ones(
-            len(token_ids),
-            device=model.base_mat.device,
-            dtype=model.base_mat.dtype,
-        )
-        if correct_margin is not None:
-            scores = states @ model.unembed_vectors.T
-            correct_scores = scores.gather(1, token_id_tensor.unsqueeze(1)).squeeze(1)
-            wrong_scores = scores.clone()
-            wrong_scores.scatter_(1, token_id_tensor.unsqueeze(1), -torch.inf)
-            desired_scores = wrong_scores.max(dim=1).values + correct_margin
-            row_scales = (desired_scores - correct_scores).clamp_min(0.0)
-            train_mask &= row_scales > 0.0
-            if not bool(train_mask.any().item()):
-                continue
-        has_update = True
-
-        targets = model.unembed_vectors[token_id_tensor]
-        target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
-        positions = torch.arange(len(token_ids), device=model.base_mat.device)
-        distances = positions.unsqueeze(1) - positions.unsqueeze(0)
-        decay = torch.tensor(recency_decay, device=model.base_mat.device, dtype=model.base_mat.dtype)
-        update_weights = torch.tril(torch.pow(decay, distances.clamp_min(0)))
-        update_weights = update_weights * row_scales.unsqueeze(1)
-        update_weights[~train_mask] = 0.0
-
-        position_updates = torch.bmm(
-            query_triangle_rows.permute(1, 2, 0),
-            (target_triangle_rows * update_weights.unsqueeze(2)).permute(1, 0, 2),
-        )
-        base_update_terms.add_(position_updates[0])
-        token_update_terms.index_add_(0, token_id_tensor[:-1], position_updates[1:])
-
-    if trained_output_count == 0 or not has_update:
+    if len(sequences) != len(target_starts):
+        raise ValueError("sequences and target_starts must have the same length")
+    if any(start < 0 or start > len(seq) for seq, start in zip(sequences, target_starts)):
+        raise ValueError("target_starts must be between zero and the sequence length")
+    examples = [(seq, start) for seq, start in zip(sequences, target_starts) if start < len(seq)]
+    if not examples:
         return
 
-    batch_update_scale = 1.0 / (trained_output_count * max_contribution_mass)
-    base_update_terms.mul_(batch_update_scale)
-    token_update_terms.mul_(batch_update_scale)
-    optimizer.step(base_update_terms, token_update_terms)
+    # Padding affects only unused future prefixes; masked targets contribute zero.
+    lengths = [len(seq) for seq, _ in examples]
+    target_count = max(lengths)
+    token_ids = torch.tensor(
+        [list(seq) + [0] * (target_count - len(seq)) for seq, _ in examples],
+        device=model.base_mat.device, dtype=torch.long,
+    )
+    positions = torch.arange(target_count, device=token_ids.device)
+    starts = torch.tensor([start for _, start in examples], device=token_ids.device)
+    ends = torch.tensor(lengths, device=token_ids.device)
+    train_mask = (positions >= starts[:, None]) & (positions < ends[:, None])
+    row_scales = train_mask.to(model.base_mat.dtype)
+    prefixes = _right_prefix_mats(model, token_ids)
+    targets = model.unembed_vectors[token_ids]
+    if correct_margin is not None:
+        states = torch.matmul(prefixes[:, :, 0].unsqueeze(-2), prefixes).squeeze(-2)
+        scores = states @ model.unembed_vectors.T
+        correct_scores = scores.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)
+        scores.scatter_(-1, token_ids.unsqueeze(-1), -torch.inf)
+        row_scales *= (scores.max(dim=-1).values + correct_margin - correct_scores).clamp_min(0.0)
+        if not bool(row_scales.any().item()):
+            return
+
+    base_terms, token_terms = _double_right_update_terms(
+        model, token_ids, prefixes, targets, row_scales, recency_decay,
+    )
+    trained_output_count = sum(len(seq) - start for seq, start in examples)
+    if recency_decay == 1.0:
+        max_contribution_mass = float(target_count)
+    else:
+        max_contribution_mass = max(
+            (1.0 - recency_decay ** length) / (1.0 - recency_decay) for length in lengths
+        )
+    scale = 1.0 / (trained_output_count * max_contribution_mass)
+    optimizer.step(base_terms * scale, token_terms * scale)
 
 
 def train(
