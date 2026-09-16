@@ -73,6 +73,14 @@ class MatrixNetwork(torch.nn.Module):
         reset_state: bool = True,
         collect_states: bool = False,
     ) -> Tuple[str, bool] | Tuple[str, bool, List[torch.Tensor]]:
+        """Generate text and report whether EOS was reached.
+
+        Leave collect_states=False for normal generation. It is a debugging-only
+        diagnostic option that adds a third return value: CPU copies of each
+        prediction's readout vector (including the EOS prediction, if reached).
+        These are not state-matrix snapshots and cannot restore generation state.
+        Collection adds memory and copying overhead without affecting predictions.
+        """
         with torch.no_grad():
             if reset_state:
                 self.reset_state()
