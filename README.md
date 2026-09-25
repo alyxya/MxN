@@ -65,8 +65,7 @@ Training does not use backpropagation. For each target token position:
    that target.
 5. Accumulate updates for both `base_mat` and all token matrices that appear in
    the prefix.
-6. Apply momentum to those learned update terms.
-7. Convert the resulting terms to a skew-symmetric generator, exponentiate it,
+6. Convert the resulting terms to a skew-symmetric generator, exponentiate it,
    and apply the resulting rotation to the matrices.
 
 For each factor in the state product, each learned update term is:
@@ -93,23 +92,6 @@ The exponential is approximated by scaling `A * learning_rate`, using
 `I + scaled_A` as the small-step approximation, then repeatedly squaring back up
 to the full rotation.
 
-Momentum is an exponential moving average of these learned update terms:
-
-```text
-momentum = momentum_decay * previous_momentum
-         + (1 - momentum_decay) * current_update
-```
-
-The applied update is:
-
-```text
-applied_update = (1 - momentum_weight) * current_update
-               + momentum_weight * momentum
-```
-
-`momentum_weight` controls the fraction of the applied update that comes from
-the momentum update instead of directly from the current batch update.
-
 Training batches variable-length sequences with masked padding. Prefix products
 are sequential over token positions but batched over examples. A backward suffix
 sweep combines both reads and all applicable targets using batched matrix
@@ -120,7 +102,7 @@ Temporary storage scales as `O(batch * length * n² + batch * length * n)`.
 
 - `matrix_network.py`: core inference model.
 - `matrix_network_optimizer.py`: custom non-autograd optimizer that turns
-  rotation deltas into matrix updates, with momentum.
+  rotation deltas into matrix updates, without autograd.
 - `matrix_network_training.py`: batched double-right update construction and the
   generic training loop.
 - `matrix_network_addition.py`: addition task data generation, evaluation, and
@@ -142,8 +124,6 @@ uv run --offline --python .venv/bin/python python matrix_network_addition.py \
 
 Useful training knobs:
 
-- `--momentum-decay`: EMA decay for base/token matrix update momentum.
-- `--momentum-weight`: fraction of the applied update from momentum.
 - `--update-noise-scale`: skew-symmetric optimizer noise scaled relative to the
   learned skew update RMS.
 - `--correct-margin`: train only targets below this decode-score margin, scaling

@@ -58,12 +58,14 @@ def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def train_remote(gpu: str | None):
-    @app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu=gpu, timeout=24 * 3600)
-    def run(args_dict: dict[str, Any]) -> dict[str, Any]:
-        return _train_impl(args_dict)
+@app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu=None, timeout=24 * 3600)
+def train_cpu_remote(args_dict: dict[str, Any]) -> dict[str, Any]:
+    return _train_impl(args_dict)
 
-    return run
+
+@app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu="T4", timeout=24 * 3600)
+def train_gpu_remote(args_dict: dict[str, Any]) -> dict[str, Any]:
+    return _train_impl(args_dict)
 
 
 @app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu=None, timeout=600)
@@ -117,8 +119,6 @@ def main(
     train_full_sequence: bool = False,
     correct_margin: float | None = None,
     recency_decay: float = 1.0,
-    momentum_decay: float = 0.0,
-    momentum_weight: float = 0.0,
     update_noise_scale: float = 0.5,
     update_orthogonalize_period: int = 100,
     seed: int = 0,
@@ -178,8 +178,6 @@ def main(
         "train_full_sequence": train_full_sequence,
         "correct_margin": correct_margin,
         "recency_decay": recency_decay,
-        "momentum_decay": momentum_decay,
-        "momentum_weight": momentum_weight,
         "update_noise_scale": update_noise_scale,
         "update_orthogonalize_period": update_orthogonalize_period,
         "addend_digits": addend_digits,
@@ -192,7 +190,8 @@ def main(
         "device": device,
     }
 
-    result = train_remote(gpu_type).remote(args_dict)
+    remote_train = train_cpu_remote if gpu_type is None else train_gpu_remote
+    result = remote_train.remote(args_dict)
     print("\nModal run result:")
     for k, v in result.items():
         print(f"{k}={v}")

@@ -7,7 +7,6 @@ import torch
 
 if TYPE_CHECKING:
     from matrix_network import MatrixNetwork
-    from matrix_network_optimizer import MatrixNetworkOptimizer
 
 Checkpoint = Dict[str, Any]
 
@@ -60,7 +59,6 @@ def apply_rotation(
 
 def save_checkpoint(
     model: "MatrixNetwork",
-    optimizer: "MatrixNetworkOptimizer",
     path: str,
     *,
     metadata: Dict[str, Any] | None = None,
@@ -73,7 +71,6 @@ def save_checkpoint(
             "n": model.n,
             "vocab": model.vocab,
             "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
             "metadata": metadata or {},
         },
         tmp,

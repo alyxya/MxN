@@ -147,14 +147,11 @@ def run_training(
         model.reset_state()
         optimizer = MatrixNetworkOptimizer(
             model,
-            momentum_decay=args.momentum_decay,
             base_lr=args.base_learning_rate,
             token_lr=args.token_learning_rate,
-            momentum_weight=args.momentum_weight,
             update_noise_scale=args.update_noise_scale,
             orthogonalize_period=args.update_orthogonalize_period,
         )
-        optimizer.load_state_dict(ckpt["optimizer_state"])
         if model.n != args.n:
             print(f"loaded_n={model.n}; overriding --n={args.n}")
             args.n = model.n
@@ -171,10 +168,8 @@ def run_training(
         model = MatrixNetwork(n=args.n, vocab=vocab_for(args.number_base), eos_token=EOS, device=device)
         optimizer = MatrixNetworkOptimizer(
             model,
-            momentum_decay=args.momentum_decay,
             base_lr=args.base_learning_rate,
             token_lr=args.token_learning_rate,
-            momentum_weight=args.momentum_weight,
             update_noise_scale=args.update_noise_scale,
             orthogonalize_period=args.update_orthogonalize_period,
         )
@@ -195,7 +190,7 @@ def run_training(
         raise ValueError("--correct-margin must be >= 0")
 
     def save(it: int) -> None:
-        save_checkpoint(model, optimizer, save_path, metadata=metadata)
+        save_checkpoint(model, save_path, metadata=metadata)
         if on_checkpoint_saved is not None:
             on_checkpoint_saved(save_path)
 
@@ -254,8 +249,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train-full-sequence", action="store_true")
     p.add_argument("--correct-margin", type=float, default=None)
     p.add_argument("--recency-decay", type=float, default=1.0)
-    p.add_argument("--momentum-decay", type=float, default=0.0)
-    p.add_argument("--momentum-weight", type=float, default=0.0)
     p.add_argument("--update-noise-scale", type=float, default=0.5)
     p.add_argument("--update-orthogonalize-period", type=int, default=100)
     p.add_argument("--seed", type=int, default=0)
