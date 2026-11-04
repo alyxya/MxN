@@ -21,6 +21,8 @@ image = (
         "matrix_network_training",
         "matrix_network_addition",
         "matrix_network_utils",
+        "matrix_network_experiment",
+        "experiments",
     )
 )
 
@@ -61,6 +63,13 @@ def _train_impl(args_dict: dict[str, Any]) -> dict[str, Any]:
 @app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu=None, timeout=24 * 3600)
 def train_cpu_remote(args_dict: dict[str, Any]) -> dict[str, Any]:
     return _train_impl(args_dict)
+
+
+@app.function(image=image, volumes={str(REMOTE_ROOT): volume}, cpu=1, timeout=3600)
+def addition_experiment_remote(run_name: str, config: dict[str, Any]) -> dict[str, Any]:
+    from matrix_network_experiment import run_experiment
+
+    return run_experiment(REMOTE_ROOT / run_name, on_save=volume.commit, **config)
 
 
 @app.function(image=image, volumes={str(REMOTE_ROOT): volume}, gpu="T4", timeout=24 * 3600)
@@ -117,7 +126,6 @@ def main(
     token_learning_rate: float = 1.0,
     base_learning_rate: float = 0.1,
     train_full_sequence: bool = False,
-    correct_margin: float | None = None,
     recency_decay: float = 1.0,
     update_noise_scale: float = 0.5,
     update_orthogonalize_period: int = 100,
@@ -176,7 +184,6 @@ def main(
         "token_learning_rate": token_learning_rate,
         "base_learning_rate": base_learning_rate,
         "train_full_sequence": train_full_sequence,
-        "correct_margin": correct_margin,
         "recency_decay": recency_decay,
         "update_noise_scale": update_noise_scale,
         "update_orthogonalize_period": update_orthogonalize_period,

@@ -14,7 +14,7 @@ class CaptureOptimizer:
         self.calls.append((base.clone(), tokens.clone()))
 
 
-def reference_updates(model, sequences, starts, decay, margin):
+def reference_updates(model, sequences, starts, decay):
     """Differentiate independent left perturbations of every factor in q S S.
 
     Autograd is used only as a test oracle; production training has no autograd.
@@ -35,16 +35,10 @@ def reference_updates(model, sequences, starts, decay, margin):
             for factor, perturbation in zip(factors, perturbations):
                 state = state @ ((torch.eye(model.n, dtype=state.dtype) + perturbation) @ factor)
             output = model.query @ state @ state
-            scores = (output @ model.unembed_vectors.T).detach()
-            scale = 1.0
-            if margin is not None:
-                correct = scores[seq[t]].clone()
-                scores[seq[t]] = -torch.inf
-                scale = max(float(scores.max() + margin - correct), 0.0)
             grads = torch.autograd.grad(output @ model.unembed_vectors[seq[t]], perturbations)
-            base += grads[0] * (0.5 * scale * decay ** t)
+            base += grads[0] * (0.5 * decay ** t)
             for pos, token in enumerate(seq[:t]):
-                tokens[token] += grads[pos + 1] * (0.5 * scale * decay ** (t - pos))
+                tokens[token] += grads[pos + 1] * (0.5 * decay ** (t - pos))
     return base / (count * max(masses)), tokens / (count * max(masses))
 
 
@@ -59,22 +53,26 @@ class DoubleRightTrainingTests(unittest.TestCase):
     def test_updates_match_independent_derivatives(self):
         for sequences, starts in [([[1]], [0]), ([[1, 1, 2, 0], [2, 0], [], [3]], [2, 0, 0, 1])]:
             for decay in (0.0, 0.7, 1.0):
-                for margin in (None, 0.0, 0.3):
-                    with self.subTest(sequences=sequences, decay=decay, margin=margin):
-                        optimizer = CaptureOptimizer()
-                        apply_batch_update(self.model, optimizer, sequences, starts, decay, margin)
-                        expected = reference_updates(self.model, sequences, starts, decay, margin)
-                        actual = optimizer.calls[0] if optimizer.calls else (torch.zeros_like(expected[0]), torch.zeros_like(expected[1]))
-                        for got, want in zip(actual, expected):
-                            torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-8)
-                            self.assertFalse(got.requires_grad)
+                with self.subTest(sequences=sequences, decay=decay):
+                    optimizer = CaptureOptimizer()
+                    apply_batch_update(self.model, optimizer, sequences, starts, decay)
+                    expected = reference_updates(self.model, sequences, starts, decay)
+                    self.assertEqual(len(optimizer.calls), 1)
+                    for got, want in zip(optimizer.calls[0], expected):
+                        torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-8)
+                        self.assertFalse(got.requires_grad)
 
-    def test_no_targets_or_satisfied_margin_skips_optimizer(self):
+    def test_no_targets_skips_optimizer(self):
         optimizer = CaptureOptimizer()
         apply_batch_update(self.model, optimizer, [[], [1]], [0, 1], 1.0)
-        model = MatrixNetwork(n=5, vocab='~01+=', eos_token='~')
-        apply_batch_update(model, optimizer, [[0]], [0], 1.0, 0.5)
         self.assertEqual(optimizer.calls, [])
+
+    def test_confident_correct_target_still_calls_optimizer(self):
+        model = MatrixNetwork(n=5, vocab='~01+=', eos_token='~')
+        model.base_mat.copy_(torch.eye(5))
+        optimizer = CaptureOptimizer()
+        apply_batch_update(model, optimizer, [[0]], [0], 1.0)
+        self.assertEqual(len(optimizer.calls), 1)
 
     def test_invalid_target_starts(self):
         for starts in ([], [-1], [2]):

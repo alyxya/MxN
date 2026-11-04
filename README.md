@@ -59,13 +59,12 @@ rotations/reflections in a shared vector space.
 Training does not use backpropagation. For each target token position:
 
 1. Build the matrix state for the prefix.
-2. Predict the next token.
-3. Choose the target vector.
-4. Build learned rotation update terms that rotate the current state toward
+2. Select the fixed one-hot vector for the correct next token.
+3. Build learned rotation update terms that rotate the current state toward
    that target.
-5. Accumulate updates for both `base_mat` and all token matrices that appear in
+4. Accumulate updates for both `base_mat` and all token matrices that appear in
    the prefix.
-6. Convert the resulting terms to a skew-symmetric generator, exponentiate it,
+5. Convert the resulting terms to a skew-symmetric generator, exponentiate it,
    and apply the resulting rotation to the matrices.
 
 For each factor in the state product, each learned update term is:
@@ -108,6 +107,10 @@ Temporary storage scales as `O(batch * length * n² + batch * length * n)`.
 - `matrix_network_addition.py`: addition task data generation, evaluation, and
   the CLI training entrypoint.
 - `matrix_network_modal.py`: Modal remote training/checkpoint utilities.
+- `matrix_network_experiment.py`: bounded CPU addition runs with held-out
+  evaluation, best/latest checkpoints, and resumable random state.
+- `experiments/`: frozen historical implementation and single-change ablations;
+  see [experiment notes](experiments/README.md).
 - `matrix_network_utils.py`: miscellaneous tensor helpers for rotations and
   diagnostics such as subspace stats.
 
@@ -126,8 +129,10 @@ Useful training knobs:
 
 - `--update-noise-scale`: skew-symmetric optimizer noise scaled relative to the
   learned skew update RMS.
-- `--correct-margin`: train only targets below this decode-score margin, scaling
-  each one-hot target update by the missing margin. Omit it to train every target.
+
+Training uses a fixed one-hot target for every supervised token, with no
+confidence-based weighting or skipping. Updates remain custom and batched;
+training does not use autograd.
 
 Run the training math checks with the local environment:
 

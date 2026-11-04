@@ -84,7 +84,6 @@ def apply_batch_update(
     sequences: Sequence[Sequence[int]],
     target_starts: Sequence[int],
     recency_decay: float,
-    correct_margin: float | None = None,
 ) -> None:
     if len(sequences) != len(target_starts):
         raise ValueError("sequences and target_starts must have the same length")
@@ -107,15 +106,8 @@ def apply_batch_update(
     train_mask = (positions >= starts[:, None]) & (positions < ends[:, None])
     row_scales = train_mask.to(model.base_mat.dtype)
     prefixes = _right_prefix_mats(model, token_ids)
+    # Every supervised position uses the correct token's fixed one-hot target.
     targets = model.unembed_vectors[token_ids]
-    if correct_margin is not None:
-        states = torch.matmul(prefixes[:, :, 0].unsqueeze(-2), prefixes).squeeze(-2)
-        scores = states @ model.unembed_vectors.T
-        correct_scores = scores.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)
-        scores.scatter_(-1, token_ids.unsqueeze(-1), -torch.inf)
-        row_scales *= (scores.max(dim=-1).values + correct_margin - correct_scores).clamp_min(0.0)
-        if not bool(row_scales.any().item()):
-            return
 
     base_terms, token_terms = _double_right_update_terms(
         model, token_ids, prefixes, targets, row_scales, recency_decay,
@@ -138,7 +130,6 @@ def train(
     sample_batch: Callable[[], Tuple[List[List[int]], List[int]]],
     iters: int,
     recency_decay: float,
-    correct_margin: float | None = None,
     eval_every: int = 0,
     evaluate: Callable[[MatrixNetwork, int], None] | None = None,
     checkpoint_every: int = 0,
@@ -149,7 +140,6 @@ def train(
         apply_batch_update(
             model, optimizer, sequences, prompt_lens,
             recency_decay=recency_decay,
-            correct_margin=correct_margin,
         )
         if evaluate is not None and eval_every > 0 and (it % eval_every == 0 or it == iters):
             evaluate(model, it)

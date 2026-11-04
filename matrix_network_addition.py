@@ -186,8 +186,6 @@ def run_training(
         "number_base": int(args.number_base),
         "addend_digits": int(args.addend_digits),
     }
-    if args.correct_margin is not None and args.correct_margin < 0.0:
-        raise ValueError("--correct-margin must be >= 0")
 
     def save(it: int) -> None:
         save_checkpoint(model, save_path, metadata=metadata)
@@ -217,7 +215,6 @@ def run_training(
         sample_batch=sample_batch,
         iters=args.iters,
         recency_decay=args.recency_decay,
-        correct_margin=args.correct_margin,
         eval_every=args.eval_every,
         evaluate=evaluate_cb,
         checkpoint_every=args.checkpoint_every,
@@ -247,7 +244,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--token-learning-rate", type=float, default=1.0)
     p.add_argument("--base-learning-rate", type=float, default=0.1)
     p.add_argument("--train-full-sequence", action="store_true")
-    p.add_argument("--correct-margin", type=float, default=None)
     p.add_argument("--recency-decay", type=float, default=1.0)
     p.add_argument("--update-noise-scale", type=float, default=0.5)
     p.add_argument("--update-orthogonalize-period", type=int, default=100)
