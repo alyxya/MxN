@@ -14,6 +14,7 @@ Modes:
 | defaults | double-right | plain one-hot | current |
 | `historical=True` | single-left | historical softmax correction | historical |
 | plus `ablation='objective'` | single-left | former margin-weighted one-hot (margin 0.1) | historical |
+| plus `ablation='plain-one-hot'` | single-left | plain one-hot, no margin weighting | historical |
 | plus `ablation='read'` | double-right | historical softmax correction | historical |
 | plus `ablation='noise'` | single-left | historical softmax correction | current |
 
@@ -74,5 +75,43 @@ orthogonalization every 100 steps, 500,000 iterations:
 Validation uses 1,000 examples; confirmation uses 2,000. The former objective
 caused the largest regression in this comparison. These runs do not isolate
 margin weighting from target direction, establish variability across seeds, or
-measure interactions among changes. Plain one-hot performance remains unmeasured
-at this training budget.
+measure interactions among changes. Follow-up plain-one-hot and component
+results are recorded below.
+
+## Historical target components
+
+These `historical=True` variants each remove one component, retaining the
+historical single-left read, optimizer noise scaling, and update normalization:
+
+- `ablation='no-softmax'`: use `decode + one_hot` rather than
+  `decode + one_hot - softmax(decode)`. Keep hidden coordinates and decode rescaling.
+- `ablation='no-hidden'`: zero target coordinates beyond the vocabulary. Keep the
+  full decode correction and decode rescaling.
+- `ablation='no-normalization'`: use the corrected decode coordinates directly,
+  omitting decode rescaling and its norm floor. Keep hidden coordinates.
+
+The no-softmax variant retains the answer signal; it does not remove the entire
+`one_hot - softmax` correction. These are single-seed comparisons, not tests of
+interactions between components.
+
+
+## Completed target ablations
+
+Same configuration, seed, evaluation sets, and 500,000-step budget as above.
+Each historical variant changes only the indicated target component.
+
+| Setup | Final validation exact sum | Best-checkpoint confirmation exact sum |
+| --- | ---: | ---: |
+| Historical target | 52.2% | 51.6% |
+| Historical setup, plain one-hot target | 0.0% | 0.0% |
+| Current double-right setup, plain one-hot target | 0.0% | 0.0% |
+| Historical target without softmax subtraction | 64.5% | 66.2% |
+| Historical target without hidden preservation | 0.3% | 0.2% |
+| Historical target without decode normalization | 16.2% | 16.65% |
+
+Removing hidden-coordinate preservation caused the largest regression among the
+component ablations. Decode normalization also helped, while removing softmax
+subtraction improved this seed. These results support preserving hidden target
+coordinates and decode normalization; replication across seeds is still needed.
+The active trainer remains plain one-hot. The successful no-softmax target is
+available only as an experimental historical variant.

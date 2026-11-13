@@ -62,8 +62,9 @@ def run_experiment(output_dir, *, n=64, batch_size=16, max_iters=200000,
                    confirmation_samples=2000, seed=0, target_accuracy=0.5,
                    on_save=None, resume_from=None, update_noise_scale=0.01,
                    historical=False, stop_on_target=True, ablation=None):
-    if ablation not in (None, 'objective', 'read', 'noise'):
-        raise ValueError('ablation must be objective, read, noise, or None')
+    if ablation not in (None, 'objective', 'plain-one-hot', 'read', 'noise',
+                        'no-softmax', 'no-hidden', 'no-normalization'):
+        raise ValueError(f'Unknown ablation: {ablation}')
     if ablation is not None and not historical:
         raise ValueError('Ablations must start from historical=True')
     for name, value in {
@@ -96,6 +97,12 @@ def run_experiment(output_dir, *, n=64, batch_size=16, max_iters=200000,
         architecture = 'single-left-97fe187'
         if ablation == 'objective':
             from experiments.ablations import objective_only_update as update_batch
+        elif ablation == 'plain-one-hot':
+            from experiments.ablations import plain_one_hot_update as update_batch
+        elif ablation in ('no-softmax', 'no-hidden', 'no-normalization'):
+            from functools import partial
+            from experiments.ablations import target_component_update
+            update_batch = partial(target_component_update, remove=ablation)
         elif ablation == 'read':
             model_class = MatrixNetwork
             from experiments.ablations import read_only_update as update_batch
@@ -114,8 +121,10 @@ def run_experiment(output_dir, *, n=64, batch_size=16, max_iters=200000,
                   architecture=architecture, historical=historical, stop_on_target=stop_on_target,
                   ablation=ablation,
                   objective=('margin-one-hot' if ablation == 'objective' else
-                             'historical-softmax' if historical else 'one-hot'),
+                             'historical-softmax' if historical and ablation != 'plain-one-hot' else 'one-hot'),
                   noise_scaling='current' if ablation == 'noise' or not historical else 'historical')
+    if ablation in ('no-softmax', 'no-hidden', 'no-normalization'):
+        config['objective'] = f'historical-{ablation}'
     if ablation == 'objective':
         config['correct_margin'] = 0.1
     status = {'config': config, 'status': 'running', 'history': [], 'best_exact_match': -1.0}

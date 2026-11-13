@@ -21,8 +21,11 @@ def objective_only_update(
     sequences: Sequence[Sequence[int]],
     target_starts: Sequence[int],
     recency_decay: float,
+    *,
+    margin_weighted: bool = True,
+    target_builder=None,
 ) -> None:
-    """Historical single-left training with the former margin-one-hot objective."""
+    """Historical single-left training with one-hot targets, optionally weighted."""
     base_update_terms = torch.zeros_like(model.base_mat)
     token_update_terms = torch.zeros_like(model.token_mats)
     trained_output_count = 0
@@ -48,12 +51,17 @@ def objective_only_update(
             device=model.base_mat.device,
             dtype=torch.long,
         )
-        states = query_triangle_rows[:, 0] @ model.base_mat
         targets = model.unembed_vectors[token_id_tensor]
-        scores = states @ model.unembed_vectors.T
-        correct = scores.gather(1, token_id_tensor[:, None]).squeeze(1)
-        scores.scatter_(1, token_id_tensor[:, None], -torch.inf)
-        scales = (scores.max(dim=1).values + 0.1 - correct).clamp_min(0)
+        if target_builder is not None:
+            states = query_triangle_rows[:, 0] @ model.base_mat
+            targets = target_builder(states, token_id_tensor, model.vocab_size)
+        scales = torch.ones(len(token_ids), device=targets.device, dtype=targets.dtype)
+        if margin_weighted:
+            states = query_triangle_rows[:, 0] @ model.base_mat
+            scores = states @ model.unembed_vectors.T
+            correct = scores.gather(1, token_id_tensor[:, None]).squeeze(1)
+            scores.scatter_(1, token_id_tensor[:, None], -torch.inf)
+            scales = (scores.max(dim=1).values + 0.1 - correct).clamp_min(0)
         has_update = has_update or bool(scales[target_start:].any().item())
         target_triangle_rows = _target_triangle_rows(model, context_ids, targets)
         positions = torch.arange(len(token_ids), device=model.base_mat.device)
@@ -79,15 +87,32 @@ def objective_only_update(
     optimizer.step(base_update_terms, token_update_terms)
 
 @torch.no_grad()
-def historical_targets(states, token_ids, vocab_size):
-    """Exact 97fe187 target construction, including the decode-norm floor."""
+def plain_one_hot_update(model, optimizer, sequences, target_starts, recency_decay):
+    """Change only the historical target to one-hot; no margin or gating."""
+    objective_only_update(
+        model, optimizer, sequences, target_starts, recency_decay,
+        margin_weighted=False,
+    )
+
+
+@torch.no_grad()
+def historical_targets(states, token_ids, vocab_size, *, remove=None):
+    """Historical target with optional removal of exactly one component.
+
+    no-softmax retains the positive one-hot correction; no-normalization removes
+    decode rescaling (including its norm floor), not update normalization.
+    """
+    if remove not in (None, 'no-softmax', 'no-hidden', 'no-normalization'):
+        raise ValueError(f'Unknown target component removal: {remove}')
     decode = states[..., :vocab_size].clone()
     norm = decode.norm(dim=-1, keepdim=True).clamp_min((vocab_size / states.shape[-1]) ** 0.5)
-    delta = -torch.softmax(decode, dim=-1)
+    delta = torch.zeros_like(decode) if remove == 'no-softmax' else -torch.softmax(decode, dim=-1)
     delta.scatter_add_(-1, token_ids.unsqueeze(-1), torch.ones_like(token_ids.unsqueeze(-1), dtype=states.dtype))
     decode.add_(delta)
-    targets = states.clone()
-    targets[..., :vocab_size] = decode * norm / decode.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    targets = torch.zeros_like(states) if remove == 'no-hidden' else states.clone()
+    if remove != 'no-normalization':
+        decode = decode * norm / decode.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    targets[..., :vocab_size] = decode
     return targets
 
 
@@ -114,3 +139,14 @@ def read_only_update(model, optimizer, sequences, target_starts, recency_decay):
         mass = max(mass, sum(recency_decay ** k for k in range(len(seq))))
     if count:
         optimizer.step(base_terms / (count * mass), token_terms / (count * mass))
+
+
+@torch.no_grad()
+def target_component_update(model, optimizer, sequences, target_starts, recency_decay, *, remove):
+    from functools import partial
+
+    objective_only_update(
+        model, optimizer, sequences, target_starts, recency_decay,
+        margin_weighted=False,
+        target_builder=partial(historical_targets, remove=remove),
+    )
