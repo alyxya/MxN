@@ -70,10 +70,9 @@ class MatrixNetwork(torch.nn.Module):
         prefix: Iterable[str],
         max_len: int,
         *,
-        reset_state: bool = True,
         collect_states: bool = False,
     ) -> Tuple[str, bool] | Tuple[str, bool, List[torch.Tensor]]:
-        """Generate text and report whether EOS was reached.
+        """Generate text from a fresh state and report whether EOS was reached.
 
         Leave collect_states=False for normal generation. It is a debugging-only
         diagnostic option that adds a third return value: CPU copies of each
@@ -82,8 +81,7 @@ class MatrixNetwork(torch.nn.Module):
         Collection adds memory and copying overhead without affecting predictions.
         """
         with torch.no_grad():
-            if reset_state:
-                self.reset_state()
+            self.reset_state()
             self.apply_context(self.encode(prefix))
             out: List[int] = []
             states: List[torch.Tensor] = []
