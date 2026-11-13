@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Tuple
+from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
