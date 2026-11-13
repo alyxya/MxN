@@ -78,10 +78,9 @@ def evaluate(model: MatrixNetwork, samples: int, seed: int, addend_digits: int, 
 
     for _ in range(samples):
         prompt, answer = random_problem(rng, addend_digits, base)
-        pred, did_stop, generated_states = model.generate(
+        pred, did_stop, generated_states = model.generate_debug(
             prompt,
             len(answer) + 2,
-            collect_states=True,  # Debugging diagnostics: readout rank and decode norm.
         )
         states.extend(generated_states)
         stopped += int(did_stop)

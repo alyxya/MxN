@@ -69,13 +69,28 @@ class MatrixNetwork(torch.nn.Module):
         self,
         prefix: Iterable[str],
         max_len: int,
-        *,
-        collect_states: bool = False,
-    ) -> Tuple[str, bool] | Tuple[str, bool, List[torch.Tensor]]:
-        """Generate text from a fresh state and report whether EOS was reached.
+    ) -> Tuple[str, bool]:
+        """Generate text from a fresh state and report whether EOS was reached."""
+        with torch.no_grad():
+            self.reset_state()
+            self.apply_context(self.encode(prefix))
+            out: List[int] = []
+            for _ in range(max_len):
+                token_id = self.predict()
+                if token_id == self.eos_id:
+                    return "".join(self.decode(token) for token in out), True
+                out.append(token_id)
+                self.apply_context([token_id])
+            return "".join(self.decode(token) for token in out), False
 
-        Leave collect_states=False for normal generation. It is a debugging-only
-        diagnostic option that adds a third return value: CPU copies of each
+    def generate_debug(
+        self,
+        prefix: Iterable[str],
+        max_len: int,
+    ) -> Tuple[str, bool, List[torch.Tensor]]:
+        """Generate from a fresh state and collect readouts for debugging only.
+
+        The third return value contains CPU copies of each
         prediction's readout vector (including the EOS prediction, if reached).
         These are not state-matrix snapshots and cannot restore generation state.
         Collection adds memory and copying overhead without affecting predictions.
@@ -87,17 +102,12 @@ class MatrixNetwork(torch.nn.Module):
             states: List[torch.Tensor] = []
             for _ in range(max_len):
                 state = self.query_state()
-                if collect_states:
-                    states.append(state.detach().cpu().clone())
+                states.append(state.detach().cpu().clone())
                 token_id = int(state[: self.vocab_size].argmax().item())
                 if token_id == self.eos_id:
                     generated = "".join(self.decode(token) for token in out)
-                    if collect_states:
-                        return generated, True, states
-                    return generated, True
+                    return generated, True, states
                 out.append(token_id)
                 self.apply_context([token_id])
             generated = "".join(self.decode(token) for token in out)
-            if collect_states:
-                return generated, False, states
-            return generated, False
+            return generated, False, states
